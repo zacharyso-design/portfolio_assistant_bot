@@ -34,6 +34,7 @@ try {
     New-Item -ItemType Directory -Force -Path $bundleScripts | Out-Null
     Copy-Item -LiteralPath 'config.example.toml' -Destination $bundle -Force
     Copy-Item -LiteralPath 'README.md' -Destination $bundle -Force
+    Copy-Item -LiteralPath 'scripts\Start-Packaged.cmd' -Destination (Join-Path $bundle 'Start CHIO Portfolio Assistant.cmd') -Force
     Copy-Item -LiteralPath 'scripts\Install-MorningTask.ps1' -Destination $bundleScripts -Force
     Copy-Item -LiteralPath 'scripts\Remove-MorningTask.ps1' -Destination $bundleScripts -Force
     Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath 'dist\CHIO-Portfolio-Assistant-Windows.zip' -Force

@@ -30,11 +30,12 @@ Build on an approved build workstation:
 .\scripts\Build-Distribution.ps1
 ```
 
-The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, copy `config.example.toml` to `config.toml`, configure it, then run:
+The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml` and opens it in Notepad. Configure the file, save it, and double-click the launcher again. It starts the local server and opens the application in the default browser; keep its command window open while using the application.
+
+The equivalent manual command is:
 
 ```powershell
-.\PortfolioAssistant.exe --config .\config.toml migrate
-.\PortfolioAssistant.exe --config .\config.toml serve
+.\PortfolioAssistant.exe --config .\config.toml launch
 ```
 
 ## Morning update

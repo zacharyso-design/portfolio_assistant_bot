@@ -20,6 +20,7 @@ from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, DecodedStreamObject, NameObject
 import pytest
 
+from portfolio_assistant import APPLICATION_ID
 from portfolio_assistant.api import create_app
 from portfolio_assistant.llm import LlmContractError
 
@@ -121,7 +122,9 @@ def snow_xlsx(comments: str) -> bytes:
 
 
 def test_environment_loopback_configuration_and_restart(settings, client: TestClient):
-    assert client.get("/api/health").json()["retrieval_mode"] == "fts5"
+    health = client.get("/api/health").json()
+    assert health["application"] == APPLICATION_ID
+    assert health["retrieval_mode"] == "fts5"
     rejected = client.get("http://evil.example/api/health", headers={"host": "evil.example"})
     assert rejected.status_code == 400
     origin = client.get("/api/health", headers={"origin": "https://evil.example"})

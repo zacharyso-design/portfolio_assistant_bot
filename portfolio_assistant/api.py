@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import APPLICATION_ID
 from .config import Settings, ensure_runtime_paths, load_settings
 from .db import Database
 from .llm import LlmContractError, LlmUnavailable, build_adapter
@@ -218,7 +219,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "version": "1.0.0", "retrieval_mode": db.fts_mode}
+        return {
+            "ok": True,
+            "application": APPLICATION_ID,
+            "version": "1.0.0",
+            "retrieval_mode": db.fts_mode,
+        }
 
     @app.get("/api/configuration")
     def configuration(test_llm: bool = False) -> dict[str, Any]:

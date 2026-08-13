@@ -235,6 +235,10 @@ def test_transcript_docx_pdf_and_unsupported(client: TestClient, project, tmp_pa
     assert process(client, pdf["id"])["processed"] == 1
     scanned = upload(client, project["id"], "fictional-scan.pdf", make_pdf(tmp_path, False)).json()["source"]
     assert process(client, scanned["id"])["unsupported"] == 1
+    preserved_scan_results = client.get(
+        "/api/search", params={"q": "fictional-scan", "project_id": project["id"]}
+    ).json()
+    assert any(item["source_id"] == scanned["id"] for item in preserved_scan_results)
     with client.app.state.db.connect() as connection:
         before_retry = connection.execute(
             "SELECT count(*) FROM source_chunks WHERE source_id = ?", (scanned["id"],)
@@ -410,6 +414,8 @@ def test_multi_project_review_rule_and_routed_retrieval(client: TestClient):
     ).json()["source"]
     result = process(client, captured["id"])
     assert result["needs_review"] == 1
+    shared_results = client.get("/api/search", params={"q": "new owner"}).json()
+    assert any(item["source_id"] == captured["id"] for item in shared_results)
     assert client.get(f"/api/projects/{atlas['id']}").json()["updates"] == []
     reviews = client.get("/api/reviews?status=open").json()
     review = next(item for item in reviews if item["source_id"] == captured["id"])
@@ -423,8 +429,20 @@ def test_multi_project_review_rule_and_routed_retrieval(client: TestClient):
     assert rules[0]["created_from_review_id"] == review["id"]
     beacon_detail = client.get(f"/api/projects/{beacon['id']}").json()
     assert len(beacon_detail["updates"]) == 1
+    routed_source = next(
+        item for item in beacon_detail["sources"] if item["source_type"] == "routed_segment"
+    )
     answer = client.post(f"/api/projects/{beacon['id']}/chat", json={"question": "What was approved?"}).json()
     assert answer["claims"]
+    removed = client.post(
+        f"/api/projects/{beacon['id']}/sources/{routed_source['id']}/remove",
+        json={"reason": "Routed segment removal regression"},
+    )
+    assert removed.status_code == 200, removed.text
+    assert client.get(f"/api/projects/{beacon['id']}").json()["updates"] == []
+    restored = client.post(f"/api/projects/{beacon['id']}/sources/{routed_source['id']}/restore")
+    assert restored.status_code == 200, restored.text
+    assert len(client.get(f"/api/projects/{beacon['id']}").json()["updates"]) == 1
     second = client.post(
         "/api/intake/multi-project",
         files={"file": ("cross-workstream-followup.txt", b"Follow-up evidence for the recurring fictional workstream.", "text/plain")},
@@ -528,8 +546,8 @@ def test_direct_project_intake_stops_on_other_project(client: TestClient):
     assert process(client, source["id"])["needs_review"] == 1
     assert client.get(f"/api/projects/{alpha['id']}").json()["updates"] == []
     review = next(item for item in client.get("/api/reviews?status=open").json() if item["source_id"] == source["id"])
-    assert review["kind"] == "cross_project_evidence"
-    assert review["options"] == [{"project_id": beta["id"], "label": "Fictional Beta Workstream"}]
+    assert review["kind"] == "project_fit"
+    assert {item["project_id"] for item in review["options"]} == {beta["id"]}
     before_retry = len([
         item for item in client.get("/api/reviews?status=open").json() if item["source_id"] == source["id"]
     ])
@@ -539,13 +557,15 @@ def test_direct_project_intake_stops_on_other_project(client: TestClient):
     ])
     assert after_retry == before_retry
     applied = client.post(f"/api/reviews/{review['id']}/resolve", json={
-        "action": "apply", "target_project_id": beta["id"],
+        "action": "move", "target_project_id": beta["id"],
     })
     assert applied.status_code == 200, applied.text
     beta_detail = client.get(f"/api/projects/{beta['id']}").json()
     assert beta_detail["updates"][0]["citations"][0]["original_filename"] == "cross-project-note.txt"
-    alpha_detail = client.get(f"/api/projects/{alpha['id']}").json()
-    assert next(item for item in alpha_detail["sources"] if item["id"] == source["id"])["processing_state"] == "complete"
+    moved_source = next(item for item in beta_detail["sources"] if item["id"] == source["id"])
+    assert moved_source["processing_state"] == "complete"
+    assert moved_source["memory_state"] == "active"
+    assert all(item["id"] != source["id"] for item in client.get(f"/api/projects/{alpha['id']}").json()["sources"])
     assert client.get("/api/routing-rules").json() == []
 
 

@@ -23,7 +23,7 @@ CHIO Portfolio Assistant\
   Archive\
 ```
 
-Each project has one stable-ID folder. Every upload becomes a self-contained ingestion package containing byte-preserved originals, hashes, a manifest, extracted text, citations, and knowledge items. Multi-project material is preserved once in `Shared Intake` and linked into projects only after Review Queue confirmation. Where policy permits, mark the `CHIO Portfolio Assistant` folder **Always keep on this device** so originals are locally available for hashing and citation access.
+Each project has one stable-ID folder. Every upload becomes a self-contained ingestion package containing byte-preserved originals, hashes, a manifest, extracted text, citations, and knowledge items. Direct-project uploads remain pending until the LLM project-fit check passes; conflicting or uncertain material stops in Review Queue before any project memory changes. Multi-project material is preserved once in `Shared Intake` and linked into projects only after Review Queue confirmation. Where policy permits, mark the `CHIO Portfolio Assistant` folder **Always keep on this device** so originals are locally available for hashing and citation access.
 
 Keep project folders as direct children of `Projects`; the bot owns that layout, and manual regrouping or moving of managed package folders is not supported. A project's human-readable folder name is fixed when the project is created; renaming the project in the app updates its metadata but does not rename the durable folder.
 
@@ -88,7 +88,9 @@ Project pages separate three review surfaces:
 
 - **Living Summary** shows the current cited project state, independent approval, failure/retry status, and prior-version comparison. Each manual regeneration intentionally creates a new auditable version, even when the eligible knowledge has not changed.
 - **Knowledge History** shows chronological cited updates with date, source, category, and review filters.
-- **Sources** exposes each package, original files and hashes, the manifest, errors, and a hash-verified **Rebuild derived files** action that never replaces originals.
+- **Sources** exposes each package, original files and hashes, the manifest, lifecycle history, errors, and a hash-verified **Rebuild derived files** action that never replaces originals. **Remove from project** moves the whole package into the managed `Archive` and excludes it from the current summary, knowledge, chat, search, updates, and source-created actions; **Restore to project** reverses that operation. **Update project knowledge** regenerates the current summary and durable knowledge sidecar from active sources only.
+
+For a project-fit review, choose **Keep in this project**, select a different project and choose **Move and process**, or choose **Archive without using**. The source is not committed to project memory while that review is open.
 
 ## Test
 
@@ -100,7 +102,7 @@ Push-Location frontend; npm ci; npm run build; Pop-Location
 
 ## Backup and recovery
 
-The OneDrive package archive is the durable record. The active SQLite database remains outside OneDrive to avoid sync conflicts and can be rebuilt from the archive. For a complete point-in-time backup of UI/cache state as well, stop the application, then copy the configured `database_path` and `one_drive_root`; SQLite WAL/SHM files can exist while the app is running. Originals, source records, updates, and review history are append-oriented, and the application has no broad cleanup command.
+The OneDrive package archive is the durable record. The active SQLite database remains outside OneDrive to avoid sync conflicts and can be rebuilt from the archive. For a complete point-in-time backup of UI/cache state as well, stop the application, then copy the configured `database_path` and `one_drive_root`; SQLite WAL/SHM files can exist while the app is running. Originals, source records, updates, review history, and source lifecycle events are append-oriented, and the application has no broad cleanup command. A source removed through the UI is recoverably archived rather than deleted from disk.
 
 If processing is interrupted, startup safely recovers `processing` records and retries captured/pending work within configured limits. Use **Retry pending** after endpoint recovery.
 

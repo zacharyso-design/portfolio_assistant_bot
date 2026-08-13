@@ -15,6 +15,7 @@ The user-supplied **Codex Build Handoff — CHIO Portfolio Assistant, Revision 1
 | 4 — chat/evidence | Project-only FTS retrieval, bounded cited chat, excerpt/original access | Contradictory two-project isolation, uncited-answer rejection, literal wildcard fallback, enriched citation/original tests pass. 50,000-chunk retrieval measured under 20 ms. |
 | 5 — review/routing/actions | Multi-project intake, confirmation-only segment apply, derived project-scoped evidence, linked narrow routing rules, cited action create/progress and closure review | No pre-approval mutation, direct cross-project detection, corrected target/rule reuse, routed chat retrieval, incomplete-action completion, progress, closure protection, and no AI project completion pass. |
 | 6 — morning/Windows/security | Prior-calendar-day idempotent run, banner/manual run, real Task Scheduler scripts, venv install, PyInstaller one-folder build, backup/security docs/tests | Daily window/idempotency pass. On 2026-08-12, the scheduled task was installed, triggered with `Last Result: 0`, and removed; the packaged executable served HTTP 200/FTS5. These workstation observations are reproducible with the documented build and scheduler scripts. |
+| 7 — source-fit and recoverable memory | Cited pre-memory project-fit check, explicit keep/move/archive review, active/pending/removed lifecycle, recoverable package relocation, active project-memory filtering with preserved archive discoverability, and manual project-knowledge rebuild | Wrong-project intake stops before mutation; move-and-process preserves identity. Removal/restore, archive rescan, search/chat/actions/knowledge exclusion, lifecycle durability, and failed-summary stale-claim protection pass. |
 
 ## Automated acceptance
 
@@ -24,7 +25,7 @@ Command:
 .\.venv\Scripts\python.exe -m pytest -q -s
 ```
 
-Result: **21 passed**. The suite includes the real background-worker claim path, post-rename database-failure cleanup, and explicit non-test fake-adapter guard. The warnings are an upstream FastAPI use of Python 3.14's deprecated `asyncio.iscoroutinefunction`; no application warning or failure occurred.
+Result on 2026-08-13: **49 passed**, replacing the stale 21-test count recorded before the archive-revision suite was added. The suite includes the real background-worker claim path, post-rename database-failure cleanup, explicit non-test fake-adapter guard, every project-fit decision path, malformed-model retry, recoverable standard and routed-segment removal/restoration, preservation of user-owned actions and unrelated open reviews during removal, searchable pending/unsupported originals, package-less source conflict handling, filesystem/database rollback, upgrade migration, rebuild from archived sidecars, and stale-summary protection when the LLM is unavailable. The warnings are an upstream FastAPI use of Python 3.14's deprecated `asyncio.iscoroutinefunction`; no application warning or failure occurred.
 
 Scale fixture and measured workstation timings (LLM time excluded):
 

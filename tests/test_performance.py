@@ -42,12 +42,13 @@ def test_required_scale_and_response_thresholds(service, settings):
             source_rows.append((
                 project[0], "txt", f"scale:{index}", f"{index:064x}", f"scale-{index}.txt",
                 str(settings.app.one_drive_root / "Projects" / f"scale-original-{index}.txt"),
-                "{}", "complete", now, now,
+                "{}", "complete", now, now, "active", 1, now,
             ))
         connection.executemany(
             """INSERT INTO sources(project_id, source_type, native_id, sha256, original_filename,
-               original_path, metadata_json, processing_state, created_at, processed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               original_path, metadata_json, processing_state, created_at, processed_at,
+               memory_state, project_fit_confirmed, memory_state_changed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             source_rows,
         )
         sources = connection.execute("SELECT id, project_id FROM sources ORDER BY id").fetchall()

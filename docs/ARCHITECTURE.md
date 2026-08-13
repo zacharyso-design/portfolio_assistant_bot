@@ -20,9 +20,9 @@ Fake adapter (tests) or approved internal HTTPS LLM only
 2. Hash, inspect a native message ID when possible, and check project/scope deduplication.
 3. Atomically rename the verified original, then commit the captured source row.
 4. The worker extracts deterministic chunks/locators and preserves email attachments independently.
-5. A bounded evidence package goes to the selected LLM adapter.
-6. Citation IDs are validated against exactly that package.
-7. Summary, append-only updates, supported action operations, chunk checkpoints, and completed source state commit in one SQLite transaction.
+5. A bounded evidence package first goes through a cited project-fit check. Conflicting or low-fit direct intake remains `pending` and enters Review Queue before any project memory mutation.
+6. After automatic or user-confirmed fit, the package goes to the knowledge-update operation and citation IDs are validated against exactly that evidence package.
+7. Summary, append-only updates, supported action operations, chunk checkpoints, active memory state, and completed source state commit in one SQLite transaction.
 
 AI unavailability leaves evidence durable in `pending_ai`; retry is idempotent. The worker stops automatically claiming a source after `automatic_ai_attempts` failures, while the manual **Retry pending** control can explicitly try it again. Unsupported inputs remain preserved as `unsupported`. Startup recovers interrupted `processing` rows.
 
@@ -33,6 +33,10 @@ CSV/XLSX rows upsert by `Number`. `Updated` is only the stale-row guard. Cumulat
 ## Multi-project routing
 
 The root intake source remains unassigned until decisions are reviewed. An approved segment creates a derived child source under the selected project and copies only the cited chunks into that project's FTS scope. The creating review decision and confirmed narrow routing rule remain linked and auditable.
+
+## Source lifecycle
+
+Removal is a reversible memory operation, not a filesystem deletion. The service atomically relocates the package between the project folder and managed `Archive`, updates the source tree and chunk scope in one transaction, records an append-only lifecycle event, and regenerates the current summary from active knowledge only. Knowledge, summaries, project chat, updates, and actions use committed active memory. Archive search remains broader so preserved pending, unsupported, and Shared Intake originals stay discoverable; only removed packages are excluded. A failed regeneration exposes no stale current summary; prior immutable versions remain available for audit.
 
 ## UI/runtime boundary
 

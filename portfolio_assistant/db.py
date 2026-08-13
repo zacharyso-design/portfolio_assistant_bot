@@ -123,7 +123,7 @@ class Database:
                     FROM source_chunks_fts
                     JOIN source_chunks c ON c.id = source_chunks_fts.rowid
                     JOIN sources s ON s.id = c.source_id
-                    WHERE source_chunks_fts MATCH ? AND c.project_id = ?
+                    WHERE source_chunks_fts MATCH ? AND c.project_id = ? AND s.memory_state = 'active'
                     ORDER BY rank LIMIT ?
                     """,
                     (expression, project_id, limit),
@@ -135,7 +135,7 @@ class Database:
                     """
                     SELECT c.*, s.original_filename, s.meeting_name, s.meeting_date, 0 AS rank
                     FROM source_chunks c JOIN sources s ON s.id = c.source_id
-                    WHERE c.project_id = ? AND c.text LIKE ? ESCAPE '\\'
+                    WHERE c.project_id = ? AND c.text LIKE ? ESCAPE '\\' AND s.memory_state = 'active'
                     ORDER BY c.id DESC LIMIT ?
                     """,
                     (project_id, pattern, limit),

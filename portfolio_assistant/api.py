@@ -74,6 +74,11 @@ class ReviewResolution(StrictModel):
     assignee_type: str | None = None
     assignee_value: str | None = None
     due_date: str | None = None
+    reason: str | None = None
+
+
+class SourceRemoval(StrictModel):
+    reason: str = Field(default="Removed from active project memory by the user.", max_length=500)
 
 
 class ActionCreate(StrictModel):
@@ -351,6 +356,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def source_detail(source_id: int) -> dict[str, Any]:
         return service.source_detail(source_id)
 
+    @app.post("/api/projects/{project_id}/sources/{source_id}/remove")
+    def remove_source(project_id: str, source_id: int, body: SourceRemoval) -> dict[str, Any]:
+        return service.remove_source_from_memory(project_id, source_id, body.reason)
+
+    @app.post("/api/projects/{project_id}/sources/{source_id}/restore")
+    def restore_source(project_id: str, source_id: int) -> dict[str, Any]:
+        return service.restore_source_to_memory(project_id, source_id)
+
     @app.get("/api/original-files/{original_file_id}")
     def original_file(original_file_id: int) -> FileResponse:
         path, filename = service.get_original_file(original_file_id)
@@ -382,6 +395,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/living-summary/regenerate")
     def regenerate_summary(project_id: str) -> dict[str, Any]:
         return service.regenerate_living_summary(project_id)
+
+    @app.post("/api/projects/{project_id}/knowledge/rebuild")
+    def rebuild_project_knowledge(project_id: str) -> dict[str, Any]:
+        return service.rebuild_project_knowledge(project_id)
 
     @app.patch("/api/projects/{project_id}/living-summary/review")
     def review_summary(project_id: str, body: ReviewStatus) -> dict[str, Any]:

@@ -61,6 +61,8 @@ SNOW_ENTRY_HEADER = re.compile(
     r"(?m)^(?P<stamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*-\s*(?P<author>.+?)\s*\((?P<kind>[^)]+)\)\s*$"
 )
 RULE_TYPES = {"ticket_number", "project_name", "filename_phrase", "sender_subject", "meeting_workstream"}
+PROJECT_FIT_SELECTED_REVIEW_THRESHOLD = 0.45
+PROJECT_FIT_ALTERNATIVE_CONFIDENCE_THRESHOLD = 0.65
 
 
 class NotFoundError(LookupError):
@@ -185,6 +187,7 @@ class PortfolioService:
         )
         atomic_write_json(assistant / "knowledge-items.json", [])
         atomic_write_json(assistant / "citations.json", [])
+        atomic_write_text(assistant / "source-lifecycle.jsonl", "")
 
     def migrate_archive(self) -> dict[str, int]:
         """Idempotently materialize legacy database records in the durable OneDrive archive."""
@@ -490,6 +493,33 @@ class PortfolioService:
             return "action"
         return "development"
 
+    def _record_source_lifecycle(
+        self,
+        connection: sqlite3.Connection,
+        source: sqlite3.Row,
+        event_type: str,
+        reason: str,
+        *,
+        from_project_id: str | None = None,
+        to_project_id: str | None = None,
+        details: dict[str, Any] | None = None,
+        event_id: str | None = None,
+        created_at: str | None = None,
+    ) -> str:
+        event_id = event_id or stable_id("E")
+        connection.execute(
+            """INSERT INTO source_lifecycle_events(
+               id, source_id, ingestion_id, project_id, event_type, from_project_id,
+               to_project_id, reason, details_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_id, source["id"], source["ingestion_id"], source["project_id"],
+                event_type, from_project_id, to_project_id, normalize_text(reason)[:500],
+                _json(details or {}), created_at or utc_now(),
+            ),
+        )
+        return event_id
+
     def _refresh_source_archive(self, source_id: int, *, processing_status: str | None = None) -> None:
         with self.db.connect() as connection:
             source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
@@ -522,6 +552,10 @@ class PortfolioService:
             ).fetchall()]
             citations = [dict(row) for row in connection.execute(
                 f"SELECT * FROM citation_records WHERE source_id IN ({placeholders}) ORDER BY id", related_ids
+            ).fetchall()]
+            lifecycle = [dict(row) for row in connection.execute(
+                "SELECT * FROM source_lifecycle_events WHERE source_id = ? ORDER BY created_at, id",
+                (source_id,),
             ).fetchall()]
             project = (
                 connection.execute("SELECT * FROM projects WHERE id = ?", (source["project_id"],)).fetchone()
@@ -576,6 +610,9 @@ class PortfolioService:
                 "subject", "sender", "recipients", "cc", "timestamp", "message_id"
             ) if metadata.get(key)},
             "processing_version": source["processing_version"],
+            "memory_state": source["memory_state"],
+            "project_fit_confirmed": bool(source["project_fit_confirmed"]),
+            "archived_previous_memory_state": source["archived_previous_memory_state"],
         })
         atomic_write_json(package / "Assistant" / "knowledge-items.json", [{
             "knowledge_item_id": item["id"],
@@ -596,6 +633,14 @@ class PortfolioService:
             "excerpt": item["excerpt"],
             "source_date": item["source_date"],
         } for item in citations])
+        lifecycle_lines = []
+        for lifecycle_item in lifecycle:
+            lifecycle_item["details"] = _decode(lifecycle_item.pop("details_json"), {})
+            lifecycle_lines.append(_json(lifecycle_item))
+        atomic_write_text(
+            package / "Assistant" / "source-lifecycle.jsonl",
+            ("\n".join(lifecycle_lines) + "\n") if lifecycle_lines else "",
+        )
         existing_manifest = read_json(package / "manifest.json", {})
         archive_errors = list(existing_manifest.get("errors", [])) if isinstance(existing_manifest, dict) else []
         if source["error_message"] and source["error_message"] not in archive_errors:
@@ -606,8 +651,14 @@ class PortfolioService:
             original_files=original_payload,
             assistant_files=[
                 "Assistant/source-summary.md", "Assistant/index.json",
-                "Assistant/knowledge-items.json", "Assistant/citations.json", "Assistant/Extracted",
+                "Assistant/knowledge-items.json", "Assistant/citations.json",
+                "Assistant/source-lifecycle.jsonl", "Assistant/Extracted",
             ],
+            database_project_id=source["project_id"],
+            project_id=project["archive_id"] if project else None,
+            memory_state=source["memory_state"],
+            project_fit_confirmed=bool(source["project_fit_confirmed"]),
+            archived_previous_memory_state=source["archived_previous_memory_state"],
             errors=archive_errors,
         )
 
@@ -790,21 +841,28 @@ class PortfolioService:
             if not row:
                 raise NotFoundError("Project not found")
             updates = connection.execute(
-                "SELECT * FROM project_updates WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 100",
+                """SELECT u.* FROM project_updates u LEFT JOIN sources s ON s.id = u.source_id
+                   WHERE u.project_id = ? AND (u.source_id IS NULL OR s.memory_state = 'active')
+                   ORDER BY u.created_at DESC, u.id DESC LIMIT 100""",
                 (project_id,),
             ).fetchall()
             sources = connection.execute(
                 """SELECT s.*, parent.original_filename AS parent_original_filename
                    FROM sources s LEFT JOIN sources parent ON parent.id = s.parent_source_id
-                   WHERE s.project_id = ? ORDER BY s.parent_source_id IS NOT NULL, s.created_at DESC, s.id DESC LIMIT 200""",
+                   WHERE s.project_id = ?
+                   ORDER BY s.memory_state = 'removed', s.parent_source_id IS NOT NULL,
+                            s.created_at DESC, s.id DESC LIMIT 200""",
                 (project_id,),
             ).fetchall()
             actions = connection.execute(
-                "SELECT * FROM action_items WHERE project_id = ? ORDER BY state = 'complete', due_date, id DESC",
+                """SELECT a.* FROM action_items a LEFT JOIN sources s ON s.id = a.source_id
+                   WHERE a.project_id = ?
+                     AND (a.source_id IS NULL OR a.created_by = 'user' OR s.memory_state = 'active')
+                   ORDER BY a.state = 'complete', a.due_date, a.id DESC""",
                 (project_id,),
             ).fetchall()
             decoded_updates = [self._decode_update(item) for item in updates]
-            decoded_actions = [self._decode_action(item) for item in actions]
+            decoded_actions = self._decode_active_actions(connection, actions)
             for update in decoded_updates:
                 update["citations"] = self._enrich_citations(connection, update["citations"])
             for action in decoded_actions:
@@ -865,10 +923,58 @@ class PortfolioService:
         item["metadata"] = _decode(item.pop("metadata_json", "{}"), {})
         return item
 
+    @staticmethod
+    def _manifest_memory_state(manifest: dict[str, Any]) -> str:
+        explicit = manifest.get("memory_state")
+        if explicit in {"pending", "active", "removed"}:
+            return str(explicit)
+        return "active" if manifest.get("processing_status") == "complete" else "pending"
+
     def _decode_action(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
         item["citations"] = _decode(item.pop("citations_json", None), [])
         return item
+
+    def _decode_active_action(
+        self, connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._decode_active_actions(connection, [row])[0]
+
+    def _decode_active_actions(
+        self, connection: sqlite3.Connection,
+        rows: Iterable[sqlite3.Row | dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        items = [self._decode_action(row) for row in rows]
+        cited_source_ids: set[int] = set()
+        for item in items:
+            if not item.get("progress_text"):
+                continue
+            cited_source_ids.update(
+                int(citation["source_id"])
+                for citation in item["citations"]
+                if isinstance(citation, dict) and citation.get("source_id") is not None
+            )
+        if not cited_source_ids:
+            return items
+        placeholders = ",".join("?" for _ in cited_source_ids)
+        active_source_ids = {
+            int(source["id"])
+            for source in connection.execute(
+                f"SELECT id FROM sources WHERE id IN ({placeholders}) AND memory_state = 'active'",
+                tuple(cited_source_ids),
+            ).fetchall()
+        }
+        for item in items:
+            progress_source_ids = {
+                int(citation["source_id"])
+                for citation in item["citations"]
+                if isinstance(citation, dict) and citation.get("source_id") is not None
+            }
+            if item.get("progress_text") and not progress_source_ids.issubset(active_source_ids):
+                # The action itself may be user-owned; retract only its removed-source progress.
+                item["progress_text"] = None
+                item["citations"] = []
+        return items
 
     def update_project(self, project_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "portfolio_group_id", "status", "priority", "owner_text", "next_action", "next_action_due"}
@@ -1104,10 +1210,13 @@ class PortfolioService:
                 "canonical_source": True,
                 "linked_ingestion_id": None,
                 "processing_status": "captured",
+                "memory_state": "pending",
+                "project_fit_confirmed": bool(multi_project or project_id is None),
                 "original_files": stored_files,
                 "assistant_files": [
                     "Assistant/source-summary.md", "Assistant/index.json",
                     "Assistant/knowledge-items.json", "Assistant/citations.json",
+                    "Assistant/source-lifecycle.jsonl",
                 ],
                 "extractor_version": "1.0",
                 "errors": [],
@@ -1124,12 +1233,15 @@ class PortfolioService:
                           project_id, source_type, native_id, sha256, original_filename, original_path,
                           metadata_json, meeting_name, meeting_date, processing_state, created_at,
                           ingestion_id, ingestion_path, source_title, source_date, capture_method,
-                          canonical_source, processing_version
-                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?, ?, ?, ?, ?, ?, 1, 1)
+                          canonical_source, processing_version, memory_state, project_fit_confirmed,
+                          memory_state_changed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?, ?, ?, ?, ?, ?, 1, 1,
+                                  'pending', ?, ?)
                         """,
                         (project_id, source_kind, native_id, digest, first_name, str(primary_final),
                          normalize_text(meeting_name or "") or None, meeting_date, now, ingestion_id,
-                         str(final_package), title, meeting_date, capture_method),
+                         str(final_package), title, meeting_date, capture_method,
+                         int(multi_project or project_id is None), now),
                     )
                     source_id = int(cursor.lastrowid)
                     for item in stored_files:
@@ -1183,17 +1295,19 @@ class PortfolioService:
         with self.db.transaction() as connection:
             cursor = connection.execute(
                 """UPDATE sources SET processing_state = 'captured', error_code = 'recovered_after_restart',
-                   error_message = NULL WHERE processing_state = 'processing' AND parent_source_id IS NULL"""
+                   error_message = NULL WHERE processing_state = 'processing'
+                   AND memory_state <> 'removed' AND parent_source_id IS NULL"""
             )
             children = [int(row["id"]) for row in connection.execute(
-                "SELECT id FROM sources WHERE processing_state = 'processing' AND parent_source_id IS NOT NULL"
+                """SELECT id FROM sources WHERE processing_state = 'processing'
+                   AND memory_state <> 'removed' AND parent_source_id IS NOT NULL"""
             ).fetchall()]
         for child_id in children:
             self._extract_attachment_child(child_id)
         return cursor.rowcount + len(children)
 
     def process_pending(self, *, manual: bool = False, source_id: int | None = None, limit: int = 20) -> dict[str, int]:
-        clauses = ["parent_source_id IS NULL"]
+        clauses = ["parent_source_id IS NULL", "memory_state <> 'removed'"]
         params: list[Any] = []
         if source_id is not None:
             clauses.append("id = ?")
@@ -1223,6 +1337,29 @@ class PortfolioService:
             source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         if not source:
             raise NotFoundError("Source not found")
+        if source["memory_state"] == "removed":
+            raise ConflictError("Removed sources cannot be retried; restore the source first")
+        if source["processing_state"] == "needs_review":
+            with self.db.transaction() as connection:
+                open_reviews = connection.execute(
+                    "SELECT id, kind FROM review_items WHERE source_id = ? AND status = 'open'",
+                    (source_id,),
+                ).fetchall()
+                if open_reviews and all(item["kind"] == "malformed_llm" for item in open_reviews):
+                    now = utc_now()
+                    connection.execute(
+                        """UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ?
+                           WHERE source_id = ? AND status = 'open' AND kind = 'malformed_llm'""",
+                        (_json({"action": "retry"}), now, source_id),
+                    )
+                    connection.execute(
+                        """UPDATE sources SET processing_state = 'captured', error_code = NULL,
+                           error_message = NULL WHERE id = ?""",
+                        (source_id,),
+                    )
+                    source = connection.execute(
+                        "SELECT * FROM sources WHERE id = ?", (source_id,)
+                    ).fetchone()
         counts = {
             "processed": 0, "pending_ai": 0, "needs_review": 0,
             "unsupported": 0, "error": 0, "already_complete": 0,
@@ -1262,6 +1399,8 @@ class PortfolioService:
             source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
             if not source:
                 raise NotFoundError("Source not found")
+            if source["memory_state"] == "removed":
+                raise ConflictError("Removed sources cannot be processed; restore the source first")
             if source["parent_source_id"] is not None:
                 raise ValidationError("Attachment sources are processed with their parent")
             if source["processing_state"] == "complete":
@@ -1289,23 +1428,9 @@ class PortfolioService:
             self._record_evidence_window(source_id, dropped)
             if not bounded:
                 raise LlmContractError("No complete evidence chunk fits the configured evidence limit")
-            cross_project = self._find_other_project_mentions(project["id"], bounded)
-            if cross_project:
-                options = [{"project_id": item["id"], "label": item["name"]} for item in cross_project]
-                self._create_review(
-                    kind="cross_project_evidence", source_id=source_id, project_id=project["id"],
-                    question="This direct-project source names another project. How should it be routed?",
-                    reason="Direct project intake cannot apply cross-project evidence silently.",
-                    evidence=[{
-                        "text": item["text"],
-                        "citations": [{"source_id": item["source_id"], "chunk_id": item["chunk_id"]}],
-                    } for item in bounded],
-                    options=options, memory_preview="No routing rule is created from direct-project intake.",
-                )
-                self._set_source_state(
-                    source_id, "needs_review", "cross_project_evidence",
-                    ValidationError("Source names another known project"),
-                )
+            if not bool(source["project_fit_confirmed"]) and self._require_project_fit_review(
+                source_id, project, bounded
+            ):
                 return "needs_review"
             result = self.llm.knowledge_update(project["current_summary"], bounded)
             self._commit_knowledge(source_id, result, bounded)
@@ -1334,28 +1459,87 @@ class PortfolioService:
             self._set_source_state(source_id, "error", "processing_failed", exc)
             return "error"
 
-    def _find_other_project_mentions(
-        self, selected_project_id: str, evidence: list[dict[str, Any]]
-    ) -> list[dict[str, str]]:
-        # Multi-word names avoid generic substring false positives; single-word projects require an exact SNOW number.
-        combined = "\n".join(str(item["text"]) for item in evidence).casefold()
+    def _require_project_fit_review(
+        self, source_id: int, selected_project: sqlite3.Row, evidence: list[dict[str, Any]]
+    ) -> bool:
         with self.db.connect() as connection:
-            projects = connection.execute(
-                "SELECT id, name, snow_number FROM projects WHERE id <> ?", (selected_project_id,)
-            ).fetchall()
-        matches = []
-        for project in projects:
-            name = normalize_text(project["name"]).casefold()
-            snow_number = normalize_text(str(project["snow_number"] or "")).casefold()
-            name_match = len(name.split()) >= 2 and re.search(
-                rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", combined
+            projects = [dict(row) for row in connection.execute(
+                "SELECT id, name, snow_number FROM projects ORDER BY name COLLATE NOCASE"
+            ).fetchall()]
+        result = self.llm.project_fit(
+            {
+                "id": selected_project["id"], "name": selected_project["name"],
+                "snow_number": selected_project["snow_number"],
+            },
+            evidence,
+            projects,
+        )
+        if not isinstance(result, dict):
+            raise LlmContractError("Project-fit response must be a JSON object")
+        try:
+            selected_confidence = float(result["selected_project_confidence"])
+            confidence = float(result["confidence"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LlmContractError("Project-fit confidence values are invalid") from exc
+        if not (0 <= selected_confidence <= 1 and 0 <= confidence <= 1):
+            raise LlmContractError("Project-fit confidence values must be between 0 and 1")
+        project_ids = {str(item["id"]) for item in projects}
+        recommended = str(result.get("recommended_project_id") or selected_project["id"])
+        if recommended not in project_ids:
+            raise LlmContractError("Project-fit response recommended an unknown project")
+        allowed = {(int(item["source_id"]), int(item["chunk_id"])) for item in evidence}
+        citations = self._validate_citations(result.get("citations"), allowed)
+        needs_review = (
+            bool(result.get("needs_review"))
+            or selected_confidence < PROJECT_FIT_SELECTED_REVIEW_THRESHOLD
+            or (
+                recommended != selected_project["id"]
+                and confidence >= PROJECT_FIT_ALTERNATIVE_CONFIDENCE_THRESHOLD
             )
-            snow_match = snow_number and re.search(
-                rf"(?<![a-z0-9]){re.escape(snow_number)}(?![a-z0-9])", combined
+        )
+        reason = normalize_text(str(result.get("reason") or "The selected project fit is uncertain."))
+        if needs_review:
+            cited = {(item["source_id"], item["chunk_id"]) for item in citations}
+            review_evidence = [{
+                "text": item["text"],
+                "citations": [{"source_id": item["source_id"], "chunk_id": item["chunk_id"]}],
+                "cited_by_project_fit": (item["source_id"], item["chunk_id"]) in cited,
+                "selected_project_confidence": selected_confidence,
+                "recommended_project_id": recommended,
+                "confidence": confidence,
+            } for item in evidence]
+            self._create_review(
+                kind="project_fit", source_id=source_id, project_id=selected_project["id"],
+                question=f"Does this source belong in {selected_project['name']}?",
+                reason=reason,
+                evidence=review_evidence,
+                options=[
+                    {"project_id": item["id"], "label": item["name"]}
+                    for item in projects if item["id"] != selected_project["id"]
+                ],
+                memory_preview="No project memory changes until you confirm where this source belongs.",
             )
-            if name_match or snow_match:
-                matches.append({"id": project["id"], "name": project["name"]})
-        return matches
+            self._set_source_state(
+                source_id, "needs_review", "project_fit_uncertain",
+                ValidationError("The selected project fit requires review"),
+            )
+            return True
+        now = utc_now()
+        with self.db.transaction() as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if not source:
+                raise NotFoundError("Source not found")
+            connection.execute(
+                "UPDATE sources SET project_fit_confirmed = 1, memory_state_changed_at = ? WHERE id = ?",
+                (now, source_id),
+            )
+            self._record_source_lifecycle(
+                connection, source, "project_fit_confirmed", reason,
+                from_project_id=source["project_id"], to_project_id=source["project_id"],
+                details={"selected_project_confidence": selected_confidence, "confidence": confidence},
+            )
+        self._refresh_source_archive(source_id)
+        return False
 
     def _source_project_id(self, source_id: int) -> str | None:
         with self.db.connect() as connection:
@@ -1498,12 +1682,13 @@ class PortfolioService:
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO sources(project_id, parent_source_id, source_type, native_id, sha256,
-                      original_filename, original_path, metadata_json, processing_state, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?)
+                      original_filename, original_path, metadata_json, processing_state, created_at,
+                      memory_state, project_fit_confirmed, memory_state_changed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, 'pending', 0, ?)
                     """,
                     (source["project_id"], source_id, Path(filename).suffix.casefold().lstrip(".") or "attachment",
                      native_id, digest, filename, str(final_path),
-                     _json({"content_type": attachment.content_type}), now),
+                     _json({"content_type": attachment.content_type}), now, now),
                 )
                 if cursor.rowcount == 1:
                     child_id = int(cursor.lastrowid)
@@ -1706,6 +1891,15 @@ class PortfolioService:
                 (source_id, now),
             )
             connection.execute(
+                """WITH RECURSIVE source_tree(id) AS (
+                     SELECT ? UNION ALL
+                     SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                   )
+                   UPDATE sources SET memory_state = 'active', memory_state_changed_at = ?
+                   WHERE id IN (SELECT id FROM source_tree)""",
+                (source_id, now),
+            )
+            connection.execute(
                 """UPDATE sources SET processing_state = 'complete', model_id = ?, processed_at = ?,
                    error_code = NULL, error_message = NULL, retry_count = 0 WHERE id = ?""",
                 (self.llm.model_id, now, source_id),
@@ -1766,7 +1960,8 @@ class PortfolioService:
             rows = connection.execute(
                 """SELECT k.*, s.source_title, s.source_type, s.ingestion_id
                    FROM knowledge_items k JOIN sources s ON s.id = k.source_id
-                   WHERE k.project_id = ? ORDER BY k.created_at, k.id""",
+                   WHERE k.project_id = ? AND s.memory_state = 'active'
+                   ORDER BY k.created_at, k.id""",
                 (project_id,),
             ).fetchall()
         lines = []
@@ -1802,9 +1997,11 @@ class PortfolioService:
             with self.db.connect() as connection:
                 project = self._project(connection, project_id)
                 knowledge = [dict(row) for row in connection.execute(
-                    """SELECT id, text, category, source_date, review_status, created_at
-                       FROM knowledge_items WHERE project_id = ? AND review_status <> 'flagged'
-                       ORDER BY created_at, id""",
+                    """SELECT k.id, k.text, k.category, k.source_date, k.review_status, k.created_at
+                       FROM knowledge_items k JOIN sources s ON s.id = k.source_id
+                       WHERE k.project_id = ? AND k.review_status <> 'flagged'
+                         AND s.memory_state = 'active'
+                       ORDER BY k.created_at, k.id""",
                     (project_id,),
                 ).fetchall()]
             generated = self.llm.living_summary(
@@ -1890,7 +2087,10 @@ class PortfolioService:
             versions = connection.execute(
                 "SELECT * FROM summary_versions WHERE project_id = ? ORDER BY revision DESC", (project_id,)
             ).fetchall()
-        current = dict(versions[0]) if versions else None
+        current_row = next(
+            (row for row in versions if int(row["revision"]) == int(project["summary_revision"])), None
+        )
+        current = dict(current_row) if current_row else None
         if current:
             current["content"] = _decode(current.pop("content_json"), {"sections": []})
         return {
@@ -1925,7 +2125,7 @@ class PortfolioService:
     ) -> list[dict[str, Any]]:
         if review_status not in {"all", "unreviewed", "approved", "flagged"}:
             raise ValidationError("Invalid knowledge review status")
-        clauses = ["k.project_id = ?"]
+        clauses = ["k.project_id = ?", "s.memory_state = 'active'"]
         params: list[Any] = [project_id]
         if review_status != "all":
             clauses.append("k.review_status = ?")
@@ -1966,7 +2166,9 @@ class PortfolioService:
             raise ValidationError("Invalid knowledge review status")
         with self.db.transaction() as connection:
             row = connection.execute(
-                "SELECT * FROM knowledge_items WHERE id = ? AND project_id = ?", (knowledge_id, project_id)
+                """SELECT k.* FROM knowledge_items k JOIN sources s ON s.id = k.source_id
+                   WHERE k.id = ? AND k.project_id = ? AND s.memory_state = 'active'""",
+                (knowledge_id, project_id),
             ).fetchone()
             if not row:
                 raise NotFoundError("Knowledge item not found")
@@ -1992,11 +2194,11 @@ class PortfolioService:
         with self.db.transaction() as connection:
             project = self._project(connection, project_id)
             version = connection.execute(
-                "SELECT * FROM summary_versions WHERE project_id = ? ORDER BY revision DESC LIMIT 1",
-                (project_id,),
+                "SELECT * FROM summary_versions WHERE project_id = ? AND revision = ?",
+                (project_id, project["summary_revision"]),
             ).fetchone()
             if not version:
-                raise ValidationError("No living summary version is available")
+                raise ConflictError("No current living summary version is available to review")
             connection.execute(
                 "UPDATE summary_versions SET review_status = ? WHERE id = ?", (status, version["id"])
             )
@@ -2104,11 +2306,363 @@ class PortfolioService:
             originals = [dict(row) for row in connection.execute(
                 "SELECT * FROM original_files WHERE source_id = ? ORDER BY is_attachment, id", (source_id,)
             ).fetchall()]
+            lifecycle = [dict(row) for row in connection.execute(
+                "SELECT * FROM source_lifecycle_events WHERE source_id = ? ORDER BY created_at DESC, id DESC",
+                (source_id,),
+            ).fetchall()]
         item = self._decode_source(source)
         item["original_files"] = originals
+        for event in lifecycle:
+            event["details"] = _decode(event.pop("details_json"), {})
+        item["lifecycle"] = lifecycle
         manifest = Path(source["ingestion_path"] or "") / "manifest.json"
         item["manifest"] = read_json(manifest) if manifest.is_file() else None
         return item
+
+    @staticmethod
+    def _path_after_package_move(value: str | None, old_package: Path, new_package: Path) -> str | None:
+        if not value:
+            return value
+        candidate = Path(value)
+        try:
+            relative = candidate.resolve().relative_to(old_package.resolve())
+        except ValueError:
+            return value
+        return str(new_package / relative)
+
+    def _move_source_package(
+        self,
+        source_id: int,
+        destination: Path,
+        *,
+        memory_state: str,
+        event_type: str,
+        reason: str,
+        to_project_id: str | None = None,
+        project_fit_confirmed: bool | None = None,
+    ) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if not source:
+                raise NotFoundError("Source not found")
+            if source["parent_source_id"] is not None and source["source_type"] != "routed_segment":
+                raise ValidationError("Use the top-level source package for memory changes")
+            if source["processing_state"] == "processing":
+                raise ConflictError("Wait for source extraction to finish before moving or archiving it")
+            target_project_id = to_project_id if to_project_id is not None else source["project_id"]
+            if to_project_id is not None and to_project_id != source["project_id"]:
+                duplicate = self._find_existing_source(
+                    connection,
+                    project_id=to_project_id,
+                    digest=source["sha256"],
+                    native_id=source["native_id"],
+                    multi_project=False,
+                )
+                if duplicate and int(duplicate["id"]) != source_id:
+                    raise ConflictError("This source is already preserved in the selected project")
+            target_project = self._project(connection, target_project_id)
+            source_project = self._project(connection, source["project_id"])
+            if source["source_type"] == "routed_segment":
+                descendants = connection.execute(
+                    "SELECT * FROM sources WHERE project_id = ? AND ingestion_path = ?",
+                    (source["project_id"], source["ingestion_path"]),
+                ).fetchall()
+            else:
+                descendants = connection.execute(
+                    """WITH RECURSIVE source_tree(id) AS (
+                         SELECT ? UNION ALL
+                         SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                         WHERE s.project_id = ? AND s.ingestion_path = ?
+                       ) SELECT * FROM sources WHERE id IN (SELECT id FROM source_tree)""",
+                    (source_id, source["project_id"], source["ingestion_path"]),
+                ).fetchall()
+        if not source["ingestion_path"]:
+            raise ConflictError("This legacy source has no movable OneDrive package")
+        old_package = self._under_root(Path(source["ingestion_path"]))
+        destination = self._under_root(destination)
+        if old_package == destination:
+            raise ConflictError("Source package is already in that location")
+        if not old_package.is_dir():
+            raise ConflictError("The preserved source package is missing from OneDrive")
+        if destination.exists():
+            raise ConflictError("A source package with this archive identity already exists at the destination")
+        old_manifest_path = old_package / "manifest.json"
+        old_lifecycle_path = old_package / "Assistant" / "source-lifecycle.jsonl"
+        manifest_before = old_manifest_path.read_text(encoding="utf-8") if old_manifest_path.is_file() else "{}\n"
+        lifecycle_before = old_lifecycle_path.read_text(encoding="utf-8") if old_lifecycle_path.is_file() else ""
+        summary_folder = Path(source_project["folder_path"]) / "_Assistant" / "living-summary"
+        summary_md_path = summary_folder / "current.md"
+        summary_json_path = summary_folder / "current.json"
+        summary_md_existed = summary_md_path.is_file()
+        summary_json_existed = summary_json_path.is_file()
+        summary_md_before = summary_md_path.read_text(encoding="utf-8") if summary_md_existed else ""
+        summary_json_before = summary_json_path.read_text(encoding="utf-8") if summary_json_existed else ""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(old_package, destination)
+        now = utc_now()
+        event_id = stable_id("E")
+        event_details = {
+            "from_path": relative_to_root(old_package, self.settings.app.one_drive_root),
+            "to_path": relative_to_root(destination, self.settings.app.one_drive_root),
+            "memory_state": memory_state,
+        }
+        archived_previous_state = source["memory_state"] if memory_state == "removed" else None
+        changes_active_summary = (
+            (event_type == "removed_from_memory" and source["memory_state"] == "active")
+            or (event_type == "restored_to_memory" and memory_state == "active")
+        )
+        manifest_path = destination / "manifest.json"
+        lifecycle_path = destination / "Assistant" / "source-lifecycle.jsonl"
+        durable_event = {
+            "id": event_id,
+            "source_id": int(source["id"]),
+            "ingestion_id": source["ingestion_id"],
+            "project_id": source["project_id"],
+            "event_type": event_type,
+            "from_project_id": source["project_id"],
+            "to_project_id": target_project_id,
+            "reason": normalize_text(reason)[:500],
+            "details": event_details,
+            "created_at": now,
+        }
+        try:
+            update_manifest(
+                destination,
+                database_project_id=target_project_id,
+                project_id=target_project["archive_id"],
+                memory_state=memory_state,
+                project_fit_confirmed=(
+                    bool(source["project_fit_confirmed"])
+                    if project_fit_confirmed is None else bool(project_fit_confirmed)
+                ),
+                archived_previous_memory_state=archived_previous_state,
+            )
+            atomic_write_text(
+                lifecycle_path,
+                lifecycle_before + ("" if not lifecycle_before or lifecycle_before.endswith("\n") else "\n")
+                + _json(durable_event) + "\n",
+            )
+            if changes_active_summary:
+                atomic_write_text(
+                    summary_md_path,
+                    f"# {source_project['name']} — Living Summary\n\nCurrent memory is awaiting regeneration.\n",
+                )
+                atomic_write_json(summary_json_path, {
+                    "schema_version": SCHEMA_VERSION,
+                    "project_id": source_project["archive_id"],
+                    "revision": int(source_project["summary_revision"]) + 1,
+                    "review_status": "unreviewed",
+                    "generation_state": "stale",
+                    "created_at": now,
+                    "sections": [],
+                })
+            with self.db.transaction() as connection:
+                for item in descendants:
+                    updates: dict[str, Any] = {
+                        "project_id": target_project_id,
+                        "original_path": self._path_after_package_move(
+                            item["original_path"], old_package, destination
+                        ),
+                        "ingestion_path": self._path_after_package_move(
+                            item["ingestion_path"], old_package, destination
+                        ),
+                        "memory_state": memory_state,
+                        "memory_state_changed_at": now,
+                    }
+                    if item["id"] == source_id:
+                        updates["ingestion_path"] = str(destination)
+                    if memory_state == "removed":
+                        updates["archived_previous_memory_state"] = item["memory_state"]
+                    else:
+                        updates["archived_previous_memory_state"] = None
+                    if project_fit_confirmed is not None:
+                        updates["project_fit_confirmed"] = int(project_fit_confirmed)
+                    assignments = ", ".join(f"{key} = ?" for key in updates)
+                    connection.execute(
+                        f"UPDATE sources SET {assignments} WHERE id = ?",
+                        (*updates.values(), item["id"]),
+                    )
+                descendant_ids = [int(item["id"]) for item in descendants]
+                placeholders = ",".join("?" for _ in descendant_ids)
+                connection.execute(
+                    f"UPDATE source_chunks SET project_id = ? WHERE source_id IN ({placeholders})",
+                    (target_project_id, *descendant_ids),
+                )
+                if event_type == "removed_from_memory" and source["memory_state"] == "active":
+                    latest = connection.execute(
+                        """SELECT u.text FROM project_updates u LEFT JOIN sources s ON s.id = u.source_id
+                           WHERE u.project_id = ? AND (u.source_id IS NULL OR s.memory_state = 'active')
+                           ORDER BY u.created_at DESC, u.id DESC LIMIT 1""",
+                        (source["project_id"],),
+                    ).fetchone()
+                    connection.execute(
+                        """UPDATE projects SET latest_change = ?, updated_at = ?,
+                           summary_revision = summary_revision + 1, summary_generation_state = 'stale',
+                           summary_error = NULL, current_summary = '', summary_generated_at = NULL
+                           WHERE id = ?""",
+                        (latest["text"] if latest else None, now, source["project_id"]),
+                    )
+                elif event_type == "restored_to_memory" and memory_state == "active":
+                    latest = connection.execute(
+                        """SELECT u.text FROM project_updates u LEFT JOIN sources s ON s.id = u.source_id
+                           WHERE u.project_id = ? AND (u.source_id IS NULL OR s.memory_state = 'active')
+                           ORDER BY u.created_at DESC, u.id DESC LIMIT 1""",
+                        (target_project_id,),
+                    ).fetchone()
+                    connection.execute(
+                        """UPDATE projects SET summary_revision = summary_revision + 1,
+                           summary_generation_state = 'stale', summary_error = NULL,
+                           latest_change = ?, updated_at = ? WHERE id = ?""",
+                        (latest["text"] if latest else None, now, target_project_id),
+                    )
+                self._record_source_lifecycle(
+                    connection, source, event_type, reason,
+                    from_project_id=source["project_id"], to_project_id=target_project_id,
+                    details=event_details, event_id=event_id, created_at=now,
+                )
+        except Exception:
+            # Each compensating write is best-effort so one locked OneDrive sidecar does not
+            # prevent the other authoritative files or package location from being restored.
+            for path, content in (
+                (manifest_path, manifest_before),
+                (lifecycle_path, lifecycle_before),
+            ):
+                try:
+                    if destination.exists():
+                        atomic_write_text(path, content)
+                except OSError:
+                    pass
+            try:
+                if summary_md_existed:
+                    atomic_write_text(summary_md_path, summary_md_before)
+                else:
+                    summary_md_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if summary_json_existed:
+                    atomic_write_text(summary_json_path, summary_json_before)
+                else:
+                    summary_json_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Restore the directory last so any reverted sidecar bytes travel back with the package.
+            if destination.exists() and not old_package.exists():
+                old_package.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, old_package)
+            raise
+        try:
+            self._refresh_source_archive(source_id)
+        except OSError:
+            # The authoritative lifecycle/manifest state was already written before the database commit.
+            pass
+        return self.source_detail(source_id)
+
+    def remove_source_from_memory(
+        self, project_id: str, source_id: int, reason: str, *, exclude_review_id: int | None = None
+    ) -> dict[str, Any]:
+        clean_reason = normalize_text(reason) or "Removed from active project memory by the user."
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+            source = connection.execute(
+                "SELECT * FROM sources WHERE id = ? AND project_id = ?", (source_id, project_id)
+            ).fetchone()
+        if not source:
+            raise NotFoundError("Source not found in this project")
+        if source["parent_source_id"] is not None and source["source_type"] != "routed_segment":
+            raise ValidationError("Remove the top-level source package instead")
+        if source["memory_state"] == "removed":
+            raise ConflictError("Source is already removed from active project memory")
+        if not source["ingestion_path"]:
+            raise ConflictError("This legacy source has no movable OneDrive package")
+        destination = self.archive_paths["archive"] / project["archive_id"] / Path(source["ingestion_path"]).name
+        previous_state = source["memory_state"]
+        self._move_source_package(
+            source_id, destination, memory_state="removed", event_type="removed_from_memory",
+            reason=clean_reason,
+        )
+        now = utc_now()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE review_items SET status = 'dismissed',
+                   resolution_json = ?, resolved_at = ?
+                   WHERE source_id = ? AND status = 'open' AND kind = 'project_fit'
+                     AND (? IS NULL OR id <> ?)""",
+                (
+                    _json({"action": "remove", "reason": clean_reason}), now, source_id,
+                    exclude_review_id, exclude_review_id,
+                ),
+            )
+        self._write_knowledge_history(project_id)
+        if previous_state == "active":
+            try:
+                self.regenerate_living_summary(project_id, advance_revision=False)
+            except UnexpectedSummaryError:
+                # The removal committed; its summary remains visibly failed and retryable.
+                pass
+        return self.source_detail(source_id)
+
+    def restore_source_to_memory(self, project_id: str, source_id: int) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+            source = connection.execute(
+                "SELECT * FROM sources WHERE id = ? AND project_id = ?", (source_id, project_id)
+            ).fetchone()
+        if not source:
+            raise NotFoundError("Source not found in this project archive")
+        if source["parent_source_id"] is not None and source["source_type"] != "routed_segment":
+            raise ValidationError("Restore the top-level source package instead")
+        if source["memory_state"] != "removed":
+            raise ConflictError("Source is already available to the project")
+        restored_state = source["archived_previous_memory_state"] or "pending"
+        destination = Path(project["folder_path"]) / Path(source["ingestion_path"]).name
+        result = self._move_source_package(
+            source_id, destination, memory_state=restored_state,
+            event_type="restored_to_memory", reason="Restored to active project memory by the user.",
+            project_fit_confirmed=bool(source["project_fit_confirmed"]),
+        )
+        if restored_state == "active":
+            self._write_knowledge_history(project_id)
+            try:
+                self.regenerate_living_summary(project_id, advance_revision=False)
+            except UnexpectedSummaryError:
+                # The restoration committed; its summary remains visibly failed and retryable.
+                pass
+        else:
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """UPDATE sources SET processing_state = 'captured', error_code = NULL,
+                       error_message = NULL, retry_count = 0 WHERE id = ?""",
+                    (source_id,),
+                )
+            try:
+                update_manifest(Path(result["ingestion_path"]), processing_status="captured")
+                self._refresh_source_archive(source_id, processing_status="captured")
+            except OSError:
+                # The package move and database reset already committed; derived sidecars are retryable.
+                pass
+            result = self.source_detail(source_id)
+        return result
+
+    def rebuild_project_knowledge(self, project_id: str) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            self._project(connection, project_id)
+            active_sources = connection.execute(
+                """SELECT count(*) FROM sources
+                   WHERE project_id = ? AND parent_source_id IS NULL AND memory_state = 'active'""",
+                (project_id,),
+            ).fetchone()[0]
+            knowledge_items = connection.execute(
+                """SELECT count(*) FROM knowledge_items k JOIN sources s ON s.id = k.source_id
+                   WHERE k.project_id = ? AND s.memory_state = 'active'""",
+                (project_id,),
+            ).fetchone()[0]
+        self._write_knowledge_history(project_id)
+        summary = self.regenerate_living_summary(project_id, advance_revision=True)
+        return {
+            "project_id": project_id, "active_sources": active_sources,
+            "knowledge_items": knowledge_items, "living_summary": summary,
+        }
 
     def search_archive(self, query: str, *, project_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         clean = normalize_text(query)
@@ -2131,8 +2685,7 @@ class PortfolioService:
             summary_rows = connection.execute(
                 """SELECT p.id AS project_id, p.name AS project_name, v.content_json, v.created_at
                    FROM projects p JOIN summary_versions v ON v.project_id = p.id
-                   WHERE v.id = (SELECT v2.id FROM summary_versions v2
-                                 WHERE v2.project_id = p.id ORDER BY v2.revision DESC LIMIT 1)
+                   WHERE v.revision = p.summary_revision
                      AND (? IS NULL OR p.id = ?)""",
                 (project_id, project_id),
             ).fetchall()
@@ -2154,7 +2707,7 @@ class PortfolioService:
                            s.id AS source_id, s.source_type, coalesce(s.source_date, s.created_at) AS source_date
                     FROM sources s LEFT JOIN projects p ON p.id = s.project_id
                     WHERE (s.source_title LIKE ? OR s.original_filename LIKE ? OR s.source_summary LIKE ?
-                           OR s.metadata_json LIKE ?){project_clause}
+                           OR s.metadata_json LIKE ?) AND s.memory_state <> 'removed'{project_clause}
                     ORDER BY s.created_at DESC LIMIT ?""",
                 ((pattern, pattern, pattern, pattern, project_id, limit) if project_id
                  else (pattern, pattern, pattern, pattern, limit)),
@@ -2166,7 +2719,7 @@ class PortfolioService:
                            s.source_type, k.source_date
                     FROM knowledge_items k JOIN projects p ON p.id = k.project_id
                     JOIN sources s ON s.id = k.source_id
-                    WHERE (k.text LIKE ? OR k.category LIKE ?){project_clause}
+                    WHERE (k.text LIKE ? OR k.category LIKE ?) AND s.memory_state = 'active'{project_clause}
                     ORDER BY k.created_at DESC LIMIT ?""",
                 ((pattern, pattern, project_id, limit) if project_id else (pattern, pattern, limit)),
             ).fetchall():
@@ -2179,7 +2732,7 @@ class PortfolioService:
                            f.id AS original_file_id
                     FROM original_files f JOIN sources s ON s.id = f.source_id
                     LEFT JOIN projects p ON p.id = s.project_id
-                    WHERE f.original_name LIKE ?{project_clause}
+                    WHERE f.original_name LIKE ? AND s.memory_state <> 'removed'{project_clause}
                     ORDER BY f.created_at DESC LIMIT ?""",
                 ((pattern, project_id, limit) if project_id else (pattern, limit)),
             ).fetchall():
@@ -2193,7 +2746,7 @@ class PortfolioService:
                                c.locator
                         FROM source_chunks c JOIN sources s ON s.id = c.source_id
                         LEFT JOIN projects p ON p.id = c.project_id
-                        WHERE c.text LIKE ?{project_clause}
+                        WHERE c.text LIKE ? AND s.memory_state <> 'removed'{project_clause}
                         ORDER BY c.id DESC LIMIT ?""",
                     ((pattern, project_id, limit) if project_id else (pattern, limit)),
                 ).fetchall():
@@ -2229,6 +2782,7 @@ class PortfolioService:
                 counts["errors"] += 1
         package_paths = list(self.archive_paths["projects"].glob("*/*/manifest.json"))
         package_paths += list(self.archive_paths["shared_intake"].glob("*/manifest.json"))
+        package_paths += list(self.archive_paths["archive"].glob("*/*/manifest.json"))
         for manifest_path in package_paths:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2259,6 +2813,26 @@ class PortfolioService:
                     ).fetchone()
                 if existing:
                     source_id = int(existing["id"])
+                    memory_state = self._manifest_memory_state(manifest)
+                    if existing["memory_state"] == "active" and memory_state == "pending":
+                        # A best-effort post-commit manifest refresh may be stale; never demote
+                        # committed memory without an explicit removed lifecycle state.
+                        memory_state = "active"
+                    archived_previous_state = manifest.get("archived_previous_memory_state")
+                    if archived_previous_state not in {"pending", "active"}:
+                        archived_previous_state = "active" if memory_state == "removed" else None
+                    with self.db.transaction() as connection:
+                        connection.execute(
+                            """UPDATE sources SET memory_state = ?, project_fit_confirmed = ?,
+                               archived_previous_memory_state = ?,
+                               memory_state_changed_at = coalesce(memory_state_changed_at, created_at)
+                               WHERE id = ?""",
+                            (
+                                memory_state,
+                                int(bool(manifest.get("project_fit_confirmed", memory_state == "active"))),
+                                archived_previous_state, source_id,
+                            ),
+                        )
                 else:
                     originals = manifest.get("original_files") if isinstance(manifest.get("original_files"), list) else []
                     primary_item = originals[0] if originals else None
@@ -2278,21 +2852,29 @@ class PortfolioService:
                     state = str(manifest.get("processing_status") or "complete")
                     if state not in {"captured", "processing", "pending_ai", "complete", "needs_review", "unsupported", "error"}:
                         state = "complete"
+                    memory_state = self._manifest_memory_state(manifest)
+                    archived_previous_state = manifest.get("archived_previous_memory_state")
+                    if archived_previous_state not in {"pending", "active"}:
+                        archived_previous_state = "active" if memory_state == "removed" else None
                     with self.db.transaction() as connection:
                         cursor = connection.execute(
                             """INSERT INTO sources(
                                project_id, source_type, sha256, original_filename, original_path,
                                metadata_json, processing_state, created_at, processed_at, ingestion_id,
                                ingestion_path, source_title, source_date, capture_method, canonical_source,
-                               linked_ingestion_id, source_summary
-                               ) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               linked_ingestion_id, source_summary, memory_state, project_fit_confirmed,
+                               archived_previous_memory_state, memory_state_changed_at
+                               ) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (database_project_id, manifest.get("source_type") or "unknown", digest,
                              primary_item.get("original_name") if primary_item else manifest.get("title") or "Source unavailable",
                              str(primary), state, manifest.get("created_at") or utc_now(),
                              manifest.get("created_at") if state == "complete" else None,
                              ingestion_id if canonical else None, str(package), manifest.get("title"),
                              manifest.get("source_date"), manifest.get("capture_method") or "archive_rescan",
-                             int(canonical), manifest.get("linked_ingestion_id"), ""),
+                             int(canonical), manifest.get("linked_ingestion_id"), "", memory_state,
+                             int(bool(manifest.get("project_fit_confirmed", memory_state == "active"))),
+                             archived_previous_state,
+                             manifest.get("created_at") or utc_now()),
                         )
                         source_id = int(cursor.lastrowid)
                         for item in originals:
@@ -2334,6 +2916,23 @@ class PortfolioService:
                         (index.get("summary") or (source_summary_file.read_text(encoding="utf-8") if source_summary_file.is_file() else ""),
                           _json({**index, **(index.get("email_metadata") or {})}), source_id),
                     )
+                    lifecycle_file = package / "Assistant" / "source-lifecycle.jsonl"
+                    if lifecycle_file.is_file():
+                        for line in lifecycle_file.read_text(encoding="utf-8").splitlines():
+                            event = json.loads(line)
+                            connection.execute(
+                                """INSERT OR IGNORE INTO source_lifecycle_events(
+                                   id, source_id, ingestion_id, project_id, event_type,
+                                   from_project_id, to_project_id, reason, details_json, created_at
+                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    event["id"], source_id, event.get("ingestion_id"),
+                                    event.get("project_id") or database_project_id, event["event_type"],
+                                    event.get("from_project_id"), event.get("to_project_id"),
+                                    event.get("reason") or "Rebuilt from archive lifecycle history.",
+                                    _json(event.get("details") or {}), event.get("created_at") or utc_now(),
+                                ),
+                            )
                 counts["knowledge_items"] += self._rebuild_package_knowledge(
                     source_id, database_project_id, package
                 )
@@ -2543,8 +3142,8 @@ class PortfolioService:
                 )
                 return
             connection.execute(
-                "UPDATE action_items SET progress_text = ?, source_id = ?, citations_json = ?, updated_at = ? WHERE id = ?",
-                (progress, source_id, _json(citations), now, action_id),
+                "UPDATE action_items SET progress_text = ?, citations_json = ?, updated_at = ? WHERE id = ?",
+                (progress, _json(citations), now, action_id),
             )
         elif kind == "request_close":
             self._insert_review(
@@ -2888,11 +3487,12 @@ class PortfolioService:
             cursor = connection.execute(
                 """
                 INSERT INTO sources(project_id, source_type, native_id, sha256, original_filename,
-                  original_path, metadata_json, processing_state, created_at)
-                VALUES (?, 'snow_comments', ?, ?, ?, ?, ?, ?, ?)
+                  original_path, metadata_json, processing_state, memory_state,
+                  project_fit_confirmed, memory_state_changed_at, created_at)
+                VALUES (?, 'snow_comments', ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)
                 """,
                 (project_id, f"snow:{number}:{cell_hash}", export_sha, export_path.name,
-                 str(export_path), _json(metadata), state, utc_now()),
+                 str(export_path), _json(metadata), state, utc_now(), utc_now()),
             )
         return int(cursor.lastrowid)
 
@@ -3048,6 +3648,12 @@ class PortfolioService:
         return item
 
     def resolve_review(self, review_id: int, resolution: dict[str, Any]) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            pending_review = connection.execute(
+                "SELECT kind FROM review_items WHERE id = ?", (review_id,)
+            ).fetchone()
+        if pending_review and pending_review["kind"] == "project_fit":
+            return self._resolve_project_fit_review(review_id, resolution)
         action = resolution.get("action", "apply")
         if action not in {"apply", "dismiss"}:
             raise ValidationError("Review action must be apply or dismiss")
@@ -3063,6 +3669,8 @@ class PortfolioService:
                     "UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ? WHERE id = ?",
                     (_json(resolution), now, review_id),
                 )
+            # Delete this compatibility branch after all pre-003 review rows have been resolved or
+            # after an archive rebuild, which never recreates cross_project_evidence reviews.
             elif review["kind"] in {"multi_project_route", "cross_project_evidence"}:
                 self._resolve_routing_review(
                     connection, review, resolution, now,
@@ -3138,6 +3746,7 @@ class PortfolioService:
             source_id = review["source_id"]
             if source_id:
                 root = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+                # The second condition finishes legacy direct-routing reviews created before migration 003.
                 if root and (root["project_id"] is None or review["kind"] == "cross_project_evidence"):
                     open_count = connection.execute(
                         "SELECT count(*) FROM review_items WHERE source_id = ? AND status = 'open'", (source_id,)
@@ -3154,6 +3763,7 @@ class PortfolioService:
                 (review_id,),
             ).fetchone()
         decoded = self._decode_review(updated)
+        # cross_project_evidence is retained here solely for pre-migration review compatibility.
         if action == "apply" and review["kind"] in {"multi_project_route", "cross_project_evidence"}:
             if review["source_id"]:
                 self._refresh_source_archive(int(review["source_id"]))
@@ -3168,6 +3778,91 @@ class PortfolioService:
                 except UnexpectedSummaryError:
                     # Routing committed; return that result while its summary remains visibly failed.
                     pass
+        return decoded
+
+    def _resolve_project_fit_review(
+        self, review_id: int, resolution: dict[str, Any]
+    ) -> dict[str, Any]:
+        action = str(resolution.get("action") or "")
+        if action not in {"keep", "move", "remove"}:
+            raise ValidationError("Project-fit review action must be keep, move, or remove")
+        with self.db.connect() as connection:
+            review = connection.execute(
+                "SELECT * FROM review_items WHERE id = ?", (review_id,)
+            ).fetchone()
+            if not review:
+                raise NotFoundError("Review item not found")
+            if review["status"] != "open":
+                raise ConflictError("Review item is already resolved")
+            source = connection.execute(
+                "SELECT * FROM sources WHERE id = ?", (review["source_id"],)
+            ).fetchone()
+        if not source:
+            raise ValidationError("Review source no longer exists")
+        if source["memory_state"] != "pending":
+            raise ConflictError("Only a pending source can be reassigned before processing")
+        reason = normalize_text(str(resolution.get("reason") or "User resolved the project-fit review."))
+        if action == "remove":
+            self.remove_source_from_memory(
+                str(source["project_id"]), int(source["id"]), reason,
+                exclude_review_id=review_id,
+            )
+        elif action == "move":
+            target_project_id = str(resolution.get("target_project_id") or "")
+            if not target_project_id or target_project_id == source["project_id"]:
+                raise ValidationError("Choose a different project before moving this source")
+            with self.db.connect() as connection:
+                target = self._project(connection, target_project_id)
+            destination = Path(target["folder_path"]) / Path(source["ingestion_path"]).name
+            self._move_source_package(
+                int(source["id"]), destination, memory_state="pending",
+                event_type="moved_before_processing", reason=reason,
+                to_project_id=target_project_id, project_fit_confirmed=True,
+            )
+        else:
+            with self.db.transaction() as connection:
+                current = connection.execute(
+                    "SELECT * FROM sources WHERE id = ?", (source["id"],)
+                ).fetchone()
+                connection.execute(
+                    """UPDATE sources SET project_fit_confirmed = 1,
+                       memory_state_changed_at = ? WHERE id = ?""",
+                    (utc_now(), source["id"]),
+                )
+                self._record_source_lifecycle(
+                    connection, current, "project_fit_confirmed", reason,
+                    from_project_id=current["project_id"], to_project_id=current["project_id"],
+                    details={"confirmed_by": "user", "review_id": review_id},
+                )
+            self._refresh_source_archive(int(source["id"]))
+        now = utc_now()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ?
+                   WHERE id = ?""",
+                (_json(resolution), now, review_id),
+            )
+            if action != "remove":
+                connection.execute(
+                    """UPDATE sources SET processing_state = 'captured', error_code = NULL,
+                       error_message = NULL WHERE id = ?""",
+                    (source["id"],),
+                )
+            updated = connection.execute(
+                """SELECT r.*, p.name AS project_name, s.original_filename
+                   FROM review_items r LEFT JOIN projects p ON p.id = r.project_id
+                   LEFT JOIN sources s ON s.id = r.source_id WHERE r.id = ?""",
+                (review_id,),
+            ).fetchone()
+        decoded = self._decode_review(updated)
+        if action != "remove":
+            state = self.process_source(int(source["id"]))
+            decoded["source_processing_state"] = state
+            with self.db.connect() as connection:
+                current_source = connection.execute(
+                    "SELECT project_id FROM sources WHERE id = ?", (source["id"],)
+                ).fetchone()
+            decoded["target_project_id"] = current_source["project_id"]
         return decoded
 
     def _resolve_routing_review(
@@ -3219,10 +3914,13 @@ class PortfolioService:
                 "linked_ingestion_id": source["ingestion_id"],
                 "canonical_source_path": relative_to_root(Path(source["ingestion_path"]), self.settings.app.one_drive_root),
                 "processing_status": "complete",
+                "memory_state": "active",
+                "project_fit_confirmed": True,
                 "original_files": [],
                 "assistant_files": [
                     "Assistant/linked-segments.json", "Assistant/source-summary.md",
                     "Assistant/knowledge-items.json", "Assistant/citations.json",
+                    "Assistant/source-lifecycle.jsonl",
                 ],
                 "extractor_version": "1.0",
                 "errors": [],
@@ -3241,16 +3939,17 @@ class PortfolioService:
                 INSERT INTO sources(project_id, parent_source_id, source_type, native_id, sha256,
                   original_filename, original_path, metadata_json, meeting_name, meeting_date,
                   processing_state, model_id, created_at, processed_at, ingestion_path, source_title,
-                  source_date, capture_method, canonical_source, linked_ingestion_id, source_summary)
+                  source_date, capture_method, canonical_source, linked_ingestion_id, source_summary,
+                  memory_state, project_fit_confirmed, memory_state_changed_at)
                 VALUES (?, ?, 'routed_segment', ?, ?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?, ?, ?, ?,
-                        'routing_review', 0, ?, ?)
+                        'routing_review', 0, ?, ?, 'active', 1, ?)
                 """,
                 (target_project_id, source["id"], derived_native, source["sha256"],
                  source["original_filename"], source["original_path"],
                  _json({"review_id": review["id"]}), source["meeting_name"], source["meeting_date"],
                  source["model_id"], now, now, str(linked_package),
                  source["source_title"] or source["original_filename"], source["source_date"],
-                 source["ingestion_id"], normalize_text(str(segment["text"]))),
+                 source["ingestion_id"], normalize_text(str(segment["text"])), now),
             )
             derived_source_id = int(cursor.lastrowid)
             derived_citations = []
@@ -3387,10 +4086,14 @@ class PortfolioService:
         with self.db.connect() as connection:
             self._project(connection, project_id)
             rows = connection.execute(
-                "SELECT * FROM action_items WHERE project_id = ? ORDER BY state = 'complete', due_date, id",
+                """SELECT a.* FROM action_items a LEFT JOIN sources s ON s.id = a.source_id
+                   WHERE a.project_id = ?
+                     AND (a.source_id IS NULL OR a.created_by = 'user' OR s.memory_state = 'active')
+                   ORDER BY a.state = 'complete', a.due_date, a.id""",
                 (project_id,),
             ).fetchall()
-        return [self._decode_action(row) for row in rows]
+            decoded = self._decode_active_actions(connection, rows)
+        return decoded
 
     def create_action(self, project_id: str, values: dict[str, Any]) -> dict[str, Any]:
         description = normalize_text(str(values.get("description", "")))
@@ -3419,7 +4122,8 @@ class PortfolioService:
                  now, now, now if state == "complete" else None),
             )
             row = connection.execute("SELECT * FROM action_items WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        return self._decode_action(row)
+            decoded = self._decode_active_action(connection, row)
+        return decoded
 
     def update_action(self, project_id: str, action_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"description", "assignee_type", "assignee_value", "due_date", "state", "progress_text"}
@@ -3449,8 +4153,13 @@ class PortfolioService:
                  normalize_text(str(merged["assignee_value"])), merged.get("due_date"), merged["state"],
                  normalize_text(str(merged.get("progress_text") or "")) or None, utc_now(), action_id),
             )
+            if "progress_text" in values:
+                connection.execute(
+                    "UPDATE action_items SET citations_json = '[]' WHERE id = ?", (action_id,)
+                )
             updated = connection.execute("SELECT * FROM action_items WHERE id = ?", (action_id,)).fetchone()
-        return self._decode_action(updated)
+            decoded = self._decode_active_action(connection, updated)
+        return decoded
 
     def complete_action(self, project_id: str, action_id: int, confirmed: bool) -> dict[str, Any]:
         if not confirmed:
@@ -3467,7 +4176,8 @@ class PortfolioService:
                 (now, now, action_id),
             )
             updated = connection.execute("SELECT * FROM action_items WHERE id = ?", (action_id,)).fetchone()
-        return self._decode_action(updated)
+            decoded = self._decode_active_action(connection, updated)
+        return decoded
 
     def ask_project(self, project_id: str, question: str) -> dict[str, Any]:
         clean = normalize_text(question)
@@ -3476,7 +4186,9 @@ class PortfolioService:
         with self.db.connect() as connection:
             project = self._project(connection, project_id)
             recent_updates = [self._decode_update(row) for row in connection.execute(
-                "SELECT * FROM project_updates WHERE project_id = ? ORDER BY created_at DESC LIMIT 10",
+                """SELECT u.* FROM project_updates u LEFT JOIN sources s ON s.id = u.source_id
+                   WHERE u.project_id = ? AND (u.source_id IS NULL OR s.memory_state = 'active')
+                   ORDER BY u.created_at DESC, u.id DESC LIMIT 10""",
                 (project_id,),
             ).fetchall()]
         chunks = self.db.search_chunks(project_id, clean, limit=12)
@@ -3500,7 +4212,12 @@ class PortfolioService:
             }
         result = self.llm.chat(
             clean,
-            _json({"current_summary": project["current_summary"], "recent_updates": recent_updates}),
+            _json({
+                "current_summary": (
+                    project["current_summary"] if project["summary_generation_state"] == "current" else ""
+                ),
+                "recent_updates": recent_updates,
+            }),
             bounded,
         )
         if not isinstance(result, dict) or not isinstance(result.get("answer"), str):
@@ -3621,7 +4338,10 @@ class PortfolioService:
                 SELECT u.id AS update_id, u.project_id, u.text, u.update_type, u.citations_json,
                        u.created_at, p.name AS project_name
                 FROM project_updates u JOIN projects p ON p.id = u.project_id
-                WHERE u.created_at >= ? AND u.created_at < ? ORDER BY u.created_at, u.id
+                LEFT JOIN sources s ON s.id = u.source_id
+                WHERE u.created_at >= ? AND u.created_at < ?
+                  AND (u.source_id IS NULL OR s.memory_state = 'active')
+                ORDER BY u.created_at, u.id
                 """,
                 (window_start, window_end),
             ).fetchall()
@@ -3629,16 +4349,22 @@ class PortfolioService:
                 "SELECT count(*) FROM review_items WHERE status = 'open'"
             ).fetchone()[0])
             action_count = int(connection.execute(
-                "SELECT count(*) FROM action_items WHERE updated_at >= ? AND updated_at < ?",
+                """SELECT count(*) FROM action_items a LEFT JOIN sources s ON s.id = a.source_id
+                   WHERE a.updated_at >= ? AND a.updated_at < ?
+                     AND (a.source_id IS NULL OR a.created_by = 'user' OR s.memory_state = 'active')""",
                 (window_start, window_end),
             ).fetchone()[0])
-            action_rows = connection.execute(
+            action_rows = self._decode_active_actions(connection, connection.execute(
                 """SELECT a.id AS action_item_id, a.project_id, a.description, a.state,
-                          a.progress_text, a.created_at, a.updated_at, p.name AS project_name
+                          a.progress_text, a.citations_json, a.created_at, a.updated_at,
+                          a.source_id, a.created_by, p.name AS project_name
                    FROM action_items a JOIN projects p ON p.id = a.project_id
-                   WHERE a.updated_at >= ? AND a.updated_at < ? ORDER BY a.updated_at, a.id""",
+                   LEFT JOIN sources s ON s.id = a.source_id
+                   WHERE a.updated_at >= ? AND a.updated_at < ?
+                     AND (a.source_id IS NULL OR a.created_by = 'user' OR s.memory_state = 'active')
+                   ORDER BY a.updated_at, a.id""",
                 (window_start, window_end),
-            ).fetchall()
+            ).fetchall())
         evidence = [{
             "kind": "project_update", "update_id": int(row["update_id"]), "project_id": row["project_id"],
             "project_name": row["project_name"], "text": row["text"],

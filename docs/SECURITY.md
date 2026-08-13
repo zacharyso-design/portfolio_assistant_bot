@@ -13,8 +13,9 @@
 - LLM redirects are disabled, host-checked, and TLS verification is mandatory. Keys are read only from the configured environment variable.
 - Safe fixed error codes/messages are stored; model-supplied review text is not placed in source error fields. Source content, complete prompts/model responses, secrets, and attachments are not logged.
 - AI cannot complete action items or projects and cannot mutate manual status/priority without an explicit reviewed user decision.
-- Cross-project name detection requires a multi-word project name with exact word boundaries; single-word projects are detected only by their exact SNOW number, avoiding generic-name false positives.
-- Append-only triggers protect project updates and routing-rule history from ordinary update/delete operations.
+- Direct-project evidence is checked for project fit before its first memory commit. That endpoint call includes bounded source evidence plus the full local project roster (IDs, names, and SNOW numbers); low confidence or a better project match requires an explicit keep, move, or archive decision in Review Queue.
+- Source removal preserves the original package and hashes in the managed Archive while excluding its chunks and derived records from active retrieval. Package moves are constrained beneath the configured OneDrive root and collision checked.
+- Append-only triggers protect project updates, routing-rule history, and source lifecycle events from ordinary update/delete operations.
 - Read connections are closed deterministically after each service/query context; write transactions also close after commit or rollback.
 
 The acceptance suite covers hostile Host/Origin, traversal-shaped names, oversized capture cleanup, unsupported/scanned files, uncited model output, project-only retrieval, exact-once retry, attachment downloads, and manual closure protection.

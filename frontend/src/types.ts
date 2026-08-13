@@ -23,7 +23,9 @@ export type Source = {
   metadata: Record<string, unknown>;
   ingestion_id?: string; ingestion_path?: string; source_title?: string; source_date?: string;
   source_summary?: string; capture_method?: string; canonical_source?: number;
+  memory_state: "pending" | "active" | "removed"; project_fit_confirmed?: number;
   original_files?: OriginalFile[]; manifest?: Record<string, unknown>;
+  lifecycle?: Array<{ id: string; event_type: string; reason: string; created_at: string }>;
 };
 export type OriginalFile = { id: number; original_name: string; relative_path: string; size_bytes: number; sha256: string; is_attachment: number };
 export type KnowledgeItem = {

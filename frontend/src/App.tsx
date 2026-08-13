@@ -25,19 +25,23 @@ function useRoute() {
 
 const pause = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-async function pollProjectSource(projectId: string, sourceId: number, refresh: () => Promise<void>) {
+async function pollProjectSource(
+  projectId: string, sourceId: number, refresh: () => Promise<ProjectDetail | void>,
+) {
   for (let attempt = 0; attempt < 90; attempt += 1) {
-    const detail = await api.get<ProjectDetail>(`/api/projects/${projectId}`);
-    await refresh();
+    const refreshed = await refresh();
+    const detail = refreshed || await api.get<ProjectDetail>(`/api/projects/${projectId}`);
     const state = detail.sources.find(source => source.id === sourceId)?.processing_state;
     if (!state || !["captured", "processing"].includes(state)) return;
     await pause(1000);
   }
 }
 
-async function pollRefresh(refresh: () => Promise<void>, attempts = 15) {
+async function pollRefresh(refresh: () => Promise<ProjectDetail | void>, attempts = 15) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    await refresh();
+    const detail = await refresh();
+    // Project refreshes can stop early; Review Queue intentionally polls the full window because it has no source state yet.
+    if (detail && !detail.sources.some(source => ["captured", "processing"].includes(source.processing_state))) return;
     if (attempt + 1 < attempts) await pause(1000);
   }
 }
@@ -193,6 +197,7 @@ function ProjectWorkspace({ projectId, navigate }: { projectId: string; navigate
   const load = useCallback(async () => {
     const [detail, groupData] = await Promise.all([api.get<ProjectDetail>(`/api/projects/${projectId}`), api.get<Group[]>("/api/groups")]);
     setProject(detail); setGroups(groupData);
+    return detail;
   }, [projectId]);
   useEffect(() => { load().catch(error => setNotice(error.message)); }, [load]);
   async function patch(field: string, value: string | number | null) { setProject(await api.patch<ProjectDetail>(`/api/projects/${projectId}`, { [field]: value })); }

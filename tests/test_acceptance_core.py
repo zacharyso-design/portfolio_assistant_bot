@@ -4,7 +4,9 @@ import csv
 import io
 import hashlib
 import json
+import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -196,6 +198,25 @@ def test_direct_eml_and_msg_preservation_dedup_and_actions(client: TestClient, p
     assert client.get(f"/api/sources/{msg['id']}/original").headers["content-type"].startswith("application/octet-stream")
 
 
+def test_capture_removes_renamed_file_when_database_insert_fails(service, project, monkeypatch):
+    source_root = Path(project["folder_path"]) / "sources"
+    before = {path for path in source_root.rglob("*") if path.is_file()}
+
+    @contextmanager
+    def failed_transaction():
+        raise sqlite3.OperationalError("fictional database lock timeout")
+        yield
+
+    monkeypatch.setattr(service.db, "transaction", failed_transaction)
+    with pytest.raises(sqlite3.OperationalError, match="fictional database lock timeout"):
+        service.capture_source(
+            io.BytesIO(b"Fictional evidence must not become an orphan."),
+            "orphan-check.txt", project_id=project["id"],
+        )
+    after = {path for path in source_root.rglob("*") if path.is_file()}
+    assert after == before
+
+
 def test_transcript_docx_pdf_and_unsupported(client: TestClient, project, tmp_path: Path):
     missing = upload(client, project["id"], "weekly-sync.vtt", b"WEBVTT\n\n00:00.000 --> 00:02.000\nFictional Atlas decision")
     assert missing.status_code == 422
@@ -211,6 +232,16 @@ def test_transcript_docx_pdf_and_unsupported(client: TestClient, project, tmp_pa
     assert process(client, pdf["id"])["processed"] == 1
     scanned = upload(client, project["id"], "fictional-scan.pdf", make_pdf(tmp_path, False)).json()["source"]
     assert process(client, scanned["id"])["unsupported"] == 1
+    with client.app.state.db.connect() as connection:
+        before_retry = connection.execute(
+            "SELECT count(*) FROM source_chunks WHERE source_id = ?", (scanned["id"],)
+        ).fetchone()[0]
+    assert process(client, scanned["id"])["unsupported"] == 1
+    with client.app.state.db.connect() as connection:
+        after_retry = connection.execute(
+            "SELECT count(*) FROM source_chunks WHERE source_id = ?", (scanned["id"],)
+        ).fetchone()[0]
+    assert after_retry == before_retry
     unknown = upload(client, project["id"], "fictional-image.png", b"not-an-image").json()["source"]
     assert process(client, unknown["id"])["unsupported"] == 1
     detail = client.get(f"/api/projects/{project['id']}").json()
@@ -230,8 +261,9 @@ def test_ai_outage_and_exact_once_recovery(client: TestClient, project, service)
     service.llm.available = True
     good = upload(client, project["id"], "independent-note.txt", b"A separate fictional source processes independently.").json()["source"]
     assert process(client, good["id"])["processed"] == 1
-    assert process(client, pending["id"])["processed"] == 1
-    assert process(client, pending["id"])["processed"] == 0
+    assert client.post("/api/sources/retry-pending").json()["processed"] == 1
+    terminal = process(client, pending["id"])
+    assert terminal["processed"] == 0 and terminal["already_complete"] == 1
     with client.app.state.db.connect() as connection:
         assert connection.execute("SELECT count(*) FROM project_updates WHERE source_id = ?", (pending["id"],)).fetchone()[0] == 1
         assert connection.execute("SELECT retry_count FROM sources WHERE id = ?", (pending["id"],)).fetchone()[0] == 0
@@ -295,6 +327,31 @@ def test_snow_csv_xlsx_incremental_stale_and_malformed(client: TestClient, servi
     assert xlsx["new_comments_applied"] == 1
     malformed = client.post("/api/import/servicenow", files={"file": ("bad.csv", snow_csv("Freeform text without a deterministic header", updated="2026-08-13 12:00:00"), "text/csv")}).json()
     assert malformed["review_or_error_count"] == 1
+    ragged_stream = io.StringIO()
+    ragged_writer = csv.writer(ragged_stream)
+    ragged_writer.writerow([
+        "Number", "Short description", "Assignment group", "Updated",
+        "Comments and Work notes", "State", "Priority",
+    ])
+    ragged_writer.writerow([
+        "REQ0099003", "Fictional Ragged Export", "Fictional Clinical Apps",
+        "2026-08-15 12:00:00", old, "In Progress", "2", "unexpected-extra-value",
+    ])
+    ragged_writer.writerow([
+        "REQ0099004", "Fictional Short Export", "Fictional Clinical Apps",
+        "2026-08-15 13:00:00", old, "In Progress",
+    ])
+    ragged = client.post(
+        "/api/import/servicenow",
+        files={"file": ("ragged.csv", ragged_stream.getvalue().encode(), "text/csv")},
+    ).json()
+    assert ragged["tickets_read"] == 2 and ragged["review_or_error_count"] == 2
+    ragged_ids = set(ragged["review_item_ids"])
+    ragged_reviews = [
+        item for item in client.get("/api/reviews?status=open").json() if item["id"] in ragged_ids
+    ]
+    assert len(ragged_reviews) == 2
+    assert all("different number of values than the header" in item["reason"] for item in ragged_reviews)
     service.llm.available = False
     outage_comments = "2026-08-14 09:00:00 - Casey Morgan (Work note)\nPending fictional AI entry.\n" + extended
     outage = client.post("/api/import/servicenow", files={"file": ("outage.csv", snow_csv(outage_comments, updated="2026-08-14 12:00:00"), "text/csv")}).json()
@@ -302,11 +359,25 @@ def test_snow_csv_xlsx_incremental_stale_and_malformed(client: TestClient, servi
     with client.app.state.db.connect() as connection:
         before = connection.execute("SELECT snow_comments_cell_hash FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
     service.llm.available = True
-    client.post("/api/sources/retry-pending")
+    recovered = client.post(
+        "/api/import/servicenow",
+        files={"file": ("outage-retry.csv", snow_csv(outage_comments, updated="2026-08-14 12:00:00"), "text/csv")},
+    ).json()
+    assert recovered["new_comments_applied"] == 1 and recovered["tickets_unchanged"] == 0
+    service.llm.available = False
+    bulk_comments = "2026-08-15 09:00:00 - Avery Chen (Work note)\nBulk retry fictional entry.\n" + outage_comments
+    bulk_pending = client.post(
+        "/api/import/servicenow",
+        files={"file": ("bulk-pending.csv", snow_csv(bulk_comments, updated="2026-08-15 12:00:00"), "text/csv")},
+    ).json()
+    assert bulk_pending["pending_ai"] == 1
+    service.llm.available = True
+    assert client.post("/api/sources/retry-pending").json()["processed"] == 1
     with client.app.state.db.connect() as connection:
         after = connection.execute("SELECT snow_comments_cell_hash FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         assert after != before
         assert connection.execute("SELECT count(*) FROM source_chunks WHERE project_id = ? AND text = 'Pending fictional AI entry.'", (project_id,)).fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM source_chunks WHERE project_id = ? AND text = 'Bulk retry fictional entry.'", (project_id,)).fetchone()[0] == 1
 
 
 def test_project_scoped_chat_and_citation_validation(client: TestClient):
@@ -365,6 +436,15 @@ def test_action_progress_close_protection_and_daily_window(client: TestClient, p
     source = upload(client, project["id"], "action.txt", b"ACTION: Publish fictional guide | OWNER: Me | DUE: 2026-08-20").json()["source"]
     process(client, source["id"])
     action = client.get(f"/api/projects/{project['id']}").json()["action_items"][0]
+    invalid_create = client.post(f"/api/projects/{project['id']}/actions", json={
+        "description": "Invalid date", "assignee_type": "me", "assignee_value": "Me",
+        "due_date": "not-a-date", "state": "open",
+    })
+    assert invalid_create.status_code == 422
+    invalid_update = client.patch(
+        f"/api/projects/{project['id']}/actions/{action['id']}", json={"due_date": "2026-99-99"},
+    )
+    assert invalid_update.status_code == 422
     progress = upload(client, project["id"], "progress.txt", f"PROGRESS [{action['id']}]: Draft is ready for review.".encode()).json()["source"]
     process(client, progress["id"])
     updated = client.get(f"/api/projects/{project['id']}").json()["action_items"][0]

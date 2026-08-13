@@ -2,7 +2,7 @@
 
 - Server configuration accepts only `127.0.0.1`; inbound Host values are restricted to loopback names on the configured port and browser Origin values must use HTTP, a loopback hostname, and that exact port.
 - No analytics, telemetry, external fonts, CDNs, public assets, or commercial AI SDKs are present.
-- Every resolved source path must remain beneath the configured OneDrive root. Filenames are basename-normalized, control/reserved characters are replaced, and stored originals receive collision-safe prefixes.
+- Every resolved source path must remain beneath the configured OneDrive root. Filenames are basename-normalized and control/reserved characters are replaced. Windows device names are not rewritten directly, but every stored original receives a UUID prefix, so no saved basename can equal a reserved device name.
 - Upload, attachment, extracted-text, retry, and evidence-package sizes are bounded by configuration.
 - An ASGI request-size guard caps declared and streamed request bodies before unbounded multipart spooling; the file-level streaming check remains the authoritative source-size limit.
 - State-changing browser requests require either the exact configured loopback Origin or the application's non-simple `X-Requested-With` header, preventing origin-less form submissions from mutating data.
@@ -13,6 +13,7 @@
 - LLM redirects are disabled, host-checked, and TLS verification is mandatory. Keys are read only from the configured environment variable.
 - Safe fixed error codes/messages are stored; model-supplied review text is not placed in source error fields. Source content, complete prompts/model responses, secrets, and attachments are not logged.
 - AI cannot complete action items or projects and cannot mutate manual status/priority without an explicit reviewed user decision.
+- Cross-project name detection requires a multi-word project name with exact word boundaries; single-word projects are detected only by their exact SNOW number, avoiding generic-name false positives.
 - Append-only triggers protect project updates and routing-rule history from ordinary update/delete operations.
 - Read connections are closed deterministically after each service/query context; write transactions also close after commit or rollback.
 

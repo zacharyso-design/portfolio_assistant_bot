@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import time
 import uuid
 from datetime import date
@@ -108,12 +109,28 @@ def test_required_scale_and_response_thresholds(service, settings):
     retrieval_ms = (time.perf_counter() - start) * 1000
     assert len(chunks) == 12
     assert retrieval_ms < 500, f"FTS retrieval took {retrieval_ms:.1f} ms"
+
+    with service.db.connect() as connection:
+        chunks_before = connection.execute("SELECT count(*) FROM source_chunks").fetchone()[0]
+        updates_before = connection.execute("SELECT count(*) FROM project_updates").fetchone()[0]
+    assert chunks_before == 50_000 and updates_before == 5_000
+
+    source, duplicate = service.capture_source(
+        io.BytesIO(b"Fictional scale processing evidence remains project scoped."),
+        "scale-process.txt", project_id=projects[0][0],
+    )
+    assert not duplicate
+    # This guards the 249-project mention scan and local pipeline; the fake adapter excludes network LLM latency.
+    start = time.perf_counter()
+    assert service.process_source(source["id"]) == "complete"
+    process_ms = (time.perf_counter() - start) * 1000
+    assert process_ms < 500, f"source processing at 250-project scale took {process_ms:.1f} ms"
     print(
         f"scale timings ms: board={board_ms:.1f}, filter={filtered_ms:.1f}, "
-        f"project={project_ms:.1f}, retrieval={retrieval_ms:.1f}"
+        f"project={project_ms:.1f}, retrieval={retrieval_ms:.1f}, process={process_ms:.1f}"
     )
 
     with service.db.connect() as connection:
-        assert connection.execute("SELECT count(*) FROM source_chunks").fetchone()[0] == 50_000
-        assert connection.execute("SELECT count(*) FROM project_updates").fetchone()[0] == 5_000
+        assert connection.execute("SELECT count(*) FROM source_chunks").fetchone()[0] == chunks_before + 1
+        assert connection.execute("SELECT count(*) FROM project_updates").fetchone()[0] == updates_before + 1
         assert connection.execute("SELECT count(*) FROM action_items").fetchone()[0] == 2_000

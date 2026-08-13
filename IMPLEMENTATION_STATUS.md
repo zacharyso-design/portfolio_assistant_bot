@@ -24,7 +24,7 @@ Command:
 .\.venv\Scripts\python.exe -m pytest -q -s
 ```
 
-Result: **20 passed**. The suite includes the real background-worker claim path and explicit non-test fake-adapter guard. The warnings are an upstream FastAPI use of Python 3.14's deprecated `asyncio.iscoroutinefunction`; no application warning or failure occurred.
+Result: **21 passed**. The suite includes the real background-worker claim path, post-rename database-failure cleanup, and explicit non-test fake-adapter guard. The warnings are an upstream FastAPI use of Python 3.14's deprecated `asyncio.iscoroutinefunction`; no application warning or failure occurred.
 
 Scale fixture and measured workstation timings (LLM time excluded):
 
@@ -36,6 +36,7 @@ Scale fixture and measured workstation timings (LLM time excluded):
 - Filter/search API: under 50 ms (under 250 ms).
 - Project page service: under 5 ms (under 300 ms).
 - FTS evidence retrieval: under 20 ms (under 500 ms).
+- Local source-processing pipeline with the fake adapter and 250-project cross-project scan: under 100 ms (under 500 ms); network LLM latency is excluded.
 
 Frontend production build: TypeScript and Vite succeeded with no public runtime assets. A dated 2026-08-12 in-app browser check at 1024 × 768 covered grouped keyboard-reachable portfolio rows, separate filters, manual project controls, direct drop, visible summary citations with exact source/locator and original access, persistent right-side project chat, Review Queue transcript controls, and fixed-column SNOW import. The document width remained within the viewport.
 

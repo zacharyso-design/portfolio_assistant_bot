@@ -417,6 +417,25 @@ class PortfolioService:
         now = datetime.now()
         return self._under_root(Path(project["folder_path"]) / "sources" / f"{now:%Y}" / f"{now:%m}")
 
+    @staticmethod
+    def _find_existing_source(
+        connection: sqlite3.Connection, *, project_id: str | None, digest: str,
+        native_id: str | None, multi_project: bool,
+    ) -> sqlite3.Row | None:
+        if multi_project:
+            return connection.execute(
+                "SELECT * FROM sources WHERE project_id IS NULL AND sha256 = ?", (digest,)
+            ).fetchone()
+        if native_id:
+            return connection.execute(
+                "SELECT * FROM sources WHERE project_id = ? AND native_id = ?", (project_id, native_id)
+            ).fetchone()
+        return connection.execute(
+            """SELECT * FROM sources WHERE project_id = ? AND sha256 = ?
+               AND parent_source_id IS NULL""",
+            (project_id, digest),
+        ).fetchone()
+
     def capture_source(
         self,
         stream: BinaryIO,
@@ -446,6 +465,8 @@ class PortfolioService:
         destination = self._destination_dir(project, multi_project)
         destination.mkdir(parents=True, exist_ok=True)
         temp_path = self._under_root(destination / f".{uuid.uuid4().hex}.capture.tmp{suffix}")
+        final_path: Path | None = None
+        source_committed = False
         total = 0
         limit = self.settings.app.max_file_mb * 1024 * 1024
         try:
@@ -461,19 +482,10 @@ class PortfolioService:
             digest = sha256_file(temp_path)
             native_id = inspect_native_id(temp_path)
             with self.db.connect() as connection:
-                if multi_project:
-                    existing = connection.execute(
-                        "SELECT * FROM sources WHERE project_id IS NULL AND sha256 = ?", (digest,)
-                    ).fetchone()
-                elif native_id:
-                    existing = connection.execute(
-                        "SELECT * FROM sources WHERE project_id = ? AND native_id = ?", (project_id, native_id)
-                    ).fetchone()
-                else:
-                    existing = connection.execute(
-                        "SELECT * FROM sources WHERE project_id = ? AND sha256 = ? AND parent_source_id IS NULL",
-                        (project_id, digest),
-                    ).fetchone()
+                existing = self._find_existing_source(
+                    connection, project_id=project_id, digest=digest,
+                    native_id=native_id, multi_project=multi_project,
+                )
             if existing:
                 temp_path.unlink(missing_ok=True)
                 return self._decode_source(existing), True
@@ -481,21 +493,38 @@ class PortfolioService:
             os.replace(temp_path, final_path)
             now = utc_now()
             source_type = suffix.lstrip(".") or "unknown"
+            insert_error: sqlite3.IntegrityError | None = None
+            concurrent = None
             with self.db.transaction() as connection:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO sources(
-                      project_id, source_type, native_id, sha256, original_filename, original_path,
-                      metadata_json, meeting_name, meeting_date, processing_state, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?)
-                    """,
-                    (project_id, source_type, native_id, digest, clean_name, str(final_path),
-                     normalize_text(meeting_name or "") or None, meeting_date, now),
-                )
-                row = connection.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
+                try:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO sources(
+                          project_id, source_type, native_id, sha256, original_filename, original_path,
+                          metadata_json, meeting_name, meeting_date, processing_state, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?)
+                        """,
+                        (project_id, source_type, native_id, digest, clean_name, str(final_path),
+                         normalize_text(meeting_name or "") or None, meeting_date, now),
+                    )
+                    row = connection.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
+                except sqlite3.IntegrityError as exc:
+                    insert_error = exc
+                    concurrent = self._find_existing_source(
+                        connection, project_id=project_id, digest=digest,
+                        native_id=native_id, multi_project=multi_project,
+                    )
+            if insert_error is not None:
+                final_path.unlink(missing_ok=True)
+                if concurrent:
+                    return self._decode_source(concurrent), True
+                raise ConflictError("Source insert conflict") from insert_error
+            source_committed = True
             return self._decode_source(row), False
         except Exception:
             temp_path.unlink(missing_ok=True)
+            if final_path is not None and not source_committed:
+                final_path.unlink(missing_ok=True)
             raise
 
     def capture_note(self, project_id: str, text: str, title: str = "Manual note") -> dict[str, Any]:
@@ -550,13 +579,25 @@ class PortfolioService:
             source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         if not source:
             raise NotFoundError("Source not found")
-        counts = {"processed": 0, "pending_ai": 0, "needs_review": 0, "unsupported": 0, "error": 0}
+        counts = {
+            "processed": 0, "pending_ai": 0, "needs_review": 0,
+            "unsupported": 0, "error": 0, "already_complete": 0,
+        }
         if source["parent_source_id"] is None:
-            if source["processing_state"] == "needs_review":
-                counts["needs_review"] = 1
+            if source["processing_state"] == "complete":
+                counts["already_complete"] = 1
                 return counts
-            return self.process_pending(manual=True, source_id=source_id, limit=1)
+            if source["processing_state"] in {"needs_review", "unsupported"}:
+                counts[source["processing_state"]] = 1
+                return counts
+            result = self.process_pending(manual=True, source_id=source_id, limit=1)
+            counts.update(result)
+            return counts
         if source["processing_state"] != "error":
+            if source["processing_state"] == "complete":
+                counts["already_complete"] = 1
+            elif source["processing_state"] in counts:
+                counts[source["processing_state"]] = 1
             return counts
         with self.db.transaction() as connection:
             connection.execute(
@@ -649,6 +690,7 @@ class PortfolioService:
     def _find_other_project_mentions(
         self, selected_project_id: str, evidence: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
+        # Multi-word names avoid generic substring false positives; single-word projects require an exact SNOW number.
         combined = "\n".join(str(item["text"]) for item in evidence).casefold()
         with self.db.connect() as connection:
             projects = connection.execute(
@@ -1065,6 +1107,8 @@ class PortfolioService:
                     if row_result.get("review_id"):
                         result["review_or_error_count"] += 1
                         result["review_item_ids"].append(row_result["review_id"])
+                    elif row_result.get("error"):
+                        result["review_or_error_count"] += 1
                 except (ValidationError, ValueError) as exc:
                     review_id = self._create_review(
                         kind="snow_invalid_row", source_id=None, project_id=None,
@@ -1090,9 +1134,15 @@ class PortfolioService:
                     continue
             if text is None:
                 raise ValidationError("CSV encoding must be UTF-8 or Windows-1252")
-            reader = csv.DictReader(io.StringIO(text))
+            reader = csv.DictReader(io.StringIO(text), restkey="__extra_columns__", restval=None)
             columns = [str(column).strip() for column in (reader.fieldnames or [])]
-            rows = [{str(key).strip(): value for key, value in row.items()} for row in reader]
+            rows = []
+            for raw in reader:
+                row = {str(key).strip(): value for key, value in raw.items()}
+                row["__ragged_row__"] = bool(row.get("__extra_columns__")) or any(
+                    row.get(column) is None for column in columns
+                )
+                rows.append(row)
             return rows, columns
         workbook = load_workbook(path, read_only=True, data_only=True)
         try:
@@ -1101,8 +1151,15 @@ class PortfolioService:
             header = next(iterator, None)
             if not header:
                 raise ValidationError("XLSX export is empty")
-            columns = [str(value).strip() if value is not None else "" for value in header]
-            rows = [dict(zip(columns, values)) for values in iterator if any(value is not None for value in values)]
+            header_width = max((index + 1 for index, value in enumerate(header) if value is not None), default=0)
+            columns = [str(value).strip() if value is not None else "" for value in header[:header_width]]
+            rows = []
+            for values in iterator:
+                if not any(value is not None for value in values):
+                    continue
+                row = dict(zip(columns, values[:header_width]))
+                row["__ragged_row__"] = any(value is not None for value in values[header_width:])
+                rows.append(row)
             return rows, columns
         finally:
             workbook.close()
@@ -1174,6 +1231,8 @@ class PortfolioService:
     def _import_snow_row(
         self, raw: dict[str, Any], row_number: int, export_path: Path, export_sha: str
     ) -> dict[str, Any]:
+        if raw.get("__ragged_row__"):
+            raise ValidationError("SNOW row has a different number of values than the header")
         number = normalize_text(str(raw.get("Number") or ""))
         name = normalize_text(str(raw.get("Short description") or ""))
         assignment = normalize_text(str(raw.get("Assignment group") or ""))
@@ -1261,8 +1320,9 @@ class PortfolioService:
             return {
                 "project_id": project_id,
                 "new_comments_applied": len(prepared) if state == "complete" else 0,
-                "unchanged": state == "complete",
+                "unchanged": False,
                 "pending_ai": state == "pending_ai",
+                "error": state == "error",
                 "review_id": self._latest_source_review(int(existing_source["id"])) if state == "needs_review" else None,
             }
         source_id = self._insert_snow_source(
@@ -1288,6 +1348,7 @@ class PortfolioService:
             "new_comments_applied": len(prepared) if state == "complete" else 0,
             "unchanged": False,
             "pending_ai": state == "pending_ai",
+            "error": state == "error",
             "review_id": self._latest_source_review(source_id) if state == "needs_review" else None,
         }
 
@@ -1720,7 +1781,10 @@ class PortfolioService:
         if not description or assignee_type not in ASSIGNEE_TYPES or not assignee_value or state not in ACTION_STATES:
             raise ValidationError("Action description, assignee, and state are invalid")
         if due:
-            date.fromisoformat(str(due))
+            try:
+                date.fromisoformat(str(due))
+            except ValueError as exc:
+                raise ValidationError("due_date must be an ISO date") from exc
         now = utc_now()
         with self.db.transaction() as connection:
             self._project(connection, project_id)
@@ -1754,7 +1818,10 @@ class PortfolioService:
             if merged["assignee_type"] not in ASSIGNEE_TYPES or merged["state"] not in {"open", "blocked"}:
                 raise ValidationError("Invalid action item assignee or state")
             if merged.get("due_date"):
-                date.fromisoformat(str(merged["due_date"]))
+                try:
+                    date.fromisoformat(str(merged["due_date"]))
+                except ValueError as exc:
+                    raise ValidationError("due_date must be an ISO date") from exc
             connection.execute(
                 """UPDATE action_items SET description = ?, assignee_type = ?, assignee_value = ?,
                    due_date = ?, state = ?, progress_text = ?, updated_at = ?, completed_at = NULL WHERE id = ?""",

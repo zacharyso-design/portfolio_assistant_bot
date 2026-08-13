@@ -24,11 +24,11 @@ Fake adapter (tests) or approved internal HTTPS LLM only
 6. Citation IDs are validated against exactly that package.
 7. Summary, append-only updates, supported action operations, chunk checkpoints, and completed source state commit in one SQLite transaction.
 
-AI unavailability leaves evidence durable in `pending_ai`; retry is idempotent. Unsupported inputs remain preserved as `unsupported`. Startup recovers interrupted `processing` rows.
+AI unavailability leaves evidence durable in `pending_ai`; retry is idempotent. The worker stops automatically claiming a source after `automatic_ai_attempts` failures, while the manual **Retry pending** control can explicitly try it again. Unsupported inputs remain preserved as `unsupported`. Startup recovers interrupted `processing` rows.
 
 ## SNOW import
 
-CSV/XLSX rows upsert by `Number`. `Updated` is only the stale-row guard. Cumulative comment boundaries and entry hashes are deterministic before any AI call. Only completed entry hashes count as checkpoints; malformed or pending-AI cells do not advance the project cell hash.
+CSV/XLSX rows upsert by `Number`. `Updated` is only the stale-row guard. Cumulative comment boundaries and entry hashes are deterministic before any AI call. Only completed entry hashes count as checkpoints; malformed or pending-AI cells do not advance the project cell hash. CSV rows with fewer or more fields than their header go to review. XLSX values beyond the final named header go to review, while blank trailing cells remain valid because spreadsheet readers cannot distinguish an omitted optional cell from an intentionally blank one.
 
 ## Multi-project routing
 

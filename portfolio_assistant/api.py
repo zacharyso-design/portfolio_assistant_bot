@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -53,6 +54,9 @@ class ProjectUpdate(StrictModel):
 class NoteCreate(StrictModel):
     title: str = "Manual note"
     text: str = Field(min_length=1)
+    is_transcript: bool = False
+    meeting_name: str | None = None
+    meeting_date: str | None = None
 
 
 class ChatRequest(StrictModel):
@@ -96,6 +100,10 @@ class Completion(StrictModel):
 
 class RuleActive(StrictModel):
     active: bool
+
+
+class ReviewStatus(StrictModel):
+    status: str
 
 
 class ContentSizeLimitMiddleware:
@@ -267,26 +275,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/projects/{project_id}/sources", status_code=202)
     def upload_source(
-        project_id: str, file: UploadFile = File(...), meeting_name: str | None = Form(None),
+        project_id: str, file: UploadFile | None = File(None), files: list[UploadFile] = File(default=[]),
+        relative_paths: str | None = Form(None), meeting_name: str | None = Form(None),
         meeting_date: str | None = Form(None), is_transcript: bool = Form(False),
     ) -> dict[str, Any]:
-        source, duplicate = service.capture_source(
-            file.file, file.filename or "source", project_id=project_id,
-            meeting_name=meeting_name, meeting_date=meeting_date, is_transcript=is_transcript,
+        uploads = ([file] if file else []) + files
+        if not uploads:
+            raise HTTPException(status_code=422, detail="At least one file is required")
+        try:
+            paths = json.loads(relative_paths) if relative_paths else []
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail="relative_paths must be a JSON array") from exc
+        source, duplicate = service.capture_sources(
+            [(upload.file, upload.filename or "source", paths[index] if index < len(paths) else upload.filename or "source")
+             for index, upload in enumerate(uploads)],
+            project_id=project_id, meeting_name=meeting_name, meeting_date=meeting_date,
+            is_transcript=is_transcript,
         )
         return {"source": source, "duplicate": duplicate}
 
     @app.post("/api/projects/{project_id}/notes", status_code=202)
     def note(project_id: str, body: NoteCreate) -> dict[str, Any]:
-        return service.capture_note(project_id, body.text, body.title)
+        return service.capture_note(
+            project_id, body.text, body.title, is_transcript=body.is_transcript,
+            meeting_name=body.meeting_name, meeting_date=body.meeting_date,
+        )
 
     @app.post("/api/intake/multi-project", status_code=202)
     def multi_project_upload(
-        file: UploadFile = File(...), meeting_name: str | None = Form(None),
+        file: UploadFile | None = File(None), files: list[UploadFile] = File(default=[]),
+        relative_paths: str | None = Form(None), meeting_name: str | None = Form(None),
         meeting_date: str | None = Form(None), is_transcript: bool = Form(False),
     ) -> dict[str, Any]:
-        source, duplicate = service.capture_source(
-            file.file, file.filename or "source", project_id=None,
+        uploads = ([file] if file else []) + files
+        if not uploads:
+            raise HTTPException(status_code=422, detail="At least one file is required")
+        try:
+            paths = json.loads(relative_paths) if relative_paths else []
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail="relative_paths must be a JSON array") from exc
+        source, duplicate = service.capture_sources(
+            [(upload.file, upload.filename or "source", paths[index] if index < len(paths) else upload.filename or "source")
+             for index, upload in enumerate(uploads)], project_id=None,
             meeting_name=meeting_name, meeting_date=meeting_date,
             is_transcript=is_transcript, multi_project=True,
         )
@@ -312,6 +342,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def original(source_id: int) -> FileResponse:
         path, filename = service.get_source_original(source_id)
         return FileResponse(path, media_type="application/octet-stream", filename=filename, content_disposition_type="attachment")
+
+    @app.get("/api/sources/{source_id}")
+    def source_detail(source_id: int) -> dict[str, Any]:
+        return service.source_detail(source_id)
+
+    @app.get("/api/original-files/{original_file_id}")
+    def original_file(original_file_id: int) -> FileResponse:
+        path, filename = service.get_original_file(original_file_id)
+        return FileResponse(path, media_type="application/octet-stream", filename=filename, content_disposition_type="attachment")
+
+    @app.get("/api/citations/{citation_id}/original")
+    def citation_original(citation_id: str) -> FileResponse:
+        path, filename = service.get_citation_original(citation_id)
+        return FileResponse(path, media_type="application/octet-stream", filename=filename, content_disposition_type="attachment")
+
+    @app.get("/api/projects/{project_id}/knowledge")
+    def knowledge(
+        project_id: str, review_status: str = "all", category: str = "", q: str = ""
+    ) -> list[dict[str, Any]]:
+        return service.list_knowledge(project_id, review_status=review_status, category=category, query=q)
+
+    @app.patch("/api/projects/{project_id}/knowledge/{knowledge_id}")
+    def review_knowledge(project_id: str, knowledge_id: str, body: ReviewStatus) -> dict[str, Any]:
+        return service.review_knowledge(project_id, knowledge_id, body.status)
+
+    @app.get("/api/projects/{project_id}/living-summary")
+    def living_summary(project_id: str) -> dict[str, Any]:
+        return service.get_living_summary(project_id)
+
+    @app.get("/api/projects/{project_id}/living-summary/versions/{revision}")
+    def living_summary_version(project_id: str, revision: int) -> dict[str, Any]:
+        return service.get_summary_version(project_id, revision)
+
+    @app.post("/api/projects/{project_id}/living-summary/regenerate")
+    def regenerate_summary(project_id: str) -> dict[str, Any]:
+        return service.regenerate_living_summary(project_id)
+
+    @app.patch("/api/projects/{project_id}/living-summary/review")
+    def review_summary(project_id: str, body: ReviewStatus) -> dict[str, Any]:
+        return service.review_summary(project_id, body.status)
+
+    @app.post("/api/sources/{source_id}/refresh-derived")
+    def refresh_source_derivatives(source_id: int) -> dict[str, Any]:
+        return service.refresh_source_derivatives(source_id)
+
+    @app.get("/api/search")
+    def archive_search(q: str, project_id: str | None = None, limit: int = Query(50, ge=1, le=100)) -> list[dict[str, Any]]:
+        return service.search_archive(q, project_id=project_id, limit=limit)
+
+    @app.post("/api/archive/rescan")
+    def rescan_archive() -> dict[str, int]:
+        return service.rebuild_index()
 
     @app.post("/api/projects/{project_id}/chat")
     def chat(project_id: str, body: ChatRequest) -> dict[str, Any]:

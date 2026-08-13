@@ -1,6 +1,6 @@
 # CHIO Portfolio Assistant
 
-CHIO Portfolio Assistant is a single-user Windows application for preserving project material, maintaining cited project knowledge, importing cumulative ServiceNow exports, and asking one project questions against its local evidence. It binds only to `127.0.0.1`, stores SQLite outside OneDrive, and makes no public runtime calls.
+CHIO Portfolio Assistant is a single-user Windows application for preserving project material, maintaining cited project knowledge, importing cumulative ServiceNow exports, and asking one project questions against its local evidence. It binds only to `127.0.0.1`, stores its rebuildable SQLite index outside OneDrive, and makes no public runtime calls.
 
 ## Install from source
 
@@ -13,6 +13,19 @@ Copy-Item config.example.toml config.toml
 ```
 
 Set `one_drive_root` to the locally synced portfolio root. Configure only the approved internal LLM endpoint. Put its key in the environment variable named by `llm.api_key_env`; never put the key in TOML.
+
+The application creates this durable archive below that root:
+
+```text
+CHIO Portfolio Assistant\
+  Projects\
+  Shared Intake\
+  Archive\
+```
+
+Each project has one stable-ID folder. Every upload becomes a self-contained ingestion package containing byte-preserved originals, hashes, a manifest, extracted text, citations, and knowledge items. Multi-project material is preserved once in `Shared Intake` and linked into projects only after Review Queue confirmation. Where policy permits, mark the `CHIO Portfolio Assistant` folder **Always keep on this device** so originals are locally available for hashing and citation access.
+
+Keep project folders as direct children of `Projects`; the bot owns that layout, and manual regrouping or moving of managed package folders is not supported.
 
 Start in the background and open `http://127.0.0.1:8765`:
 
@@ -56,10 +69,24 @@ The installer reads `app.daily_run_time` from TOML. If GFE policy blocks task cr
 .\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml config-test --connect
 .\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml daily
 .\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml retry-pending
+.\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml rebuild-index
+.\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml rescan-onedrive
 .\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml acceptance-setup --projects 250
 ```
 
 `config-test` never displays secrets. The fake adapter is for fictional tests and demonstrations only; production configuration uses `adapter = "internal"`.
+
+`rebuild-index` and `rescan-onedrive` rebuild the local SQLite index from the OneDrive manifests and assistant sidecars without modifying or reprocessing original files. The Portfolio page also provides a **Rescan OneDrive** button.
+
+## Project archive workflow
+
+Open a project and use the upload area to select one file, multiple files, or a folder. Use **Paste a note or transcript** when no original container exists; the archive records the capture method as `pasted_text` and never represents pasted email text as an original `.msg` or `.eml`.
+
+Project pages separate three review surfaces:
+
+- **Living Summary** shows the current cited project state, independent approval, failure/retry status, and prior-version comparison. Each manual regeneration intentionally creates a new auditable version, even when the eligible knowledge has not changed.
+- **Knowledge History** shows chronological cited updates with date, source, category, and review filters.
+- **Sources** exposes each package, original files and hashes, the manifest, errors, and a hash-verified **Rebuild derived files** action that never replaces originals.
 
 ## Test
 
@@ -71,7 +98,7 @@ Push-Location frontend; npm ci; npm run build; Pop-Location
 
 ## Backup and recovery
 
-Stop the application, then copy the configured `database_path` file and the complete configured `one_drive_root`. A consistent backup requires both. SQLite WAL/SHM files can exist while the app is running, which is why stopping first matters. Originals, source records, updates, and review history are append-oriented; the application has no broad cleanup command.
+The OneDrive package archive is the durable record. The active SQLite database remains outside OneDrive to avoid sync conflicts and can be rebuilt from the archive. For a complete point-in-time backup of UI/cache state as well, stop the application, then copy the configured `database_path` and `one_drive_root`; SQLite WAL/SHM files can exist while the app is running. Originals, source records, updates, and review history are append-oriented, and the application has no broad cleanup command.
 
 If processing is interrupted, startup safely recovers `processing` records and retries captured/pending work within configured limits. Use **Retry pending** after endpoint recovery.
 

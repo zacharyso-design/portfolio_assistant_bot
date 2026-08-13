@@ -26,6 +26,7 @@ class LlmAdapter(Protocol):
     def knowledge_update(self, summary: str, evidence: list[dict[str, Any]]) -> dict[str, Any]: ...
     def chat(self, question: str, summary: str, evidence: list[dict[str, Any]]) -> dict[str, Any]: ...
     def route(self, evidence: list[dict[str, Any]], projects: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def living_summary(self, project: dict[str, Any], knowledge_items: list[dict[str, Any]]) -> dict[str, Any]: ...
     def daily(self, evidence: list[dict[str, Any]], counts: dict[str, Any]) -> dict[str, Any]: ...
     def test_connection(self) -> dict[str, Any]: ...
 
@@ -109,6 +110,24 @@ class FakeLlmAdapter:
             })
         return {"segments": segments}
 
+    def living_summary(self, project: dict[str, Any], knowledge_items: list[dict[str, Any]]) -> dict[str, Any]:
+        self._check()
+        section_names = {
+            "decision": "Decisions",
+            "risk": "Risks and Issues",
+            "milestone": "Schedule and Milestones",
+            "action": "Open Actions",
+            "development": "Latest Developments",
+        }
+        sections = []
+        for item in knowledge_items[-12:]:
+            sections.append({
+                "section": section_names.get(item.get("category"), "Latest Developments"),
+                "text": item["text"],
+                "knowledge_item_ids": [item["id"]],
+            })
+        return {"sections": sections}
+
     def daily(self, evidence: list[dict[str, Any]], counts: dict[str, Any]) -> dict[str, Any]:
         self._check()
         if not evidence:
@@ -181,6 +200,24 @@ class InternalHttpLlmAdapter:
 
     def route(self, evidence: list[dict[str, Any]], projects: list[dict[str, Any]]) -> dict[str, Any]:
         return self._call("multi_project_routing", {"evidence": evidence, "projects": projects})
+
+    def living_summary(self, project: dict[str, Any], knowledge_items: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._call(
+            "living_project_summary",
+            {
+                "instructions": (
+                    "Regenerate the project's current state only from the supplied knowledge items. "
+                    "Return sections as objects with section, text, and knowledge_item_ids. "
+                    "Every factual section must cite only supplied knowledge item IDs. Omit unsupported sections."
+                ),
+                "supported_sections": [
+                    "Current Status", "Objective", "Latest Developments", "Decisions",
+                    "Schedule and Milestones", "Risks and Issues", "Open Actions", "Next Steps", "What Changed",
+                ],
+                "project": project,
+                "knowledge_items": knowledge_items,
+            },
+        )
 
     def daily(self, evidence: list[dict[str, Any]], counts: dict[str, Any]) -> dict[str, Any]:
         return self._call("daily_update", {"evidence": evidence, "counts": counts})

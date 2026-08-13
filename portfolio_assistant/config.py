@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .archive import ensure_archive_roots
+
 
 class ConfigurationError(ValueError):
     pass
@@ -135,6 +137,8 @@ def ensure_runtime_paths(settings: Settings) -> None:
     except OSError as exc:
         raise ConfigurationError(f"Configured OneDrive root is not writable: {root}") from exc
     settings.app.database_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_archive_roots(root)
     (root / "_PortfolioAssistant" / "imports" / "snow").mkdir(parents=True, exist_ok=True)
+    # Retain legacy locations so pre-archive installs can migrate their existing files in place.
     (root / "_PortfolioAssistant" / "intake" / "multi-project").mkdir(parents=True, exist_ok=True)
     (root / "Projects").mkdir(parents=True, exist_ok=True)

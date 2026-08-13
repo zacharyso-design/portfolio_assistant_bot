@@ -24,4 +24,11 @@ export const api = {
     Object.entries(fields).forEach(([key, value]) => form.append(key, String(value)));
     return request<T>(path, { method: "POST", body: form });
   },
+  uploadMany: <T>(path: string, files: File[], fields: Record<string, string | boolean> = {}) => {
+    const form = new FormData();
+    files.forEach(file => form.append("files", file));
+    form.append("relative_paths", JSON.stringify(files.map(file => file.webkitRelativePath || file.name)));
+    Object.entries(fields).forEach(([key, value]) => form.append(key, String(value)));
+    return request<T>(path, { method: "POST", body: form });
+  },
 };

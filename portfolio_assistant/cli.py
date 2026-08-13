@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("acceptance-setup")
     setup.add_argument("--projects", type=int, default=250)
     subparsers.add_parser("retry-pending")
+    subparsers.add_parser("rebuild-index")
+    subparsers.add_parser("rescan-onedrive")
     return parser
 
 
@@ -160,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _seed(service, max(1, min(args.projects, 250)))
         elif args.command == "retry-pending":
             result = service.process_pending(manual=True, limit=100)
+        elif args.command in {"rebuild-index", "rescan-onedrive"}:
+            result = service.rebuild_index()
         else:
             return 2
         print(json.dumps(result, indent=2, ensure_ascii=False))

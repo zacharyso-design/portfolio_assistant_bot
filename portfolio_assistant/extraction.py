@@ -12,10 +12,11 @@ from typing import Any
 import extract_msg
 from bs4 import BeautifulSoup
 from docx import Document
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 
-SUPPORTED_SUFFIXES = {".eml", ".msg", ".txt", ".md", ".vtt", ".srt", ".docx", ".pdf"}
+SUPPORTED_SUFFIXES = {".eml", ".msg", ".txt", ".md", ".vtt", ".srt", ".docx", ".pdf", ".xlsx"}
 TRANSCRIPT_SUFFIXES = {".vtt", ".srt"}
 
 
@@ -214,6 +215,32 @@ def _extract_pdf(path: Path) -> ExtractedSource:
     return ExtractedSource("pdf", None, {"pages": page_count}, chunks)
 
 
+def _extract_xlsx(path: Path) -> ExtractedSource:
+    """Read displayed workbook values without evaluating formulas or macros."""
+    workbook = None
+    try:
+        workbook = load_workbook(filename=path, read_only=True, data_only=True)
+        chunks: list[dict[str, Any]] = []
+        sheet_names: list[str] = []
+        for worksheet in workbook.worksheets:
+            sheet_names.append(worksheet.title)
+            lines: list[str] = []
+            for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                values = [normalize_text(str(value)) for value in row if value is not None and str(value).strip()]
+                if values:
+                    lines.append(f"Row {row_number}: " + " | ".join(values))
+            if lines:
+                chunks.extend(_chunk_lines("\n".join(lines), f"sheet {worksheet.title} rows"))
+    except Exception as exc:
+        raise ExtractionFailure("The XLSX workbook could not be parsed") from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
+    if not chunks:
+        raise UnsupportedSource("The XLSX workbook contains no extractable displayed values")
+    return ExtractedSource("xlsx", None, {"worksheets": sheet_names}, chunks)
+
+
 def inspect_native_id(path: Path) -> str | None:
     suffix = path.suffix.casefold()
     if suffix == ".eml":
@@ -251,6 +278,8 @@ def extract_source(path: Path, *, max_attachments: int, max_text_bytes: int) -> 
         result = _extract_docx(path)
     elif suffix == ".pdf":
         result = _extract_pdf(path)
+    elif suffix == ".xlsx":
+        result = _extract_xlsx(path)
     else:
         try:
             text = path.read_text(encoding="utf-8-sig")

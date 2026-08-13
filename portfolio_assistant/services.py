@@ -6,15 +6,30 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
 from openpyxl import load_workbook
 
+from .archive import (
+    SCHEMA_VERSION,
+    atomic_write_json,
+    atomic_write_text,
+    ensure_archive_roots,
+    ingestion_folder_name,
+    project_folder_name,
+    read_json,
+    relative_to_root,
+    stable_id,
+    update_manifest,
+    write_project_files,
+)
 from .config import Settings
 from .db import Database, utc_now
 from .extraction import (
@@ -77,16 +92,13 @@ def _safe_error(exc: Exception) -> str:
     return "The operation failed. See application diagnostics for the safe error code."
 
 
-def _slug(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
-    return text[:60] or "project"
-
-
 class PortfolioService:
     def __init__(self, settings: Settings, db: Database, llm: LlmAdapter):
         self.settings = settings
         self.db = db
         self.llm = llm
+        self.archive_paths = ensure_archive_roots(settings.app.one_drive_root)
+        self.migrate_archive()
 
     def _under_root(self, path: Path) -> Path:
         root = self.settings.app.one_drive_root.resolve()
@@ -102,6 +114,471 @@ class PortfolioService:
         if not row:
             raise NotFoundError("Project not found")
         return row
+
+    @staticmethod
+    def _archive_project_id(project_id: str) -> str:
+        compact = re.sub(r"[^A-Fa-f0-9]", "", project_id)
+        if len(compact) < 8:
+            compact = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
+        return f"P-{compact[:8].upper()}"
+
+    @staticmethod
+    def _legacy_ingestion_id(source: sqlite3.Row) -> str:
+        material = f"{source['id']}:{source['sha256']}".encode("utf-8")
+        return f"I-{hashlib.sha256(material).hexdigest()[:8].upper()}"
+
+    def _write_project_archive(self, project: sqlite3.Row | dict[str, Any]) -> Path:
+        archive_id = str(project["archive_id"] or self._archive_project_id(str(project["id"])))
+        existing = Path(str(project["folder_path"]))
+        descriptor_path = existing / "_Assistant" / "project.json"
+        descriptor = None
+        if descriptor_path.is_file():
+            try:
+                descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                descriptor = None
+        folder = (
+            self._under_root(existing)
+            if isinstance(descriptor, dict) and descriptor.get("archive_id") == archive_id
+            else self._under_root(
+                self.archive_paths["projects"] / project_folder_name(str(project["name"]), archive_id)
+            )
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        write_project_files(
+            folder,
+            project_id=str(project["id"]),
+            archive_id=archive_id,
+            name=str(project["name"]),
+            created_at=str(project["created_at"]),
+        )
+        return folder
+
+    def _initial_assistant_files(self, package: Path, ingestion_id: str, project_id: str | None, title: str) -> None:
+        assistant = package / "Assistant"
+        (assistant / "Extracted").mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            assistant / "source-summary.md",
+            f"# {title}\n\nProcessing is pending. No derived source summary is available yet.\n",
+        )
+        atomic_write_json(
+            assistant / "index.json",
+            {
+                "ingestion_id": ingestion_id,
+                "project_id": project_id,
+                "title": title,
+                "summary": "Processing pending.",
+                "topics": [],
+                "people": [],
+                "organizations": [],
+                "ticket_numbers": [],
+                "suggested_project_ids": [project_id] if project_id else [],
+                "original_files": [],
+                "processing_version": 1,
+            },
+        )
+        atomic_write_json(assistant / "knowledge-items.json", [])
+        atomic_write_json(assistant / "citations.json", [])
+
+    def migrate_archive(self) -> dict[str, int]:
+        """Idempotently materialize legacy database records in the durable OneDrive archive."""
+        counts = {"projects": 0, "sources": 0, "missing_originals": 0}
+        with self.db.connect() as connection:
+            projects = connection.execute("SELECT * FROM projects ORDER BY created_at, id").fetchall()
+        for project in projects:
+            archive_id = str(project["archive_id"] or self._archive_project_id(str(project["id"])))
+            folder = self._write_project_archive({**dict(project), "archive_id": archive_id})
+            if project["archive_id"] != archive_id or Path(project["folder_path"]) != folder:
+                with self.db.transaction() as connection:
+                    connection.execute(
+                        "UPDATE projects SET archive_id = ?, folder_path = ? WHERE id = ?",
+                        (archive_id, str(folder), project["id"]),
+                    )
+                counts["projects"] += 1
+
+        with self.db.connect() as connection:
+            roots = connection.execute(
+                "SELECT * FROM sources WHERE parent_source_id IS NULL AND ingestion_path IS NULL ORDER BY id"
+            ).fetchall()
+        for source in roots:
+            ingestion_id = str(source["ingestion_id"] or self._legacy_ingestion_id(source))
+            with self.db.connect() as connection:
+                project = self._project(connection, source["project_id"]) if source["project_id"] else None
+            destination = Path(project["folder_path"]) if project else self.archive_paths["shared_intake"]
+            created = datetime.fromisoformat(str(source["created_at"]).replace("Z", "+00:00"))
+            title = str(source["meeting_name"] or Path(source["original_filename"]).stem)
+            folder_name = ingestion_folder_name(created, source["source_type"], title, ingestion_id)
+            final = self._under_root(destination / folder_name)
+            incomplete = self._under_root(destination / f"_INCOMPLETE_{ingestion_id}")
+            if not final.exists():
+                incomplete.mkdir(parents=True, exist_ok=True)
+                original_dir = incomplete / "Original"
+                original_dir.mkdir(exist_ok=True)
+                self._initial_assistant_files(incomplete, ingestion_id, source["project_id"], title)
+                old = Path(source["original_path"])
+                originals: list[dict[str, Any]] = []
+                errors: list[str] = []
+                new_original: Path | None = None
+                if old.is_file():
+                    stored = safe_filename(source["original_filename"], "source")
+                    new_original = original_dir / stored
+                    shutil.copy2(old, new_original)
+                    originals.append({
+                        "relative_path": f"Original/{stored}",
+                        "original_name": source["original_filename"],
+                        "stored_name": stored,
+                        "size_bytes": new_original.stat().st_size,
+                        "sha256": sha256_file(new_original),
+                    })
+                else:
+                    errors.append("Legacy original is unavailable; no replacement was fabricated.")
+                    counts["missing_originals"] += 1
+                atomic_write_json(incomplete / "manifest.json", {
+                    "schema_version": SCHEMA_VERSION,
+                    "ingestion_id": ingestion_id,
+                    "project_id": project["archive_id"] if project else None,
+                    "database_project_id": source["project_id"],
+                    "source_type": source["source_type"],
+                    "title": title,
+                    "created_at": source["created_at"],
+                    "source_date": source["meeting_date"],
+                    "capture_method": "legacy_migration",
+                    "canonical_source": True,
+                    "linked_ingestion_id": None,
+                    "processing_status": source["processing_state"],
+                    "original_files": originals,
+                    "assistant_files": [],
+                    "extractor_version": "1.0",
+                    "errors": errors,
+                })
+                os.replace(incomplete, final)
+            counts["missing_originals"] += self._migrate_legacy_attachments(int(source["id"]), final)
+            manifest = read_json(final / "manifest.json", {})
+            originals = manifest.get("original_files", [])
+            primary = final / str(originals[0]["relative_path"]) if originals else Path(source["original_path"])
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """UPDATE sources SET ingestion_id = ?, ingestion_path = ?, source_title = ?,
+                       capture_method = 'legacy_migration', original_path = ? WHERE id = ?""",
+                    (ingestion_id, str(final), title, str(primary), source["id"]),
+                )
+                for item in originals:
+                    connection.execute(
+                        """INSERT OR IGNORE INTO original_files(
+                           source_id, relative_path, original_name, stored_name, size_bytes, sha256,
+                           is_attachment, created_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (source["id"], item["relative_path"], item["original_name"], item["stored_name"],
+                         item["size_bytes"], item["sha256"], int(bool(item.get("is_attachment"))),
+                         source["created_at"]),
+                    )
+            self._refresh_source_archive(int(source["id"]))
+            counts["sources"] += 1
+        with self.db.connect() as connection:
+            legacy_updates = connection.execute(
+                """SELECT u.* FROM project_updates u
+                   WHERE u.source_id IS NOT NULL AND u.update_type IN ('knowledge', 'routed_review')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM knowledge_items k
+                     WHERE k.source_id = u.source_id AND k.text = u.text
+                   ) ORDER BY u.created_at, u.id"""
+            ).fetchall()
+        touched_projects: set[str] = set()
+        touched_sources: set[int] = set()
+        for update in legacy_updates:
+            with self.db.transaction() as connection:
+                source = connection.execute("SELECT * FROM sources WHERE id = ?", (update["source_id"],)).fetchone()
+                if not source:
+                    continue
+                citation_ids = []
+                for citation in _decode(update["citations_json"], []):
+                    try:
+                        validated = {"source_id": int(citation["source_id"]), "chunk_id": int(citation["chunk_id"])}
+                        durable = self._ensure_citation_record(connection, source, validated, update["created_at"])
+                        citation_ids.append(durable["citation_id"])
+                    except (KeyError, TypeError, ValueError, LlmContractError):
+                        continue
+                if not citation_ids:
+                    continue
+                connection.execute(
+                    """INSERT INTO knowledge_items(
+                       id, project_id, source_id, text, category, source_date, citation_ids_json,
+                       review_status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', ?)""",
+                    (stable_id("K"), update["project_id"], update["source_id"], update["text"],
+                     self._knowledge_category(update["text"]), source["source_date"] or source["created_at"],
+                     _json(citation_ids), update["created_at"]),
+                )
+            touched_projects.add(str(update["project_id"]))
+            touched_sources.add(int(update["source_id"]))
+        with self.db.transaction() as connection:
+            legacy_projects = connection.execute(
+                """SELECT * FROM projects WHERE current_summary <> '' AND NOT EXISTS (
+                     SELECT 1 FROM summary_versions v WHERE v.project_id = projects.id
+                   )"""
+            ).fetchall()
+            for project in legacy_projects:
+                content = {"legacy": True, "sections": [{
+                    "section": "Legacy Summary",
+                    "text": project["current_summary"],
+                    "knowledge_item_ids": [],
+                }]}
+                connection.execute(
+                    """INSERT INTO summary_versions(
+                       project_id, revision, content_json, markdown, review_status,
+                       generation_state, model_id, created_at
+                       ) VALUES (?, 0, ?, ?, 'unreviewed', 'stale', NULL, ?)""",
+                    (project["id"], _json(content), f"## Legacy Summary\n\n{project['current_summary']}",
+                     project["updated_at"]),
+                )
+                connection.execute(
+                    "UPDATE projects SET summary_generation_state = 'stale' WHERE id = ?", (project["id"],)
+                )
+                legacy_path = (
+                    Path(project["folder_path"]) / "_Assistant" / "living-summary" / "versions" /
+                    "000000__legacy.json"
+                )
+                atomic_write_json(legacy_path, {
+                    "schema_version": SCHEMA_VERSION, "project_id": project["archive_id"],
+                    "revision": 0, "review_status": "unreviewed", "generation_state": "stale",
+                    "created_at": project["updated_at"], **content,
+                })
+        for source_id in touched_sources:
+            self._refresh_source_archive(source_id)
+        for project_id in touched_projects:
+            self._write_knowledge_history(project_id)
+        return counts
+
+    def _migrate_legacy_attachments(self, root_source_id: int, package: Path) -> int:
+        """Copy legacy attachment source rows into their root source's durable package."""
+        manifest_path = package / "manifest.json"
+        manifest = read_json(manifest_path, {})
+        if not isinstance(manifest, dict):
+            manifest = {}
+        originals = manifest.get("original_files")
+        if not isinstance(originals, list):
+            originals = []
+        errors = manifest.get("errors")
+        if not isinstance(errors, list):
+            errors = []
+        with self.db.connect() as connection:
+            children = connection.execute(
+                """WITH RECURSIVE descendants(id) AS (
+                     SELECT id FROM sources WHERE parent_source_id = ?
+                     UNION ALL
+                     SELECT s.id FROM sources s JOIN descendants d ON s.parent_source_id = d.id
+                   )
+                   SELECT s.* FROM sources s WHERE s.id IN (SELECT id FROM descendants)
+                   ORDER BY s.id""",
+                (root_source_id,),
+            ).fetchall()
+        used = {str(item.get("relative_path", "")).casefold() for item in originals}
+        missing = 0
+        changed = False
+        for child in children:
+            existing_item = next(
+                (item for item in originals if item.get("legacy_source_id") == int(child["id"])), None
+            )
+            old_path = Path(child["original_path"])
+            if existing_item:
+                migrated_path = self._under_root(package / str(existing_item["relative_path"]))
+                if migrated_path.is_file():
+                    with self.db.transaction() as connection:
+                        connection.execute(
+                            """UPDATE sources SET original_path = ?, ingestion_path = ?,
+                               capture_method = 'legacy_attachment_migration' WHERE id = ?""",
+                            (str(migrated_path), str(package), child["id"]),
+                        )
+                    continue
+            if not old_path.is_file():
+                message = f"Legacy attachment is unavailable: {child['original_filename']}"
+                if message not in errors:
+                    errors.append(message)
+                    changed = True
+                missing += 1
+                continue
+            digest = sha256_file(old_path)
+            name = safe_filename(child["original_filename"], f"attachment-{child['id']}")
+            candidate = Path("Original") / "Attachments" / name
+            suffix = 2
+            while candidate.as_posix().casefold() in used:
+                candidate = candidate.with_name(f"{Path(name).stem}-{suffix}{Path(name).suffix}")
+                suffix += 1
+            used.add(candidate.as_posix().casefold())
+            migrated_path = self._under_root(package / candidate)
+            migrated_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = migrated_path.parent / f".{uuid.uuid4().hex}.tmp"
+            try:
+                shutil.copy2(old_path, temporary)
+                if sha256_file(temporary) != digest:
+                    raise ConflictError("Legacy attachment copy failed its integrity check")
+                os.replace(temporary, migrated_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            item = {
+                "relative_path": candidate.as_posix(),
+                "original_name": child["original_filename"],
+                "stored_name": migrated_path.name,
+                "size_bytes": migrated_path.stat().st_size,
+                "sha256": digest,
+                "is_attachment": True,
+                "legacy_source_id": int(child["id"]),
+            }
+            originals.append(item)
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """INSERT OR IGNORE INTO original_files(
+                       source_id, relative_path, original_name, stored_name, size_bytes, sha256,
+                       is_attachment, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                    (root_source_id, item["relative_path"], item["original_name"], item["stored_name"],
+                     item["size_bytes"], item["sha256"], child["created_at"]),
+                )
+                connection.execute(
+                    """UPDATE sources SET original_path = ?, ingestion_path = ?,
+                       capture_method = 'legacy_attachment_migration' WHERE id = ?""",
+                    (str(migrated_path), str(package), child["id"]),
+                )
+            changed = True
+        if changed:
+            manifest["original_files"] = originals
+            manifest["errors"] = errors
+            atomic_write_json(manifest_path, manifest)
+        return missing
+
+    @staticmethod
+    def _knowledge_category(text: str) -> str:
+        lowered = text.casefold()
+        if any(word in lowered for word in ("approved", "decided", "decision")):
+            return "decision"
+        if any(word in lowered for word in ("risk", "issue", "blocked", "delay")):
+            return "risk"
+        if any(word in lowered for word in ("due", "milestone", "schedule", "target date")):
+            return "milestone"
+        if any(word in lowered for word in ("action", "follow up", "next step")):
+            return "action"
+        return "development"
+
+    def _refresh_source_archive(self, source_id: int, *, processing_status: str | None = None) -> None:
+        with self.db.connect() as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if not source or not source["ingestion_path"]:
+                return
+            related_ids = [source_id]
+            if source["source_type"] == "routed_segment":
+                related_ids = [int(row["id"]) for row in connection.execute(
+                    "SELECT id FROM sources WHERE project_id = ? AND ingestion_path = ?",
+                    (source["project_id"], source["ingestion_path"]),
+                ).fetchall()]
+            placeholders = ",".join("?" for _ in related_ids)
+            originals = [dict(row) for row in connection.execute(
+                f"""SELECT * FROM original_files WHERE source_id IN ({placeholders})
+                    ORDER BY is_attachment, id""", related_ids
+            ).fetchall()]
+            chunks = [dict(row) for row in connection.execute(
+                f"""WITH RECURSIVE source_tree(id) AS (
+                       SELECT id FROM sources WHERE id IN ({placeholders})
+                       UNION ALL
+                       SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                     )
+                     SELECT c.* FROM source_chunks c WHERE c.source_id IN (SELECT id FROM source_tree)
+                     ORDER BY c.source_id, c.sequence""",
+                related_ids,
+            ).fetchall()]
+            knowledge = [dict(row) for row in connection.execute(
+                f"SELECT * FROM knowledge_items WHERE source_id IN ({placeholders}) ORDER BY created_at, id",
+                related_ids,
+            ).fetchall()]
+            citations = [dict(row) for row in connection.execute(
+                f"SELECT * FROM citation_records WHERE source_id IN ({placeholders}) ORDER BY id", related_ids
+            ).fetchall()]
+            project = (
+                connection.execute("SELECT * FROM projects WHERE id = ?", (source["project_id"],)).fetchone()
+                if source["project_id"] else None
+            )
+        package = self._under_root(Path(source["ingestion_path"]))
+        metadata = _decode(source["metadata_json"], {})
+        source_summary = source["source_summary"].strip()
+        if not source_summary:
+            preview = normalize_text(" ".join(chunk["text"] for chunk in chunks))[:900]
+            source_summary = preview or "No searchable text was extracted; the original remains preserved."
+        tickets = sorted(set(re.findall(r"\b(?:REQ|INC|CHG|RITM|TASK)[-_]?\d+\b", source_summary, re.IGNORECASE)))
+        topics = sorted({self._knowledge_category(item["text"]) for item in knowledge})
+        addresses = getaddresses([
+            str(metadata.get("sender") or ""), str(metadata.get("recipients") or ""),
+            str(metadata.get("cc") or ""),
+        ])
+        people = sorted({normalize_text(name) or address for name, address in addresses if name or address})
+        organizations = {address.rsplit("@", 1)[1].casefold() for _, address in addresses if "@" in address}
+        organizations.update(re.findall(r"\b[A-Z][A-Z0-9&-]{1,9}\b", source_summary))
+        original_payload = [{
+            "relative_path": item["relative_path"],
+            "original_name": item["original_name"],
+            "stored_name": item["stored_name"],
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+            "is_attachment": bool(item["is_attachment"]),
+        } for item in originals]
+        atomic_write_text(
+            package / "Assistant" / "source-summary.md",
+            f"# {source['source_title'] or source['original_filename']}\n\n"
+            f"- **Source type:** {source['source_type']}\n"
+            f"- **Source date:** {source['source_date'] or source['created_at']}\n"
+            f"- **Project:** {project['name'] if project else 'Shared intake — awaiting routing'}\n\n"
+            f"## Overview\n\n{source_summary}\n\n"
+            f"## Categories\n\n{', '.join(topics) if topics else 'Not yet categorized'}\n",
+        )
+        atomic_write_json(package / "Assistant" / "index.json", {
+            "ingestion_id": source["ingestion_id"],
+            "project_id": project["archive_id"] if project else None,
+            "title": source["source_title"] or source["original_filename"],
+            "source_type": source["source_type"],
+            "source_date": source["source_date"] or source["created_at"],
+            "summary": source_summary,
+            "topics": topics,
+            "people": people,
+            "organizations": sorted(organizations),
+            "ticket_numbers": tickets,
+            "suggested_project_ids": [project["archive_id"]] if project else [],
+            "original_files": original_payload,
+            "email_metadata": {key: metadata.get(key) for key in (
+                "subject", "sender", "recipients", "cc", "timestamp", "message_id"
+            ) if metadata.get(key)},
+            "processing_version": source["processing_version"],
+        })
+        atomic_write_json(package / "Assistant" / "knowledge-items.json", [{
+            "knowledge_item_id": item["id"],
+            "project_id": project["archive_id"] if project else item["project_id"],
+            "text": item["text"],
+            "category": item["category"],
+            "source_date": item["source_date"],
+            "citation_ids": _decode(item["citation_ids_json"], []),
+            "review_status": item["review_status"],
+            "supersedes_knowledge_item_id": item["supersedes_knowledge_item_id"],
+        } for item in knowledge])
+        atomic_write_json(package / "Assistant" / "citations.json", [{
+            "citation_id": item["id"],
+            "original_relative_path": item["original_relative_path"],
+            "display_name": item["display_name"],
+            "source_type": item["source_type"],
+            "locator": item["locator"],
+            "excerpt": item["excerpt"],
+            "source_date": item["source_date"],
+        } for item in citations])
+        existing_manifest = read_json(package / "manifest.json", {})
+        archive_errors = list(existing_manifest.get("errors", [])) if isinstance(existing_manifest, dict) else []
+        if source["error_message"] and source["error_message"] not in archive_errors:
+            archive_errors.append(source["error_message"])
+        update_manifest(
+            package,
+            processing_status=processing_status or source["processing_state"],
+            original_files=original_payload,
+            assistant_files=[
+                "Assistant/source-summary.md", "Assistant/index.json",
+                "Assistant/knowledge-items.json", "Assistant/citations.json", "Assistant/Extracted",
+            ],
+            errors=archive_errors,
+        )
 
     def create_group(self, name: str, sort_order: int = 0) -> dict[str, Any]:
         clean = normalize_text(name)
@@ -161,13 +638,15 @@ class PortfolioService:
         if not clean or len(clean) > 240:
             raise ValidationError("Project name must be 1-240 characters")
         project_id = str(uuid.uuid4())
+        archive_id = self._archive_project_id(project_id)
         folder = self._under_root(
-            self.settings.app.one_drive_root / "Projects" / f"{_slug(clean)}--{project_id}"
+            self.archive_paths["projects"] / project_folder_name(clean, archive_id)
         )
         folder.mkdir(parents=True, exist_ok=False)
-        (folder / "sources").mkdir()
-        (folder / "attachments").mkdir()
         now = utc_now()
+        write_project_files(
+            folder, project_id=project_id, archive_id=archive_id, name=clean, created_at=now
+        )
         try:
             with self.db.transaction() as connection:
                 if portfolio_group_id is None:
@@ -180,18 +659,16 @@ class PortfolioService:
                 connection.execute(
                     """
                     INSERT INTO projects(
-                      id, name, portfolio_group_id, snow_number, assignment_group,
+                      id, archive_id, name, portfolio_group_id, snow_number, assignment_group,
                       snow_metadata_json, folder_path, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (project_id, clean, portfolio_group_id, snow_number, assignment_group,
+                    (project_id, archive_id, clean, portfolio_group_id, snow_number, assignment_group,
                      _json(snow_metadata or {}), str(folder), now, now),
                 )
         except Exception:
             try:
-                (folder / "sources").rmdir()
-                (folder / "attachments").rmdir()
-                folder.rmdir()
+                shutil.rmtree(folder)
             except OSError:
                 pass
             raise
@@ -314,6 +791,8 @@ class PortfolioService:
                     seen.add(pair)
                     summary_citations.append(citation)
         result["summary_citations"] = summary_citations
+        result["knowledge_history"] = self.list_knowledge(project_id)
+        result["living_summary"] = self.get_living_summary(project_id)
         return result
 
     def _enrich_citations(
@@ -336,6 +815,7 @@ class PortfolioService:
                 enriched.append({
                     "source_id": source_id,
                     "chunk_id": chunk_id,
+                    "citation_id": citation.get("citation_id"),
                     "locator": row["locator"],
                     "original_filename": row["original_filename"],
                     "meeting_name": row["meeting_name"],
@@ -407,15 +887,23 @@ class PortfolioService:
                         (project_id, text, now),
                     )
                     connection.execute("UPDATE projects SET latest_change = ? WHERE id = ?", (text, project_id))
-        return self.get_project(project_id)
+        updated_project = self.get_project(project_id)
+        if "name" in fields:
+            write_project_files(
+                Path(updated_project["folder_path"]),
+                project_id=project_id,
+                archive_id=updated_project["archive_id"],
+                name=updated_project["name"],
+                created_at=updated_project["created_at"],
+            )
+        return updated_project
 
     def _destination_dir(self, project: sqlite3.Row | None, multi_project: bool) -> Path:
         if multi_project:
-            return self._under_root(self.settings.app.one_drive_root / "_PortfolioAssistant" / "intake" / "multi-project")
+            return self._under_root(self.archive_paths["shared_intake"])
         if project is None:
             raise ValidationError("A destination project is required")
-        now = datetime.now()
-        return self._under_root(Path(project["folder_path"]) / "sources" / f"{now:%Y}" / f"{now:%m}")
+        return self._under_root(Path(project["folder_path"]))
 
     @staticmethod
     def _find_existing_source(
@@ -446,9 +934,41 @@ class PortfolioService:
         meeting_date: str | None = None,
         is_transcript: bool = False,
         multi_project: bool = False,
+        capture_method: str = "file_upload",
     ) -> tuple[dict[str, Any], bool]:
-        clean_name = safe_filename(filename, "source")
-        suffix = Path(clean_name).suffix.casefold()
+        return self.capture_sources(
+            [(stream, filename, filename)],
+            project_id=project_id,
+            meeting_name=meeting_name,
+            meeting_date=meeting_date,
+            is_transcript=is_transcript,
+            multi_project=multi_project,
+            capture_method=capture_method,
+        )
+
+    @staticmethod
+    def _safe_relative_path(value: str, fallback: str) -> Path:
+        candidate = str(value or fallback).replace("\\", "/")
+        parts = [part for part in candidate.split("/") if part not in {"", "."}]
+        if not parts or any(part == ".." for part in parts) or Path(candidate).is_absolute():
+            parts = [fallback]
+        return Path(*(safe_filename(part, "item") for part in parts))
+
+    def capture_sources(
+        self,
+        files: list[tuple[BinaryIO, str, str]],
+        *,
+        project_id: str | None,
+        meeting_name: str | None = None,
+        meeting_date: str | None = None,
+        is_transcript: bool = False,
+        multi_project: bool = False,
+        capture_method: str = "file_upload",
+    ) -> tuple[dict[str, Any], bool]:
+        if not files:
+            raise ValidationError("At least one source file is required")
+        first_name = safe_filename(files[0][1], "source")
+        suffix = Path(first_name).suffix.casefold()
         if (suffix in TRANSCRIPT_SUFFIXES or is_transcript) and (not meeting_name or not meeting_date):
             raise ValidationError("Meeting name and meeting date are required for transcripts")
         if meeting_date:
@@ -464,35 +984,101 @@ class PortfolioService:
             raise ValidationError("Multi-project intake cannot have a project destination before review")
         destination = self._destination_dir(project, multi_project)
         destination.mkdir(parents=True, exist_ok=True)
-        temp_path = self._under_root(destination / f".{uuid.uuid4().hex}.capture.tmp{suffix}")
-        final_path: Path | None = None
+        ingestion_id = stable_id("I")
+        incomplete = self._under_root(destination / f"_INCOMPLETE_{ingestion_id}")
+        incomplete.mkdir(parents=False, exist_ok=False)
+        (incomplete / "Original").mkdir()
+        title = normalize_text(meeting_name or Path(first_name).stem) or "Source"
+        source_kind = (
+            "meeting-transcript" if is_transcript or suffix in TRANSCRIPT_SUFFIXES
+            else "email" if suffix in {".msg", ".eml"}
+            else "uploaded-folder" if any("/" in relative.replace("\\", "/") for _, _, relative in files)
+            else "multiple-files" if len(files) > 1
+            else suffix.lstrip(".") or "unknown"
+        )
+        created_local = datetime.now().astimezone()
+        final_package = self._under_root(
+            destination / ingestion_folder_name(created_local, source_kind, title, ingestion_id)
+        )
         source_committed = False
         total = 0
         limit = self.settings.app.max_file_mb * 1024 * 1024
+        stored_files: list[dict[str, Any]] = []
+        used_paths: set[str] = set()
         try:
-            with temp_path.open("xb") as output:
-                while True:
-                    block = stream.read(1024 * 1024)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > limit:
-                        raise ValidationError(f"File exceeds the configured {self.settings.app.max_file_mb} MB limit")
-                    output.write(block)
-            digest = sha256_file(temp_path)
-            native_id = inspect_native_id(temp_path)
+            for stream, original_name, relative_name in files:
+                relative = self._safe_relative_path(relative_name, safe_filename(original_name, "source"))
+                relative_key = relative.as_posix().casefold()
+                original_relative = relative
+                collision = 2
+                while relative_key in used_paths:
+                    relative = original_relative.with_name(
+                        f"{original_relative.stem}-{collision}{original_relative.suffix}"
+                    )
+                    relative_key = relative.as_posix().casefold()
+                    collision += 1
+                used_paths.add(relative_key)
+                output_path = self._under_root(incomplete / "Original" / relative)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("xb") as output:
+                    while True:
+                        block = stream.read(1024 * 1024)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > limit:
+                            raise ValidationError(
+                                f"Ingestion exceeds the configured {self.settings.app.max_file_mb} MB limit"
+                            )
+                        output.write(block)
+                stored_files.append({
+                    "relative_path": f"Original/{relative.as_posix()}",
+                    "original_name": original_name,
+                    "stored_name": relative.name,
+                    "size_bytes": output_path.stat().st_size,
+                    "sha256": sha256_file(output_path),
+                })
+            digest = (
+                stored_files[0]["sha256"] if len(stored_files) == 1
+                else hashlib.sha256(_json(sorted([
+                    (item["relative_path"], item["sha256"]) for item in stored_files
+                ])).encode("utf-8")).hexdigest()
+            )
+            primary_incomplete = incomplete / stored_files[0]["relative_path"]
+            native_id = inspect_native_id(primary_incomplete) if len(stored_files) == 1 else None
             with self.db.connect() as connection:
                 existing = self._find_existing_source(
                     connection, project_id=project_id, digest=digest,
                     native_id=native_id, multi_project=multi_project,
                 )
             if existing:
-                temp_path.unlink(missing_ok=True)
+                shutil.rmtree(incomplete)
                 return self._decode_source(existing), True
-            final_path = self._under_root(destination / f"{uuid.uuid4().hex[:12]}-{clean_name}")
-            os.replace(temp_path, final_path)
             now = utc_now()
-            source_type = suffix.lstrip(".") or "unknown"
+            self._initial_assistant_files(incomplete, ingestion_id, project_id, title)
+            atomic_write_json(incomplete / "manifest.json", {
+                "schema_version": SCHEMA_VERSION,
+                "ingestion_id": ingestion_id,
+                "project_id": project["archive_id"] if project else None,
+                "database_project_id": project_id,
+                "source_type": source_kind,
+                "title": title,
+                "created_at": now,
+                "source_date": meeting_date,
+                "capture_method": capture_method,
+                "canonical_source": True,
+                "linked_ingestion_id": None,
+                "processing_status": "captured",
+                "original_files": stored_files,
+                "assistant_files": [
+                    "Assistant/source-summary.md", "Assistant/index.json",
+                    "Assistant/knowledge-items.json", "Assistant/citations.json",
+                ],
+                "extractor_version": "1.0",
+                "errors": [],
+            })
+            os.replace(incomplete, final_package)
+            primary_final = final_package / stored_files[0]["relative_path"]
             insert_error: sqlite3.IntegrityError | None = None
             concurrent = None
             with self.db.transaction() as connection:
@@ -501,12 +1087,24 @@ class PortfolioService:
                         """
                         INSERT INTO sources(
                           project_id, source_type, native_id, sha256, original_filename, original_path,
-                          metadata_json, meeting_name, meeting_date, processing_state, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?)
+                          metadata_json, meeting_name, meeting_date, processing_state, created_at,
+                          ingestion_id, ingestion_path, source_title, source_date, capture_method,
+                          canonical_source, processing_version
+                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, 'captured', ?, ?, ?, ?, ?, ?, 1, 1)
                         """,
-                        (project_id, source_type, native_id, digest, clean_name, str(final_path),
-                         normalize_text(meeting_name or "") or None, meeting_date, now),
+                        (project_id, source_kind, native_id, digest, first_name, str(primary_final),
+                         normalize_text(meeting_name or "") or None, meeting_date, now, ingestion_id,
+                         str(final_package), title, meeting_date, capture_method),
                     )
+                    source_id = int(cursor.lastrowid)
+                    for item in stored_files:
+                        connection.execute(
+                            """INSERT INTO original_files(
+                               source_id, relative_path, original_name, stored_name, size_bytes, sha256, created_at
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (source_id, item["relative_path"], item["original_name"], item["stored_name"],
+                             item["size_bytes"], item["sha256"], now),
+                        )
                     row = connection.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
                 except sqlite3.IntegrityError as exc:
                     insert_error = exc
@@ -515,24 +1113,35 @@ class PortfolioService:
                         native_id=native_id, multi_project=multi_project,
                     )
             if insert_error is not None:
-                final_path.unlink(missing_ok=True)
+                shutil.rmtree(final_package)
                 if concurrent:
                     return self._decode_source(concurrent), True
                 raise ConflictError("Source insert conflict") from insert_error
             source_committed = True
             return self._decode_source(row), False
         except Exception:
-            temp_path.unlink(missing_ok=True)
-            if final_path is not None and not source_committed:
-                final_path.unlink(missing_ok=True)
+            if final_package.exists() and not source_committed:
+                recovery = destination / f"_INCOMPLETE_{ingestion_id}"
+                if not recovery.exists():
+                    os.replace(final_package, recovery)
+            elif incomplete.exists():
+                shutil.rmtree(incomplete)
             raise
 
-    def capture_note(self, project_id: str, text: str, title: str = "Manual note") -> dict[str, Any]:
+    def capture_note(
+        self, project_id: str, text: str, title: str = "Manual note", *,
+        is_transcript: bool = False, meeting_name: str | None = None,
+        meeting_date: str | None = None,
+    ) -> dict[str, Any]:
         body = text.strip()
         if not body:
             raise ValidationError("Manual note cannot be blank")
-        filename = f"{safe_filename(title, 'Manual note')}.txt"
-        source, _ = self.capture_source(io.BytesIO(body.encode("utf-8")), filename, project_id=project_id)
+        filename = "transcript-as-submitted.txt" if is_transcript else f"{safe_filename(title, 'Manual note')}.txt"
+        source, _ = self.capture_source(
+            io.BytesIO(body.encode("utf-8")), filename, project_id=project_id,
+            meeting_name=meeting_name, meeting_date=meeting_date, is_transcript=is_transcript,
+            capture_method="pasted_text",
+        )
         return source
 
     def recover_interrupted(self) -> int:
@@ -724,6 +1333,11 @@ class PortfolioService:
                    retry_count = retry_count + ? WHERE id = ?""",
                 (state, code, _safe_error(error), int(increment_retry), source_id),
             )
+            row = connection.execute(
+                "SELECT id, parent_source_id FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        if row:
+            self._refresh_source_archive(int(row["parent_source_id"] or row["id"]), processing_status=state)
 
     def _ensure_extracted(self, source_id: int) -> None:
         with self.db.connect() as connection:
@@ -732,37 +1346,91 @@ class PortfolioService:
                 "SELECT count(*) FROM source_chunks WHERE source_id = ? OR source_id IN (SELECT id FROM sources WHERE parent_source_id = ?)",
                 (source_id, source_id),
             ).fetchone()[0]
+            originals = connection.execute(
+                "SELECT * FROM original_files WHERE source_id = ? AND is_attachment = 0 ORDER BY id",
+                (source_id,),
+            ).fetchall()
         metadata = _decode(source["metadata_json"], {})
         if existing and (metadata.get("_extraction_complete") is True or source["source_type"] in {"snow_comments", "routed_segment"}):
             return
-        result = extract_source(
-            Path(source["original_path"]),
-            max_attachments=self.settings.app.max_attachments,
-            max_text_bytes=self.settings.app.max_extracted_text_mb * 1024 * 1024,
-        )
+        package = Path(source["ingestion_path"] or Path(source["original_path"]).parent)
+        if not originals:
+            originals = [{
+                "relative_path": Path(source["original_path"]).name,
+                "original_name": source["original_filename"],
+            }]
+        results: list[tuple[Any, Any, Path]] = []
+        unsupported_errors: list[Exception] = []
+        for original in originals:
+            path = package / original["relative_path"] if source["ingestion_path"] else Path(source["original_path"])
+            try:
+                result = extract_source(
+                    path,
+                    max_attachments=self.settings.app.max_attachments,
+                    max_text_bytes=self.settings.app.max_extracted_text_mb * 1024 * 1024,
+                )
+                results.append((original, result, path))
+            except UnsupportedSource as exc:
+                unsupported_errors.append(exc)
+            except ExtractionFailure as exc:
+                raise ExtractionFailure(f"{original['relative_path']}: {exc}") from exc
+        if not results:
+            raise unsupported_errors[0] if unsupported_errors else UnsupportedSource("No supported text could be extracted")
+        combined_metadata = dict(metadata)
+        sequence = 0
         with self.db.transaction() as connection:
+            for original, result, path in results:
+                combined_metadata.update(result.metadata)
+                for chunk in result.chunks:
+                    locator = (
+                        chunk["locator"] if len(originals) == 1
+                        else f"{original['relative_path']}: {chunk['locator']}"
+                    )
+                    connection.execute(
+                        "INSERT OR IGNORE INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state) VALUES (?, ?, ?, ?, ?, 'captured')",
+                        (source_id, source["project_id"], sequence, chunk["text"], locator),
+                    )
+                    sequence += 1
+            primary_result = results[0][1]
             connection.execute(
                 "UPDATE sources SET native_id = coalesce(native_id, ?), source_type = ?, metadata_json = ? WHERE id = ?",
-                (result.native_id, result.source_type, _json({**result.metadata, "_extraction_complete": False}), source_id),
+                (primary_result.native_id,
+                 primary_result.source_type if len(results) == 1 else "multiple-files",
+                 _json({**combined_metadata, "_extraction_complete": False}), source_id),
             )
-            for sequence, chunk in enumerate(result.chunks):
-                connection.execute(
-                    "INSERT OR IGNORE INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state) VALUES (?, ?, ?, ?, ?, 'captured')",
-                    (source_id, source["project_id"], sequence, chunk["text"], chunk["locator"]),
-                )
-        if result.attachments and source["project_id"] is not None:
-            self._preserve_attachments(source_id, result.attachments)
+        extracted_dir = package / "Assistant" / "Extracted"
+        original_positions = {
+            str(item["relative_path"]): index for index, item in enumerate(originals, start=1)
+        }
+        for original, result, path in results:
+            index = original_positions[str(original["relative_path"])]
+            extracted_name = f"{index:03d}-{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
+            atomic_write_text(
+                extracted_dir / extracted_name,
+                "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n",
+            )
+            if result.attachments:
+                self._preserve_attachments(source_id, result.attachments)
         with self.db.transaction() as connection:
             connection.execute(
                 "UPDATE sources SET metadata_json = ? WHERE id = ?",
-                (_json({**result.metadata, "_extraction_complete": True}), source_id),
+                (_json({**combined_metadata, "_extraction_complete": True}), source_id),
             )
+        self._refresh_source_archive(source_id, processing_status="processing")
 
     def _preserve_attachments(self, source_id: int, attachments: Iterable[Any]) -> None:
         with self.db.connect() as connection:
             source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-            project = self._project(connection, source["project_id"])
-        directory = self._under_root(Path(project["folder_path"]) / "attachments" / str(source_id))
+        root_source = source
+        while root_source["parent_source_id"]:
+            with self.db.connect() as connection:
+                root_source = connection.execute(
+                    "SELECT * FROM sources WHERE id = ?", (root_source["parent_source_id"],)
+                ).fetchone()
+        package = Path(root_source["ingestion_path"])
+        directory = self._under_root(package / "Original" / "Attachments")
+        if source["parent_source_id"]:
+            directory = self._under_root(directory / safe_filename(Path(source["original_filename"]).stem, "nested-email"))
         directory.mkdir(parents=True, exist_ok=True)
         for sequence, attachment in enumerate(attachments):
             native_id = f"attachment:{source_id}:{sequence}"
@@ -776,7 +1444,13 @@ class PortfolioService:
                     self._extract_attachment_child(int(existing_child["id"]))
                 continue
             filename = safe_filename(attachment.filename, f"attachment-{sequence + 1}")
-            final_path = self._under_root(directory / f"{uuid.uuid4().hex[:10]}-{filename}")
+            final_path = self._under_root(directory / filename)
+            collision = 2
+            while final_path.exists():
+                final_path = self._under_root(
+                    directory / f"{Path(filename).stem}-{collision}{Path(filename).suffix}"
+                )
+                collision += 1
             temp_path = self._under_root(directory / f".{uuid.uuid4().hex}.tmp")
             temp_path.write_bytes(attachment.data)
             digest = sha256_file(temp_path)
@@ -803,7 +1477,21 @@ class PortfolioService:
                     if not existing_child or existing_child["processing_state"] == "complete":
                         continue
                     child_id = int(existing_child["id"])
+                relative_path = relative_to_root(final_path, package)
+                connection.execute(
+                    """INSERT OR IGNORE INTO original_files(
+                       source_id, relative_path, original_name, stored_name, size_bytes, sha256, is_attachment, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                    (root_source["id"], relative_path, attachment.filename, final_path.name,
+                     final_path.stat().st_size, digest, now),
+                )
+                connection.execute(
+                    """UPDATE sources SET ingestion_path = ?, capture_method = 'email_attachment',
+                       canonical_source = 0 WHERE id = ?""",
+                    (str(package), child_id),
+                )
             self._extract_attachment_child(child_id)
+        self._refresh_source_archive(int(root_source["id"]), processing_status="processing")
 
     def _extract_attachment_child(self, child_id: int) -> None:
         with self.db.connect() as connection:
@@ -813,7 +1501,7 @@ class PortfolioService:
         try:
             result = extract_source(
                 Path(child["original_path"]),
-                max_attachments=0,
+                max_attachments=self.settings.app.max_attachments,
                 max_text_bytes=self.settings.app.max_extracted_text_mb * 1024 * 1024,
             )
             prior_metadata = _decode(child["metadata_json"], {})
@@ -831,6 +1519,17 @@ class PortfolioService:
                        processed_at = ?, error_code = NULL, error_message = NULL WHERE id = ?""",
                     (result.source_type, _json({**prior_metadata, **result.metadata}), utc_now(), child_id),
                 )
+            if result.attachments:
+                self._preserve_attachments(child_id, result.attachments)
+            parent = child["parent_source_id"]
+            with self.db.connect() as connection:
+                root = connection.execute("SELECT * FROM sources WHERE id = ?", (parent,)).fetchone()
+            if root and root["ingestion_path"]:
+                atomic_write_text(
+                    Path(root["ingestion_path"]) / "Assistant" / "Extracted" /
+                    f"attachment-{child_id}-{safe_filename(Path(child['original_filename']).stem, 'attachment')}.txt",
+                    "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n",
+                )
         except UnsupportedSource as exc:
             self._set_source_state(child_id, "unsupported", "unsupported_attachment", exc)
         except ExtractionFailure as exc:
@@ -842,13 +1541,18 @@ class PortfolioService:
         with self.db.connect() as connection:
             rows = connection.execute(
                 """
+                WITH RECURSIVE source_tree(id) AS (
+                  SELECT ?
+                  UNION ALL
+                  SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                )
                 SELECT c.id AS chunk_id, c.source_id, c.text, c.locator, c.comment_at, c.author,
                        s.original_filename, s.meeting_name, s.meeting_date
                 FROM source_chunks c JOIN sources s ON s.id = c.source_id
-                WHERE c.source_id = ? OR s.parent_source_id = ?
+                WHERE c.source_id IN (SELECT id FROM source_tree)
                 ORDER BY c.source_id = ? DESC, c.source_id, c.sequence
                 """,
-                (source_id, source_id, source_id),
+                (source_id, source_id),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -925,16 +1629,25 @@ class PortfolioService:
             project_id = source["project_id"]
             project = self._project(connection, project_id)
             for text, citations in prepared_updates:
+                durable_citations = [self._ensure_citation_record(connection, source, citation, now) for citation in citations]
                 connection.execute(
                     "INSERT INTO project_updates(project_id, source_id, update_type, text, citations_json, model_id, created_at) VALUES (?, ?, 'knowledge', ?, ?, ?, ?)",
-                    (project_id, source_id, text, _json(citations), self.llm.model_id, now),
+                    (project_id, source_id, text, _json(durable_citations), self.llm.model_id, now),
                 )
-            grounded_summary = " ".join(
-                part for part in (project["current_summary"].strip(), *(text for text, _ in prepared_updates)) if part
-            )[-10_000:]
+                connection.execute(
+                    """INSERT INTO knowledge_items(
+                       id, project_id, source_id, text, category, source_date, citation_ids_json,
+                       review_status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', ?)""",
+                    (stable_id("K"), project_id, source_id, text, self._knowledge_category(text),
+                     source["source_date"] or source["meeting_date"] or source["created_at"],
+                     _json([citation["citation_id"] for citation in durable_citations]), now),
+                )
             connection.execute(
-                "UPDATE projects SET current_summary = ?, latest_change = ?, updated_at = ? WHERE id = ?",
-                (grounded_summary, prepared_updates[-1][0], now, project_id),
+                """UPDATE projects SET latest_change = ?, updated_at = ?,
+                   summary_revision = summary_revision + 1, summary_generation_state = 'stale',
+                   summary_error = NULL WHERE id = ?""",
+                (prepared_updates[-1][0], now, project_id),
             )
             for operation in operations:
                 self._apply_ai_action(connection, project_id, source_id, operation, allowed, now)
@@ -946,8 +1659,13 @@ class PortfolioService:
                     [recommendation], [], "No routing rule will be created.", now,
                 )
             connection.execute(
-                "UPDATE source_chunks SET processing_state = 'complete', processed_at = ? WHERE source_id = ? OR source_id IN (SELECT id FROM sources WHERE parent_source_id = ?)",
-                (now, source_id, source_id),
+                """WITH RECURSIVE source_tree(id) AS (
+                     SELECT ? UNION ALL
+                     SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                   )
+                   UPDATE source_chunks SET processing_state = 'complete', processed_at = ?
+                   WHERE source_id IN (SELECT id FROM source_tree)""",
+                (source_id, now),
             )
             connection.execute(
                 """UPDATE sources SET processing_state = 'complete', model_id = ?, processed_at = ?,
@@ -960,6 +1678,729 @@ class PortfolioService:
                     "UPDATE projects SET snow_comments_cell_hash = ? WHERE id = ?",
                     (metadata["cell_hash"], project_id),
                 )
+            source_summary = " ".join(text for text, _ in prepared_updates)[:1800]
+            connection.execute(
+                "UPDATE sources SET source_summary = ? WHERE id = ?", (source_summary, source_id)
+            )
+        self._refresh_source_archive(source_id, processing_status="complete")
+        self._write_knowledge_history(project_id)
+        self.regenerate_living_summary(project_id, advance_revision=False)
+
+    def _ensure_citation_record(
+        self, connection: sqlite3.Connection, root_source: sqlite3.Row,
+        citation: dict[str, int], now: str,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """SELECT c.*, s.original_filename, s.original_path, s.source_type,
+                      s.meeting_date, s.created_at, s.parent_source_id
+               FROM source_chunks c JOIN sources s ON s.id = c.source_id
+               WHERE c.id = ? AND c.source_id = ?""",
+            (citation["chunk_id"], citation["source_id"]),
+        ).fetchone()
+        if not row:
+            raise LlmContractError("Citation source excerpt is unavailable")
+        citation_key = f"{citation['source_id']}:{citation['chunk_id']}"
+        citation_id = f"C-{hashlib.sha256(citation_key.encode()).hexdigest()[:8].upper()}"
+        package = Path(root_source["ingestion_path"] or Path(root_source["original_path"]).parent)
+        original_path = Path(row["original_path"])
+        try:
+            original_relative = original_path.resolve().relative_to(package.resolve()).as_posix()
+        except ValueError:
+            original_relative = f"Original/{safe_filename(row['original_filename'], 'source')}"
+        connection.execute(
+            """INSERT OR IGNORE INTO citation_records(
+               id, source_id, chunk_id, original_relative_path, display_name, source_type,
+               locator, excerpt, source_date, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (citation_id, root_source["id"], row["id"], original_relative,
+             row["original_filename"], row["source_type"], row["locator"], row["text"][:1200],
+             row["meeting_date"] or row["created_at"], now),
+        )
+        return {
+            "source_id": int(citation["source_id"]),
+            "chunk_id": int(citation["chunk_id"]),
+            "citation_id": citation_id,
+        }
+
+    def _write_knowledge_history(self, project_id: str) -> None:
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+            rows = connection.execute(
+                """SELECT k.*, s.source_title, s.source_type, s.ingestion_id
+                   FROM knowledge_items k JOIN sources s ON s.id = k.source_id
+                   WHERE k.project_id = ? ORDER BY k.created_at, k.id""",
+                (project_id,),
+            ).fetchall()
+        lines = []
+        for row in rows:
+            item = dict(row)
+            item["citation_ids"] = _decode(item.pop("citation_ids_json"), [])
+            lines.append(_json(item))
+        atomic_write_text(
+            Path(project["folder_path"]) / "_Assistant" / "knowledge-history.jsonl",
+            ("\n".join(lines) + "\n") if lines else "",
+        )
+
+    def regenerate_living_summary(self, project_id: str, *, advance_revision: bool = True) -> dict[str, Any]:
+        with self.db.transaction() as connection:
+            project = self._project(connection, project_id)
+            revision = int(project["summary_revision"]) + (1 if advance_revision else 0)
+            connection.execute(
+                """UPDATE projects SET summary_revision = ?, summary_generation_state = 'updating',
+                   summary_error = NULL WHERE id = ?""",
+                (revision, project_id),
+            )
+        try:
+            with self.db.connect() as connection:
+                project = self._project(connection, project_id)
+                knowledge = [dict(row) for row in connection.execute(
+                    """SELECT id, text, category, source_date, review_status, created_at
+                       FROM knowledge_items WHERE project_id = ? AND review_status <> 'flagged'
+                       ORDER BY created_at, id""",
+                    (project_id,),
+                ).fetchall()]
+            generated = self.llm.living_summary(
+                {"id": project["archive_id"], "name": project["name"]}, knowledge
+            )
+            sections = generated.get("sections") if isinstance(generated, dict) else None
+            if not isinstance(sections, list):
+                raise LlmContractError("Living summary response did not contain sections")
+            allowed = {item["id"] for item in knowledge}
+            prepared: list[dict[str, Any]] = []
+            for section in sections:
+                if not isinstance(section, dict):
+                    raise LlmContractError("Living summary section must be an object")
+                heading = normalize_text(str(section.get("section", "")))
+                text = normalize_text(str(section.get("text", "")))
+                ids = section.get("knowledge_item_ids")
+                if not heading or not text or not isinstance(ids, list) or not ids:
+                    raise LlmContractError("Living summary section is missing text or knowledge-item citations")
+                normalized_ids = [str(item) for item in ids]
+                if any(item not in allowed for item in normalized_ids):
+                    raise LlmContractError("Living summary cited an unknown or wrong-project knowledge item")
+                prepared.append({"section": heading, "text": text, "knowledge_item_ids": normalized_ids})
+            markdown = "\n\n".join(
+                f"## {section['section']}\n\n{section['text']}\n\n"
+                f"Knowledge: {', '.join(section['knowledge_item_ids'])}"
+                for section in prepared
+            )
+            summary_text = " ".join(section["text"] for section in prepared)
+            now = utc_now()
+            with self.db.transaction() as connection:
+                current = self._project(connection, project_id)
+                if int(current["summary_revision"]) != revision:
+                    connection.execute(
+                        "UPDATE projects SET summary_generation_state = 'stale' WHERE id = ?", (project_id,)
+                    )
+                    raise ConflictError("New knowledge arrived while the summary was being generated")
+                connection.execute(
+                    """INSERT INTO summary_versions(
+                       project_id, revision, content_json, markdown, review_status,
+                       generation_state, model_id, created_at
+                       ) VALUES (?, ?, ?, ?, 'unreviewed', 'current', ?, ?)""",
+                    (project_id, revision, _json({"sections": prepared}), markdown, self.llm.model_id, now),
+                )
+                connection.execute(
+                    """UPDATE projects SET current_summary = ?, summary_generation_state = 'current',
+                       summary_review_status = 'unreviewed', summary_generated_at = ?, summary_error = NULL
+                       WHERE id = ?""",
+                    (summary_text, now, project_id),
+                )
+            self._write_summary_files(project_id, revision, prepared, markdown, now)
+            return self.get_living_summary(project_id)
+        except Exception as exc:
+            with self.db.transaction() as connection:
+                current = self._project(connection, project_id)
+                if int(current["summary_revision"]) == revision:
+                    connection.execute(
+                        """UPDATE projects SET summary_generation_state = 'failed', summary_error = ?
+                           WHERE id = ?""",
+                        (_safe_error(exc), project_id),
+                    )
+            return self.get_living_summary(project_id)
+
+    def _write_summary_files(
+        self, project_id: str, revision: int, sections: list[dict[str, Any]],
+        markdown: str, created_at: str,
+    ) -> None:
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+        folder = Path(project["folder_path"]) / "_Assistant" / "living-summary"
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "project_id": project["archive_id"],
+            "revision": revision,
+            "review_status": "unreviewed",
+            "generation_state": "current",
+            "created_at": created_at,
+            "sections": sections,
+        }
+        atomic_write_text(folder / "current.md", f"# {project['name']} — Living Summary\n\n{markdown}\n")
+        atomic_write_json(folder / "current.json", payload)
+        stamp = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%Y-%m-%d_%H%M%S")
+        atomic_write_json(folder / "versions" / f"{revision:06d}__{stamp}.json", payload)
+
+    def get_living_summary(self, project_id: str) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+            versions = connection.execute(
+                "SELECT * FROM summary_versions WHERE project_id = ? ORDER BY revision DESC", (project_id,)
+            ).fetchall()
+        current = dict(versions[0]) if versions else None
+        if current:
+            current["content"] = _decode(current.pop("content_json"), {"sections": []})
+        return {
+            "project_id": project_id,
+            "generation_state": project["summary_generation_state"],
+            "review_status": project["summary_review_status"],
+            "revision": project["summary_revision"],
+            "generated_at": project["summary_generated_at"],
+            "error": project["summary_error"],
+            "current": current,
+            "versions": [{
+                "id": row["id"], "revision": row["revision"], "review_status": row["review_status"],
+                "generation_state": row["generation_state"], "created_at": row["created_at"],
+            } for row in versions],
+        }
+
+    def get_summary_version(self, project_id: str, revision: int) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            self._project(connection, project_id)
+            row = connection.execute(
+                "SELECT * FROM summary_versions WHERE project_id = ? AND revision = ?",
+                (project_id, revision),
+            ).fetchone()
+        if not row:
+            raise NotFoundError("Living summary version not found")
+        result = dict(row)
+        result["content"] = _decode(result.pop("content_json"), {"sections": []})
+        return result
+
+    def list_knowledge(
+        self, project_id: str, *, review_status: str = "all", category: str = "", query: str = ""
+    ) -> list[dict[str, Any]]:
+        if review_status not in {"all", "unreviewed", "approved", "flagged"}:
+            raise ValidationError("Invalid knowledge review status")
+        clauses = ["k.project_id = ?"]
+        params: list[Any] = [project_id]
+        if review_status != "all":
+            clauses.append("k.review_status = ?")
+            params.append(review_status)
+        if category:
+            clauses.append("k.category = ?")
+            params.append(category)
+        if query.strip():
+            clauses.append("k.text LIKE ?")
+            params.append(f"%{query.strip()[:200]}%")
+        with self.db.connect() as connection:
+            self._project(connection, project_id)
+            rows = connection.execute(
+                f"""SELECT k.*, s.source_title, s.source_type, s.original_filename, s.ingestion_id
+                    FROM knowledge_items k JOIN sources s ON s.id = k.source_id
+                    WHERE {' AND '.join(clauses)} ORDER BY k.created_at DESC, k.id DESC""",
+                params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                ids = _decode(item.pop("citation_ids_json"), [])
+                citation_rows = []
+                for citation_id in ids:
+                    citation = connection.execute(
+                        "SELECT * FROM citation_records WHERE id = ?", (citation_id,)
+                    ).fetchone()
+                    if citation:
+                        citation_item = dict(citation)
+                        citation_item["citation_id"] = citation_item.pop("id")
+                        citation_rows.append(citation_item)
+                item["citations"] = citation_rows
+                result.append(item)
+        return result
+
+    def review_knowledge(self, project_id: str, knowledge_id: str, status: str) -> dict[str, Any]:
+        if status not in {"unreviewed", "approved", "flagged"}:
+            raise ValidationError("Invalid knowledge review status")
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM knowledge_items WHERE id = ? AND project_id = ?", (knowledge_id, project_id)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Knowledge item not found")
+            connection.execute("UPDATE knowledge_items SET review_status = ? WHERE id = ?", (status, knowledge_id))
+            source_id = int(row["source_id"])
+            connection.execute(
+                """UPDATE projects SET summary_revision = summary_revision + 1,
+                   summary_generation_state = 'stale' WHERE id = ?""",
+                (project_id,),
+            )
+        self._refresh_source_archive(source_id)
+        self._write_knowledge_history(project_id)
+        self.regenerate_living_summary(project_id, advance_revision=False)
+        return next(item for item in self.list_knowledge(project_id) if item["id"] == knowledge_id)
+
+    def review_summary(self, project_id: str, status: str) -> dict[str, Any]:
+        if status not in {"unreviewed", "approved", "flagged"}:
+            raise ValidationError("Invalid summary review status")
+        with self.db.transaction() as connection:
+            project = self._project(connection, project_id)
+            version = connection.execute(
+                "SELECT * FROM summary_versions WHERE project_id = ? ORDER BY revision DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if not version:
+                raise ValidationError("No living summary version is available")
+            connection.execute(
+                "UPDATE summary_versions SET review_status = ? WHERE id = ?", (status, version["id"])
+            )
+            connection.execute(
+                "UPDATE projects SET summary_review_status = ? WHERE id = ?", (status, project_id)
+            )
+        current_path = Path(project["folder_path"]) / "_Assistant" / "living-summary" / "current.json"
+        fallback_payload = {
+            "schema_version": SCHEMA_VERSION, "project_id": project["archive_id"],
+            "revision": int(version["revision"]), "generation_state": version["generation_state"],
+            "created_at": version["created_at"],
+            "sections": _decode(version["content_json"], {"sections": []}).get("sections", []),
+        }
+        payload = read_json(current_path, {}) if current_path.exists() else {}
+        if not isinstance(payload, dict) or not isinstance(payload.get("sections"), list):
+            payload = dict(fallback_payload)
+        payload["review_status"] = status
+        atomic_write_json(current_path, payload)
+        versions_folder = current_path.parent / "versions"
+        for version_path in versions_folder.glob(f"{int(version['revision']):06d}__*.json"):
+            version_payload = read_json(version_path, {})
+            if not isinstance(version_payload, dict) or not isinstance(version_payload.get("sections"), list):
+                version_payload = dict(fallback_payload)
+            version_payload["review_status"] = status
+            atomic_write_json(version_path, version_payload)
+        return self.get_living_summary(project_id)
+
+    def refresh_source_derivatives(self, source_id: int) -> dict[str, Any]:
+        """Recreate replaceable extracted text and sidecars without modifying originals."""
+        with self.db.connect() as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if not source:
+                raise NotFoundError("Source not found")
+            while source["parent_source_id"]:
+                source = connection.execute(
+                    "SELECT * FROM sources WHERE id = ?", (source["parent_source_id"],)
+                ).fetchone()
+            originals = connection.execute(
+                "SELECT * FROM original_files WHERE source_id = ? ORDER BY is_attachment, id", (source["id"],)
+            ).fetchall()
+        if not source["canonical_source"]:
+            self._refresh_source_archive(int(source["id"]))
+            return {"source_id": int(source["id"]), "files_refreshed": 0, "unsupported_files": 0}
+        if not originals:
+            raise ValidationError("No preserved originals are available to rebuild derived files")
+        package = self._under_root(Path(source["ingestion_path"]))
+        extracted_dir = self._under_root(package / "Assistant" / "Extracted")
+        replacement = self._under_root(package / "Assistant" / f"_DERIVED_{uuid.uuid4().hex}")
+        replacement.mkdir(parents=True, exist_ok=False)
+        generated: list[Path] = []
+        unsupported = 0
+        try:
+            for index, original in enumerate(originals, start=1):
+                path = self._under_root(package / original["relative_path"])
+                if not path.is_file():
+                    raise ValidationError(
+                        f"Preserved original is unavailable locally: {original['original_name']}"
+                    )
+                if sha256_file(path) != original["sha256"]:
+                    raise ConflictError(
+                        f"Preserved original failed its SHA-256 integrity check: {original['original_name']}"
+                    )
+                try:
+                    result = extract_source(
+                        path,
+                        max_attachments=self.settings.app.max_attachments,
+                        max_text_bytes=self.settings.app.max_extracted_text_mb * 1024 * 1024,
+                    )
+                except UnsupportedSource:
+                    unsupported += 1
+                    continue
+                output = replacement / (
+                    f"{index:03d}-{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
+                )
+                atomic_write_text(output, "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n")
+                generated.append(output)
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+            expected_names = {path.name for path in generated}
+            for existing in extracted_dir.glob("*.txt"):
+                if existing.name not in expected_names:
+                    existing.unlink()
+            for generated_path in generated:
+                os.replace(generated_path, extracted_dir / generated_path.name)
+        finally:
+            if replacement.exists():
+                shutil.rmtree(replacement)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE sources SET processing_version = processing_version + 1 WHERE id = ?",
+                (source["id"],),
+            )
+        self._refresh_source_archive(int(source["id"]))
+        if source["project_id"]:
+            self._write_knowledge_history(str(source["project_id"]))
+        return {
+            "source_id": int(source["id"]), "files_refreshed": len(generated),
+            "unsupported_files": unsupported,
+        }
+
+    def source_detail(self, source_id: int) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if not source:
+                raise NotFoundError("Source not found")
+            originals = [dict(row) for row in connection.execute(
+                "SELECT * FROM original_files WHERE source_id = ? ORDER BY is_attachment, id", (source_id,)
+            ).fetchall()]
+        item = self._decode_source(source)
+        item["original_files"] = originals
+        manifest = Path(source["ingestion_path"] or "") / "manifest.json"
+        item["manifest"] = read_json(manifest) if manifest.is_file() else None
+        return item
+
+    def search_archive(self, query: str, *, project_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        clean = normalize_text(query)
+        if not clean:
+            return []
+        pattern = f"%{clean[:200]}%"
+        limit = max(1, min(limit, 100))
+        project_clause = " AND p.id = ?" if project_id else ""
+        results: list[dict[str, Any]] = []
+        with self.db.connect() as connection:
+            for row in connection.execute(
+                f"""SELECT p.id AS project_id, p.name AS project_name, p.name AS title,
+                           'project' AS result_type, p.name AS excerpt, NULL AS source_id,
+                           NULL AS source_type, p.updated_at AS source_date
+                    FROM projects p WHERE p.name LIKE ?{project_clause}
+                    LIMIT ?""",
+                ((pattern, project_id, limit) if project_id else (pattern, limit)),
+            ).fetchall():
+                results.append(dict(row))
+            summary_rows = connection.execute(
+                """SELECT p.id AS project_id, p.name AS project_name, v.content_json, v.created_at
+                   FROM projects p JOIN summary_versions v ON v.project_id = p.id
+                   WHERE v.id = (SELECT v2.id FROM summary_versions v2
+                                 WHERE v2.project_id = p.id ORDER BY v2.revision DESC LIMIT 1)
+                     AND (? IS NULL OR p.id = ?)""",
+                (project_id, project_id),
+            ).fetchall()
+            for row in summary_rows:
+                for section in _decode(row["content_json"], {"sections": []}).get("sections", []):
+                    section_text = str(section.get("text", ""))
+                    section_name = str(section.get("section", "Living Summary"))
+                    if clean.casefold() in f"{section_name} {section_text}".casefold():
+                        results.append({
+                            "project_id": row["project_id"], "project_name": row["project_name"],
+                            "title": f"{row['project_name']} — {section_name}",
+                            "result_type": "living_summary_claim", "excerpt": section_text,
+                            "source_id": None, "source_type": None, "source_date": row["created_at"],
+                        })
+            for row in connection.execute(
+                f"""SELECT p.id AS project_id, p.name AS project_name,
+                           coalesce(s.source_title, s.original_filename) AS title,
+                           'source_ingestion' AS result_type, s.source_summary AS excerpt,
+                           s.id AS source_id, s.source_type, coalesce(s.source_date, s.created_at) AS source_date
+                    FROM sources s LEFT JOIN projects p ON p.id = s.project_id
+                    WHERE (s.source_title LIKE ? OR s.original_filename LIKE ? OR s.source_summary LIKE ?
+                           OR s.metadata_json LIKE ?){project_clause}
+                    ORDER BY s.created_at DESC LIMIT ?""",
+                ((pattern, pattern, pattern, pattern, project_id, limit) if project_id
+                 else (pattern, pattern, pattern, pattern, limit)),
+            ).fetchall():
+                results.append(dict(row))
+            for row in connection.execute(
+                f"""SELECT p.id AS project_id, p.name AS project_name, s.source_title AS title,
+                           'knowledge_item' AS result_type, k.text AS excerpt, s.id AS source_id,
+                           s.source_type, k.source_date
+                    FROM knowledge_items k JOIN projects p ON p.id = k.project_id
+                    JOIN sources s ON s.id = k.source_id
+                    WHERE (k.text LIKE ? OR k.category LIKE ?){project_clause}
+                    ORDER BY k.created_at DESC LIMIT ?""",
+                ((pattern, pattern, project_id, limit) if project_id else (pattern, pattern, limit)),
+            ).fetchall():
+                results.append(dict(row))
+            for row in connection.execute(
+                f"""SELECT p.id AS project_id, p.name AS project_name,
+                           coalesce(s.source_title, s.original_filename) AS title,
+                           'original_file' AS result_type, f.original_name AS excerpt,
+                           s.id AS source_id, s.source_type, coalesce(s.source_date, s.created_at) AS source_date,
+                           f.id AS original_file_id
+                    FROM original_files f JOIN sources s ON s.id = f.source_id
+                    LEFT JOIN projects p ON p.id = s.project_id
+                    WHERE f.original_name LIKE ?{project_clause}
+                    ORDER BY f.created_at DESC LIMIT ?""",
+                ((pattern, project_id, limit) if project_id else (pattern, limit)),
+            ).fetchall():
+                results.append(dict(row))
+            if len(results) < limit:
+                for row in connection.execute(
+                    f"""SELECT p.id AS project_id, p.name AS project_name,
+                               coalesce(s.source_title, s.original_filename) AS title,
+                               'source_excerpt' AS result_type, c.text AS excerpt, s.id AS source_id,
+                               s.source_type, coalesce(s.source_date, s.created_at) AS source_date,
+                               c.locator
+                        FROM source_chunks c JOIN sources s ON s.id = c.source_id
+                        LEFT JOIN projects p ON p.id = c.project_id
+                        WHERE c.text LIKE ?{project_clause}
+                        ORDER BY c.id DESC LIMIT ?""",
+                    ((pattern, project_id, limit) if project_id else (pattern, limit)),
+                ).fetchall():
+                    results.append(dict(row))
+        return results[:limit]
+
+    def rebuild_index(self) -> dict[str, int]:
+        """Rescan durable OneDrive sidecars into an empty or partially rebuilt local index."""
+        counts = {"projects": 0, "sources": 0, "knowledge_items": 0, "summary_versions": 0, "errors": 0}
+        project_map: dict[str, str] = {}
+        for descriptor_path in self.archive_paths["projects"].glob("*/_Assistant/project.json"):
+            try:
+                descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+                project_id = str(descriptor["project_id"])
+                archive_id = str(descriptor["archive_id"])
+                project_map[archive_id] = project_id
+                with self.db.transaction() as connection:
+                    group = connection.execute(
+                        "SELECT id FROM portfolio_groups WHERE name = 'Unassigned' COLLATE NOCASE"
+                    ).fetchone()
+                    exists = connection.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()
+                    connection.execute(
+                        """INSERT OR IGNORE INTO projects(
+                           id, archive_id, name, portfolio_group_id, folder_path, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (project_id, archive_id, descriptor.get("name") or descriptor_path.parents[1].name,
+                         group["id"], str(descriptor_path.parents[1]), descriptor.get("created_at") or utc_now(),
+                         descriptor.get("created_at") or utc_now()),
+                    )
+                if not exists:
+                    counts["projects"] += 1
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                counts["errors"] += 1
+        package_paths = list(self.archive_paths["projects"].glob("*/*/manifest.json"))
+        package_paths += list(self.archive_paths["shared_intake"].glob("*/manifest.json"))
+        for manifest_path in package_paths:
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                package = manifest_path.parent
+                canonical = bool(manifest.get("canonical_source", True))
+                ingestion_id = str(manifest.get("ingestion_id") or stable_id("I"))
+                manifest_project_id = manifest.get("project_id")
+                database_project_id = manifest.get("database_project_id")
+                with self.db.connect() as connection:
+                    candidate_project = (
+                        connection.execute(
+                            "SELECT archive_id FROM projects WHERE id = ?", (database_project_id,)
+                        ).fetchone()
+                        if database_project_id else None
+                    )
+                    if (
+                        candidate_project and manifest_project_id
+                        and candidate_project["archive_id"] != manifest_project_id
+                    ):
+                        candidate_project = None
+                    if not candidate_project:
+                        database_project_id = project_map.get(str(manifest_project_id))
+                    if (manifest_project_id or manifest.get("database_project_id")) and not database_project_id:
+                        counts["errors"] += 1
+                        continue
+                    existing = connection.execute(
+                        "SELECT * FROM sources WHERE ingestion_path = ?", (str(package),)
+                    ).fetchone()
+                if existing:
+                    source_id = int(existing["id"])
+                else:
+                    originals = manifest.get("original_files") if isinstance(manifest.get("original_files"), list) else []
+                    primary_item = originals[0] if originals else None
+                    primary = package / primary_item["relative_path"] if primary_item else package
+                    if not canonical and manifest.get("canonical_source_path"):
+                        canonical_package = self.settings.app.one_drive_root / str(manifest["canonical_source_path"])
+                        canonical_manifest = json.loads((canonical_package / "manifest.json").read_text(encoding="utf-8"))
+                        canonical_originals = canonical_manifest.get("original_files", [])
+                        if canonical_originals:
+                            primary = canonical_package / canonical_originals[0]["relative_path"]
+                    digest = (
+                        str(primary_item.get("sha256")) if primary_item and len(originals) == 1
+                        else hashlib.sha256(_json([
+                            (item.get("relative_path"), item.get("sha256")) for item in originals
+                        ]).encode()).hexdigest()
+                    )
+                    state = str(manifest.get("processing_status") or "complete")
+                    if state not in {"captured", "processing", "pending_ai", "complete", "needs_review", "unsupported", "error"}:
+                        state = "complete"
+                    with self.db.transaction() as connection:
+                        cursor = connection.execute(
+                            """INSERT INTO sources(
+                               project_id, source_type, sha256, original_filename, original_path,
+                               metadata_json, processing_state, created_at, processed_at, ingestion_id,
+                               ingestion_path, source_title, source_date, capture_method, canonical_source,
+                               linked_ingestion_id, source_summary
+                               ) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (database_project_id, manifest.get("source_type") or "unknown", digest,
+                             primary_item.get("original_name") if primary_item else manifest.get("title") or "Source unavailable",
+                             str(primary), state, manifest.get("created_at") or utc_now(),
+                             manifest.get("created_at") if state == "complete" else None,
+                             ingestion_id if canonical else None, str(package), manifest.get("title"),
+                             manifest.get("source_date"), manifest.get("capture_method") or "archive_rescan",
+                             int(canonical), manifest.get("linked_ingestion_id"), ""),
+                        )
+                        source_id = int(cursor.lastrowid)
+                        for item in originals:
+                            connection.execute(
+                                """INSERT INTO original_files(
+                                   source_id, relative_path, original_name, stored_name, size_bytes, sha256,
+                                   is_attachment, created_at
+                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (source_id, item["relative_path"], item.get("original_name") or Path(item["relative_path"]).name,
+                                 item.get("stored_name") or Path(item["relative_path"]).name,
+                                 int(item.get("size_bytes") or 0), item.get("sha256") or "",
+                                 int(bool(item.get("is_attachment"))), manifest.get("created_at") or utc_now()),
+                            )
+                    counts["sources"] += 1
+                with self.db.transaction() as connection:
+                    existing_chunks = connection.execute(
+                        "SELECT count(*) FROM source_chunks WHERE source_id = ?", (source_id,)
+                    ).fetchone()[0]
+                    if not existing_chunks:
+                        sequence = 0
+                        for extracted in sorted((package / "Assistant" / "Extracted").glob("*.txt")):
+                            text = extracted.read_text(encoding="utf-8")
+                            for offset in range(0, len(text), 3000):
+                                excerpt = text[offset:offset + 3000].strip()
+                                if excerpt:
+                                    connection.execute(
+                                        """INSERT INTO source_chunks(
+                                           source_id, project_id, sequence, text, locator, processing_state, processed_at
+                                           ) VALUES (?, ?, ?, ?, ?, 'complete', ?)""",
+                                        (source_id, database_project_id, sequence, excerpt,
+                                         f"{extracted.name} characters {offset + 1}-{offset + len(excerpt)}", utc_now()),
+                                    )
+                                    sequence += 1
+                    source_summary_file = package / "Assistant" / "source-summary.md"
+                    index_file = package / "Assistant" / "index.json"
+                    index = json.loads(index_file.read_text(encoding="utf-8")) if index_file.is_file() else {}
+                    connection.execute(
+                        "UPDATE sources SET source_summary = ?, metadata_json = ? WHERE id = ?",
+                        (index.get("summary") or (source_summary_file.read_text(encoding="utf-8") if source_summary_file.is_file() else ""),
+                          _json({**index, **(index.get("email_metadata") or {})}), source_id),
+                    )
+                counts["knowledge_items"] += self._rebuild_package_knowledge(
+                    source_id, database_project_id, package
+                )
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                counts["errors"] += 1
+        for archive_id, project_id in project_map.items():
+            counts["summary_versions"] += self._rebuild_project_summaries(project_id)
+            self._write_knowledge_history(project_id)
+        return counts
+
+    def _rebuild_package_knowledge(self, source_id: int, project_id: str | None, package: Path) -> int:
+        if not project_id:
+            return 0
+        citations_path = package / "Assistant" / "citations.json"
+        knowledge_path = package / "Assistant" / "knowledge-items.json"
+        citations = json.loads(citations_path.read_text(encoding="utf-8")) if citations_path.is_file() else []
+        knowledge = json.loads(knowledge_path.read_text(encoding="utf-8")) if knowledge_path.is_file() else []
+        count = 0
+        with self.db.transaction() as connection:
+            citation_map: dict[str, str] = {}
+            for citation in citations:
+                citation_id = str(citation["citation_id"])
+                citation_excerpt = str(citation.get("excerpt") or "")[:120]
+                chunk = (
+                    connection.execute(
+                        """SELECT * FROM source_chunks
+                           WHERE source_id = ? AND instr(text, ?) > 0 ORDER BY id LIMIT 1""",
+                        (source_id, citation_excerpt),
+                    ).fetchone()
+                    if citation_excerpt else None
+                )
+                if not chunk:
+                    cursor = connection.execute(
+                        """INSERT INTO source_chunks(
+                           source_id, project_id, sequence, text, locator, processing_state, processed_at
+                           ) VALUES (?, ?, ?, ?, ?, 'complete', ?)""",
+                        (source_id, project_id, 1_000_000 + len(citation_map),
+                         citation.get("excerpt") or "Citation excerpt unavailable",
+                         citation.get("locator") or "Archive citation", utc_now()),
+                    )
+                    chunk_id = int(cursor.lastrowid)
+                else:
+                    chunk_id = int(chunk["id"])
+                connection.execute(
+                    """INSERT OR IGNORE INTO citation_records(
+                       id, source_id, chunk_id, original_relative_path, display_name, source_type,
+                       locator, excerpt, source_date, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (citation_id, source_id, chunk_id, citation.get("original_relative_path") or "",
+                     citation.get("display_name") or "Source", citation.get("source_type") or "unknown",
+                     citation.get("locator") or "Archive citation", citation.get("excerpt") or "",
+                     citation.get("source_date"), utc_now()),
+                )
+                citation_map[citation_id] = citation_id
+            for item in knowledge:
+                if connection.execute("SELECT 1 FROM knowledge_items WHERE id = ?", (item["knowledge_item_id"],)).fetchone():
+                    continue
+                ids = [value for value in item.get("citation_ids", []) if value in citation_map]
+                if not ids:
+                    continue
+                connection.execute(
+                    """INSERT INTO knowledge_items(
+                       id, project_id, source_id, text, category, source_date, citation_ids_json,
+                       review_status, supersedes_knowledge_item_id, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (item["knowledge_item_id"], project_id, source_id, item["text"],
+                     item.get("category") or "development", item.get("source_date"), _json(ids),
+                     item.get("review_status") if item.get("review_status") in {"unreviewed", "approved", "flagged"} else "unreviewed",
+                     item.get("supersedes_knowledge_item_id"), utc_now()),
+                )
+                connection.execute(
+                    """INSERT INTO project_updates(
+                       project_id, source_id, update_type, text, citations_json, created_at
+                       ) SELECT ?, ?, 'knowledge', ?, '[]', ? WHERE NOT EXISTS (
+                         SELECT 1 FROM project_updates WHERE project_id = ? AND source_id = ? AND text = ?
+                       )""",
+                    (project_id, source_id, item["text"], utc_now(), project_id, source_id, item["text"]),
+                )
+                count += 1
+        return count
+
+    def _rebuild_project_summaries(self, project_id: str) -> int:
+        with self.db.connect() as connection:
+            project = self._project(connection, project_id)
+        folder = Path(project["folder_path"]) / "_Assistant" / "living-summary"
+        count = 0
+        for version_path in sorted((folder / "versions").glob("*.json")):
+            payload = json.loads(version_path.read_text(encoding="utf-8"))
+            revision = int(payload.get("revision") or 0)
+            with self.db.transaction() as connection:
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO summary_versions(
+                       project_id, revision, content_json, markdown, review_status,
+                       generation_state, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (project_id, revision, _json({"sections": payload.get("sections", [])}),
+                     "\n\n".join(f"## {item.get('section')}\n\n{item.get('text')}" for item in payload.get("sections", [])),
+                     payload.get("review_status") if payload.get("review_status") in {"unreviewed", "approved", "flagged"} else "unreviewed",
+                     payload.get("generation_state") if payload.get("generation_state") in {"current", "updating", "stale", "failed"} else "stale",
+                     payload.get("created_at") or utc_now()),
+                )
+                count += cursor.rowcount
+        current_path = folder / "current.json"
+        if current_path.is_file():
+            current = json.loads(current_path.read_text(encoding="utf-8"))
+            summary_text = " ".join(item.get("text", "") for item in current.get("sections", []))
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """UPDATE projects SET current_summary = ?, summary_revision = ?,
+                       summary_generation_state = ?, summary_review_status = ?, summary_generated_at = ?
+                       WHERE id = ?""",
+                    (summary_text, int(current.get("revision") or 0), current.get("generation_state") or "current",
+                     current.get("review_status") or "unreviewed", current.get("created_at"), project_id),
+                )
+        return count
 
     def _apply_ai_action(
         self, connection: sqlite3.Connection, project_id: str, source_id: int,
@@ -1458,6 +2899,7 @@ class PortfolioService:
                     "UPDATE sources SET processing_state = 'needs_review', model_id = ?, processed_at = ? WHERE id = ?",
                     (self.llm.model_id, now, source_id),
                 )
+            self._refresh_source_archive(source_id, processing_status="needs_review")
             return "needs_review"
         except UnsupportedSource as exc:
             self._set_source_state(source_id, "unsupported", "unsupported_type", exc)
@@ -1630,7 +3072,18 @@ class PortfolioService:
                    LEFT JOIN sources s ON s.id = r.source_id WHERE r.id = ?""",
                 (review_id,),
             ).fetchone()
-        return self._decode_review(updated)
+        decoded = self._decode_review(updated)
+        if action == "apply" and review["kind"] in {"multi_project_route", "cross_project_evidence"}:
+            if review["source_id"]:
+                self._refresh_source_archive(int(review["source_id"]))
+            routed = decoded.get("resolution") or {}
+            derived_source_id = routed.get("derived_source_id")
+            target_project_id = routed.get("target_project_id")
+            if derived_source_id and target_project_id:
+                self._refresh_source_archive(int(derived_source_id), processing_status="complete")
+                self._write_knowledge_history(str(target_project_id))
+                self.regenerate_living_summary(str(target_project_id), advance_revision=False)
+        return decoded
 
     def _resolve_routing_review(
         self, connection: sqlite3.Connection, review: sqlite3.Row,
@@ -1651,6 +3104,45 @@ class PortfolioService:
         ).fetchall()
         allowed = {(int(row["source_id"]), int(row["id"])) for row in allowed_rows}
         valid_citations = self._validate_citations(citations, allowed)
+        created = datetime.fromisoformat(str(source["created_at"]).replace("Z", "+00:00"))
+        linked_package = self._under_root(
+            Path(target["folder_path"]) /
+            ingestion_folder_name(
+                created, "linked-source", source["source_title"] or source["original_filename"],
+                source["ingestion_id"] or self._legacy_ingestion_id(source),
+            )
+        )
+        if not linked_package.exists():
+            incomplete = linked_package.parent / f"_INCOMPLETE_LINK_{review['id']}"
+            incomplete.mkdir(parents=True, exist_ok=False)
+            self._initial_assistant_files(
+                incomplete, source["ingestion_id"], target_project_id,
+                source["source_title"] or source["original_filename"],
+            )
+            atomic_write_json(incomplete / "Assistant" / "linked-segments.json", [])
+            atomic_write_json(incomplete / "manifest.json", {
+                "schema_version": SCHEMA_VERSION,
+                "ingestion_id": source["ingestion_id"],
+                "project_id": target["archive_id"],
+                "database_project_id": target_project_id,
+                "source_type": "linked-source",
+                "title": source["source_title"] or source["original_filename"],
+                "created_at": now,
+                "source_date": source["source_date"],
+                "capture_method": "routing_review",
+                "canonical_source": False,
+                "linked_ingestion_id": source["ingestion_id"],
+                "canonical_source_path": relative_to_root(Path(source["ingestion_path"]), self.settings.app.one_drive_root),
+                "processing_status": "complete",
+                "original_files": [],
+                "assistant_files": [
+                    "Assistant/linked-segments.json", "Assistant/source-summary.md",
+                    "Assistant/knowledge-items.json", "Assistant/citations.json",
+                ],
+                "extractor_version": "1.0",
+                "errors": [],
+            })
+            os.replace(incomplete, linked_package)
         derived_native = f"routed-review:{review['id']}"
         existing = connection.execute(
             "SELECT id FROM sources WHERE project_id = ? AND native_id = ?",
@@ -1663,13 +3155,17 @@ class PortfolioService:
                 """
                 INSERT INTO sources(project_id, parent_source_id, source_type, native_id, sha256,
                   original_filename, original_path, metadata_json, meeting_name, meeting_date,
-                  processing_state, model_id, created_at, processed_at)
-                VALUES (?, ?, 'routed_segment', ?, ?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?)
+                  processing_state, model_id, created_at, processed_at, ingestion_path, source_title,
+                  source_date, capture_method, canonical_source, linked_ingestion_id, source_summary)
+                VALUES (?, ?, 'routed_segment', ?, ?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?, ?, ?, ?,
+                        'routing_review', 0, ?, ?)
                 """,
                 (target_project_id, source["id"], derived_native, source["sha256"],
                  source["original_filename"], source["original_path"],
                  _json({"review_id": review["id"]}), source["meeting_name"], source["meeting_date"],
-                 source["model_id"], now, now),
+                 source["model_id"], now, now, str(linked_package),
+                 source["source_title"] or source["original_filename"], source["source_date"],
+                 source["ingestion_id"], normalize_text(str(segment["text"]))),
             )
             derived_source_id = int(cursor.lastrowid)
             derived_citations = []
@@ -1687,16 +3183,55 @@ class PortfolioService:
                 )
                 derived_citations.append({"source_id": derived_source_id, "chunk_id": int(inserted.lastrowid)})
             text = normalize_text(str(segment["text"]))
+            citation_payload = []
+            for original_citation, derived_citation in zip(valid_citations, derived_citations, strict=True):
+                original_chunk = connection.execute(
+                    "SELECT * FROM source_chunks WHERE id = ?", (original_citation["chunk_id"],)
+                ).fetchone()
+                citation_key = f"{derived_source_id}:{derived_citation['chunk_id']}"
+                citation_id = f"C-{hashlib.sha256(citation_key.encode()).hexdigest()[:8].upper()}"
+                try:
+                    canonical_relative = relative_to_root(
+                        Path(source["original_path"]), Path(source["ingestion_path"])
+                    )
+                except ValueError:
+                    canonical_relative = Path(source["original_path"]).name
+                connection.execute(
+                    """INSERT OR IGNORE INTO citation_records(
+                       id, source_id, chunk_id, original_relative_path, display_name, source_type,
+                       locator, excerpt, source_date, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (citation_id, derived_source_id, derived_citation["chunk_id"], canonical_relative,
+                     source["original_filename"], source["source_type"], original_chunk["locator"],
+                     original_chunk["text"][:1200], source["source_date"] or source["created_at"], now),
+                )
+                citation_payload.append({**derived_citation, "citation_id": citation_id})
             connection.execute(
                 "INSERT INTO project_updates(project_id, source_id, update_type, text, citations_json, model_id, created_at) VALUES (?, ?, 'routed_review', ?, ?, ?, ?)",
-                (target_project_id, derived_source_id, text, _json(derived_citations), source["model_id"], now),
+                (target_project_id, derived_source_id, text, _json(citation_payload), source["model_id"], now),
             )
-            current = target["current_summary"].strip()
-            summary = f"{current} {text}".strip()[-10_000:]
             connection.execute(
-                "UPDATE projects SET current_summary = ?, latest_change = ?, updated_at = ? WHERE id = ?",
-                (summary, text, now, target_project_id),
+                """INSERT INTO knowledge_items(
+                   id, project_id, source_id, text, category, source_date, citation_ids_json,
+                   review_status, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', ?)""",
+                (stable_id("K"), target_project_id, derived_source_id, text,
+                 self._knowledge_category(text), source["source_date"] or source["created_at"],
+                 _json([item["citation_id"] for item in citation_payload]), now),
             )
+            connection.execute(
+                """UPDATE projects SET latest_change = ?, updated_at = ?,
+                   summary_revision = summary_revision + 1, summary_generation_state = 'stale'
+                   WHERE id = ?""",
+                (text, now, target_project_id),
+            )
+            linked_segments_path = linked_package / "Assistant" / "linked-segments.json"
+            linked_segments = json.loads(linked_segments_path.read_text(encoding="utf-8"))
+            linked_segments.append({
+                "review_id": review["id"], "text": text, "citations": citation_payload,
+                "confirmed_at": now, "target_project_id": target["archive_id"],
+            })
+            atomic_write_json(linked_segments_path, linked_segments)
         stored_resolution = {**resolution, "derived_source_id": derived_source_id}
         if learn_rule:
             rule = resolution.get("rule") or segment.get("suggested_rule") or {}
@@ -1932,6 +3467,54 @@ class PortfolioService:
         if not path.is_file():
             raise NotFoundError("Preserved original is unavailable")
         return path, safe_filename(row["original_filename"], "source")
+
+    def get_original_file(self, original_file_id: int) -> tuple[Path, str]:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                """SELECT f.*, s.ingestion_path FROM original_files f
+                   JOIN sources s ON s.id = f.source_id WHERE f.id = ?""",
+                (original_file_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Original file not found")
+        path = self._under_root(Path(row["ingestion_path"]) / row["relative_path"])
+        if not path.is_file():
+            raise NotFoundError("Preserved original is unavailable locally; make it available in OneDrive and retry")
+        if sha256_file(path) != row["sha256"]:
+            raise ConflictError("Preserved original no longer matches its recorded SHA-256 hash")
+        return path, safe_filename(row["original_name"], row["stored_name"])
+
+    def get_citation_original(self, citation_id: str) -> tuple[Path, str]:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                """SELECT c.*, s.ingestion_path, s.linked_ingestion_id, s.original_filename
+                   FROM citation_records c JOIN sources s ON s.id = c.source_id WHERE c.id = ?""",
+                (citation_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("Citation not found")
+            package = Path(row["ingestion_path"])
+            original_source_id = int(row["source_id"])
+            if row["linked_ingestion_id"]:
+                canonical = connection.execute(
+                    """SELECT id, ingestion_path FROM sources
+                       WHERE ingestion_id = ? AND canonical_source = 1""",
+                    (row["linked_ingestion_id"],),
+                ).fetchone()
+                if canonical:
+                    package = Path(canonical["ingestion_path"])
+                    original_source_id = int(canonical["id"])
+            original = connection.execute(
+                """SELECT sha256 FROM original_files
+                   WHERE source_id = ? AND relative_path = ?""",
+                (original_source_id, row["original_relative_path"]),
+            ).fetchone()
+        path = self._under_root(package / row["original_relative_path"])
+        if not path.is_file():
+            raise NotFoundError("Cited original is unavailable locally; make it available in OneDrive and retry")
+        if not original or sha256_file(path) != original["sha256"]:
+            raise ConflictError("Cited original no longer matches its recorded SHA-256 hash")
+        return path, safe_filename(row["display_name"], row["original_filename"])
 
     def run_daily(self, run_date: date | None = None) -> dict[str, Any]:
         local_now = datetime.now().astimezone()

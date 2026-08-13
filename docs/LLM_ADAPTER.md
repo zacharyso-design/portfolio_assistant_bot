@@ -14,7 +14,9 @@ Controls:
 - Source text is labeled as untrusted evidence and all responses must be JSON objects.
 - Citation source/chunk pairs must exist in the exact supplied evidence package.
 - The same bounded evidence list is used both for the model call and the citation allow-list; chunks are kept whole and a boundary chunk is never partially supplied. Oversized/non-fitting chunks are counted in source metadata and shown as a partial-evidence warning instead of being silently hidden.
-- The model's `updated_summary` is treated as a proposal. Durable summary text is constructed from the prior committed summary plus the newly validated cited updates, so unsupported summary-only claims cannot persist.
+- Source processing returns cited knowledge updates; validated updates become durable `knowledge_items` rather than being appended to prior summary prose.
+- The required `living_summary(project, knowledge)` adapter operation returns `{"sections": [...]}`. Every section has `section`, `text`, and one or more `knowledge_item_ids` drawn only from the supplied project knowledge. Unknown or wrong-project IDs reject the result.
+- Living Summary generation always regenerates from non-flagged eligible knowledge. It never uses prior summary prose as evidence, and each successful run creates a version.
 - Missing/foreign citations, malformed JSON, explicit uncertainty, or missing update fields block knowledge mutation and create review work.
 - A substantive chat answer is rejected unless it contains at least one validated cited claim; an uncertainty string cannot excuse an uncited factual answer.
 - Status/priority recommendations go to Review Queue; action closure requests always go to review.

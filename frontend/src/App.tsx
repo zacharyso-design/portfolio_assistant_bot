@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
-import type { BoardResult, Citation, Group, Project, ProjectDetail, Review } from "./types";
+import type { BoardResult, Citation, Group, KnowledgeItem, Project, ProjectDetail, Review, SearchResult, Source } from "./types";
 
 type Route = { page: "portfolio" | "project" | "review" | "import"; id?: string };
 
@@ -65,7 +65,7 @@ function App() {
       </aside>
       <main>
         {route.page === "portfolio" && <Portfolio navigate={navigate} />}
-        {route.page === "project" && route.id && <ProjectWorkspace projectId={route.id} navigate={navigate} />}
+        {route.page === "project" && route.id && <ProjectArchiveWorkspace projectId={route.id} navigate={navigate} />}
         {route.page === "review" && <ReviewQueue navigate={navigate} onChange={refreshCount} />}
         {route.page === "import" && <SnowImport navigate={navigate} />}
       </main>
@@ -87,6 +87,7 @@ function Portfolio({ navigate }: { navigate: (path: string) => void }) {
   const [newGroup, setNewGroup] = useState("");
   const [notice, setNotice] = useState("");
   const [scheduler, setScheduler] = useState<any>(null);
+  const [archiveResults, setArchiveResults] = useState<SearchResult[]>([]);
   const load = useCallback(async () => {
     const params = new URLSearchParams();
     if (filters.q) params.set("q", filters.q);
@@ -94,10 +95,11 @@ function Portfolio({ navigate }: { navigate: (path: string) => void }) {
     if (filters.assignment !== "") params.set("assignment_group", filters.assignment === "__none" ? "" : filters.assignment);
     if (filters.status) params.set("status", filters.status);
     if (filters.priority) params.set("priority", filters.priority);
-    const [projects, groupData, dailyData] = await Promise.all([
+    const [projects, groupData, dailyData, searchData] = await Promise.all([
       api.get<BoardResult>(`/api/projects?${params}`), api.get<Group[]>("/api/groups"), api.get<any>("/api/daily"),
+      filters.q.trim() ? api.get<SearchResult[]>(`/api/search?q=${encodeURIComponent(filters.q)}`) : Promise.resolve([]),
     ]);
-    setBoard(projects); setGroups(groupData); setDaily(dailyData);
+    setBoard(projects); setGroups(groupData); setDaily(dailyData); setArchiveResults(searchData);
   }, [filters]);
   useEffect(() => { const timer = setTimeout(() => load().catch(error => setNotice(error.message)), 120); return () => clearTimeout(timer); }, [load]);
   useEffect(() => { api.get<any>("/api/configuration").then(data => setScheduler(data.scheduler)).catch(() => {}); }, []);
@@ -142,6 +144,7 @@ function Portfolio({ navigate }: { navigate: (path: string) => void }) {
   return <>
     <PageHeader eyebrow={new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} title="Project portfolio">
       <label className="search-field"><span className="sr-only">Search projects</span><input value={filters.q} onChange={event => setFilters({ ...filters, q: event.target.value })} placeholder="Search projects" /></label>
+      <button className="button" onClick={() => api.post<Record<string, number>>("/api/archive/rescan").then(result => { setNotice(`OneDrive rescan complete: ${result.projects} projects, ${result.sources} sources added; ${result.errors} archive item(s) could not be indexed.`); return load(); }).catch(error => setNotice(error.message))}>Rescan OneDrive</button>
       <button className="button" onClick={() => navigate("/import")}>Import SNOW</button>
       <button className="button primary" onClick={() => setNewOpen(true)}>+ New project</button>
     </PageHeader>
@@ -163,6 +166,7 @@ function Portfolio({ navigate }: { navigate: (path: string) => void }) {
         <select aria-label="Status" value={filters.status} onChange={event => setFilters({ ...filters, status: event.target.value })}><option value="">All statuses</option>{["Green", "Yellow", "Red", "Complete"].map(value => <option key={value}>{value}</option>)}</select>
         <select aria-label="Priority" value={filters.priority} onChange={event => setFilters({ ...filters, priority: event.target.value })}><option value="">All priorities</option>{["Critical", "High", "Medium", "Low"].map(value => <option key={value}>{value}</option>)}</select>
       </section>
+      {filters.q.trim() && <section className="panel archive-results"><header><div><small>Projects, sources, originals, excerpts, and knowledge</small><h2>Archive search</h2></div><span>{archiveResults.length} results</span></header>{archiveResults.map((result, index) => <article key={`${result.result_type}-${result.source_id || result.project_id}-${index}`}><div><small>{result.result_type.replaceAll("_", " ")} · {result.project_name || "Shared Intake"}</small><strong>{result.title}</strong><p>{result.excerpt || "Matching archive record"}</p></div>{result.original_file_id ? <a className="button compact" href={`/api/original-files/${result.original_file_id}`}>Open original</a> : result.source_id ? <a className="button compact" href={`/api/sources/${result.source_id}/original`}>Open source</a> : result.project_id ? <button className="button compact" onClick={() => navigate(`/projects/${result.project_id}`)}>Open project</button> : null}</article>)}</section>}
       <section className="board" aria-label="Project board">
         {grouped.map(([name, projects]) => <section className="project-group" key={name}>
           <header><div><span>⌄</span><strong>{name}</strong><small>{projects.length} shown</small></div><span>portfolio group</span></header>
@@ -185,6 +189,141 @@ function Portfolio({ navigate }: { navigate: (path: string) => void }) {
 function Metric({ label, value, tone = "" }: { label: string; value: React.ReactNode; tone?: string }) { return <div className={`metric ${tone}`}><strong>{value}</strong><span>{label}</span></div>; }
 function Pill({ value }: { value: string }) { return <span className={`pill ${value.toLowerCase()}`}>{value}</span>; }
 function Status({ value }: { value: string }) { return <span className={`status ${value.toLowerCase()}`}><i />{value}</span>; }
+
+function ProjectArchiveWorkspace({ projectId, navigate }: { projectId: string; navigate: (path: string) => void }) {
+  const [project, setProject] = useState<ProjectDetail | null>(null);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [notice, setNotice] = useState("");
+  const [citation, setCitation] = useState<any>(null);
+  const [sourceDetail, setSourceDetail] = useState<Source | null>(null);
+  const [priorSummary, setPriorSummary] = useState<any>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasted, setPasted] = useState({ title: "Manual note", text: "", isTranscript: false, meetingName: "", meetingDate: new Date().toISOString().slice(0, 10) });
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState<any>(null);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [view, setView] = useState<"summary" | "knowledge" | "sources">("summary");
+  const [filters, setFilters] = useState({ q: "", category: "", status: "all", source: "", date: "" });
+  const load = useCallback(async () => {
+    const [detail, groupData] = await Promise.all([
+      api.get<ProjectDetail>(`/api/projects/${projectId}`), api.get<Group[]>("/api/groups"),
+    ]);
+    setProject(detail); setGroups(groupData); return detail;
+  }, [projectId]);
+  useEffect(() => { load().catch(error => setNotice(error.message)); }, [load]);
+  async function patchProject(field: string, value: string | number | null) {
+    setProject(await api.patch<ProjectDetail>(`/api/projects/${projectId}`, { [field]: value }));
+  }
+  async function uploadFiles(files: File[]) {
+    const first = files[0];
+    if (!first) return;
+    const lowerNames = files.map(file => file.name.toLowerCase());
+    const transcript = lowerNames.some(name => [".vtt", ".srt"].some(ext => name.endsWith(ext))) ||
+      (lowerNames.some(name => [".txt", ".md"].some(ext => name.endsWith(ext))) && confirm("Does this selection contain a meeting transcript?"));
+    let meeting_name = "", meeting_date = "";
+    if (transcript) {
+      meeting_name = prompt("Meeting name") || "";
+      meeting_date = prompt("Meeting date (YYYY-MM-DD)", new Date().toISOString().slice(0, 10)) || "";
+      if (!meeting_name || !meeting_date) throw new Error("Meeting name and date are required for transcripts.");
+    }
+    const result = files.length === 1 && !first.webkitRelativePath
+      ? await api.upload<any>(`/api/projects/${projectId}/sources`, first, { meeting_name, meeting_date, is_transcript: transcript })
+      : await api.uploadMany<any>(`/api/projects/${projectId}/sources`, files, { meeting_name, meeting_date, is_transcript: transcript });
+    setNotice(result.duplicate ? "This content is already preserved for the project." : "Source package preserved; local processing continues.");
+    await load();
+    if (!result.duplicate && result.source?.id) void pollProjectSource(projectId, result.source.id, load).catch(error => setNotice(error.message));
+  }
+  async function openCitation(item: Citation) { setCitation({ ...(await api.get<Record<string, unknown>>(`/api/chunks/${item.chunk_id}`)), citation_id: item.citation_id }); }
+  async function reviewKnowledge(item: KnowledgeItem, status: "approved" | "flagged") {
+    await api.patch(`/api/projects/${projectId}/knowledge/${item.id}`, { status });
+    setNotice(`Knowledge item ${status}; Living Summary approval remains independent.`); await load();
+  }
+  async function reviewSummary(status: "approved" | "flagged") {
+    await api.patch(`/api/projects/${projectId}/living-summary/review`, { status });
+    setNotice(`Living Summary ${status}; Knowledge History states were not changed.`); await load();
+  }
+  async function refreshDerived(sourceId: number) {
+    const result = await api.post<{ files_refreshed: number; unsupported_files: number }>(`/api/sources/${sourceId}/refresh-derived`);
+    setNotice(`Rebuilt ${result.files_refreshed} extracted file(s); all original hashes were verified first.`);
+    setSourceDetail(await api.get<Source>(`/api/sources/${sourceId}`));
+    await load();
+  }
+  async function submitPastedText(event: React.FormEvent) {
+    event.preventDefault();
+    const source = await api.post<{ id: number }>(`/api/projects/${projectId}/notes`, {
+      title: pasted.title, text: pasted.text, is_transcript: pasted.isTranscript,
+      meeting_name: pasted.isTranscript ? pasted.meetingName : null,
+      meeting_date: pasted.isTranscript ? pasted.meetingDate : null,
+    });
+    setPasteOpen(false);
+    setPasted({ ...pasted, text: "" });
+    setNotice("Pasted text was preserved exactly as submitted; processing continues locally.");
+    await load();
+    void pollProjectSource(projectId, source.id, load).catch(error => setNotice(error.message));
+  }
+  async function askProject(event: React.FormEvent) {
+    event.preventDefault(); setChatBusy(true);
+    try { setAnswer(await api.post(`/api/projects/${projectId}/chat`, { question })); setQuestion(""); }
+    catch (error) { setNotice((error as Error).message); }
+    finally { setChatBusy(false); }
+  }
+  async function addAction() {
+    const description = prompt("Action description")?.trim();
+    if (!description) return;
+    const assignee = prompt("Assignee name, team/office, or Me", "Me")?.trim() || "Me";
+    const due = prompt("Due date (YYYY-MM-DD), or leave blank", "")?.trim() || null;
+    await api.post(`/api/projects/${projectId}/actions`, {
+      description, assignee_type: assignee.toLowerCase() === "me" ? "me" : "person",
+      assignee_value: assignee, due_date: due, state: "open", progress_text: null,
+    });
+    await load();
+  }
+  if (!project) return <div className="page loading">Loading project...</div>;
+  const knowledge = project.knowledge_history.filter(item =>
+    (!filters.q || `${item.text} ${item.source_title || ""}`.toLowerCase().includes(filters.q.toLowerCase())) &&
+    (!filters.category || item.category === filters.category) &&
+    (filters.status === "all" || item.review_status === filters.status) &&
+    (!filters.source || String(item.source_id) === filters.source) &&
+    (!filters.date || (item.source_date || "").slice(0, 10) === filters.date)
+  );
+  const citationsFor = (ids: string[]) => Array.from(new Map(
+    project.knowledge_history.filter(item => ids.includes(item.id)).flatMap(item => item.citations)
+      .map(item => [`${item.source_id}-${item.chunk_id}`, item])
+  ).values());
+  return <>
+    <PageHeader eyebrow={project.portfolio_group_name} title={project.name}>
+      <button className="button" onClick={() => navigate("/")}>Back to portfolio</button>
+      <select aria-label="Project priority" value={project.priority} onChange={event => patchProject("priority", event.target.value)}>{["Critical", "High", "Medium", "Low"].map(value => <option key={value}>{value}</option>)}</select>
+      <select aria-label="Project status" value={project.status} onChange={event => patchProject("status", event.target.value)}>{["Green", "Yellow", "Red", "Complete"].map(value => <option key={value}>{value}</option>)}</select>
+      <select aria-label="Portfolio group" value={project.portfolio_group_id} onChange={event => patchProject("portfolio_group_id", Number(event.target.value))}>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}</select>
+    </PageHeader>
+    <div className="archive-workspace">
+      {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")}>x</button></div>}
+      <section className="snow-strip"><div><small>SNOW number</small><strong>{project.snow_number || "Not linked"}</strong></div><div><small>SNOW state</small><strong>{project.snow_state || "-"}</strong></div><div><small>SNOW priority</small><strong>{project.snow_priority || "-"}</strong></div><div><small>Assignment Group</small><strong>{project.assignment_group || "None"}</strong></div></section>
+      <nav className="project-tabs" aria-label="Project archive views"><button className={view === "summary" ? "active" : ""} onClick={() => setView("summary")}>Living Summary</button><button className={view === "knowledge" ? "active" : ""} onClick={() => setView("knowledge")}>Knowledge History <span>{project.knowledge_history.length}</span></button><button className={view === "sources" ? "active" : ""} onClick={() => setView("sources")}>Sources <span>{project.sources.filter(source => !source.parent_source_id).length}</span></button></nav>
+      <section className="panel manual-fields"><header><div><small>User-controlled</small><h2>Project fields</h2></div></header><div><label>Project name<input defaultValue={project.name} onBlur={event => event.target.value !== project.name && patchProject("name", event.target.value)} /></label><label>Owner<input defaultValue={project.owner_text || ""} onBlur={event => patchProject("owner_text", event.target.value || null)} /></label><label>Primary next action<input defaultValue={project.next_action || ""} onBlur={event => patchProject("next_action", event.target.value || null)} /></label><label>Due date<input type="date" defaultValue={project.next_action_due || ""} onBlur={event => patchProject("next_action_due", event.target.value || null)} /></label></div></section>
+      <IngestionDropZone onFiles={files => uploadFiles(files).catch(error => setNotice(error.message))} />
+      <button className="button" onClick={() => setPasteOpen(true)}>Paste a note or transcript</button>
+      {view === "summary" && <section className="panel summary-panel">
+        <header><div><small>Revision {project.living_summary.revision} / {project.living_summary.generation_state} / {project.living_summary.review_status}</small><h2>Living Summary</h2></div><div className="header-actions"><button className="button compact" onClick={() => api.post(`/api/projects/${projectId}/living-summary/regenerate`).then(load).catch(error => setNotice(error.message))}>Regenerate</button><button className="button compact" onClick={() => reviewSummary("flagged").catch(error => setNotice(error.message))}>Flag</button><button className="button primary compact" onClick={() => reviewSummary("approved").catch(error => setNotice(error.message))}>Approve</button></div></header>
+        {project.living_summary.generation_state !== "current" && <div className={`notice ${project.living_summary.generation_state === "failed" ? "error" : ""}`}>Summary is {project.living_summary.generation_state}. {project.living_summary.error || "The last valid version does not include all current knowledge."}</div>}
+        {project.living_summary.current?.content.sections.length ? project.living_summary.current.content.sections.map((section, index) => <article className="summary-claim" key={`${section.section}-${index}`}><div><small>{section.section}</small><p>{section.text}</p><code>{section.knowledge_item_ids.join(", ")}</code><Citations items={citationsFor(section.knowledge_item_ids)} onOpen={openCitation} /></div><button className="button compact" onClick={() => Promise.all(section.knowledge_item_ids.map(id => api.patch(`/api/projects/${projectId}/knowledge/${id}`, { status: "flagged" }))).then(load).catch(error => setNotice(error.message))}>Flag statement</button></article>) : <p>No eligible source-grounded knowledge yet.</p>}
+        <details><summary>Prior versions ({project.living_summary.versions.length})</summary>{project.living_summary.versions.map(version => <div className="version-row" key={version.id}><strong>Revision {version.revision}</strong><span>{version.review_status} / {new Date(version.created_at).toLocaleString()}</span><button className="button compact" onClick={() => api.get(`/api/projects/${projectId}/living-summary/versions/${version.revision}`).then(setPriorSummary).catch(error => setNotice(error.message))}>Compare</button></div>)}</details>
+      </section>}
+      {view === "knowledge" && <section className="panel"><header><div><small>Chronological and independently reviewed</small><h2>Knowledge History</h2></div><span>{knowledge.length} shown</span></header>
+        <div className="knowledge-filters"><input placeholder="Search knowledge or source" value={filters.q} onChange={event => setFilters({ ...filters, q: event.target.value })} /><select value={filters.category} onChange={event => setFilters({ ...filters, category: event.target.value })}><option value="">All categories</option>{["decision", "development", "milestone", "risk", "action"].map(value => <option key={value}>{value}</option>)}</select><select value={filters.status} onChange={event => setFilters({ ...filters, status: event.target.value })}><option value="all">All review states</option>{["unreviewed", "approved", "flagged"].map(value => <option key={value}>{value}</option>)}</select><select value={filters.source} onChange={event => setFilters({ ...filters, source: event.target.value })}><option value="">All sources</option>{Array.from(new Map(project.knowledge_history.map(item => [item.source_id, item.source_title || item.source_type])).entries()).map(([id, title]) => <option key={id} value={id}>{title}</option>)}</select><input aria-label="Knowledge source date" type="date" value={filters.date} onChange={event => setFilters({ ...filters, date: event.target.value })} /></div>
+        {knowledge.map(item => <article className="knowledge-item" key={item.id}><div><small>{item.category} / {item.source_date ? new Date(item.source_date).toLocaleDateString() : "No date"} / {item.review_status}</small><strong>{item.text}</strong><span>{item.source_title || item.source_type} / {item.id}</span>{item.supersedes_knowledge_item_id && <span>Supersedes {item.supersedes_knowledge_item_id}</span>}<Citations items={item.citations} onOpen={openCitation} /></div><div className="decision-actions"><button className="button compact" onClick={() => reviewKnowledge(item, "flagged").catch(error => setNotice(error.message))}>Flag</button><button className="button primary compact" onClick={() => reviewKnowledge(item, "approved").catch(error => setNotice(error.message))}>Approve</button></div></article>)}
+      </section>}
+      {view === "sources" && <section className="panel"><header><div><small>Self-contained OneDrive ingestion packages</small><h2>Sources</h2></div><button className="button" onClick={() => api.post("/api/sources/retry-pending").then(() => pollRefresh(load)).catch(error => setNotice(error.message))}>Retry pending</button></header><div className="source-list">{project.sources.filter(source => !source.parent_source_id).map(source => <article key={source.id}><div><small>{source.ingestion_id || "Linked source"} / {new Date(source.created_at).toLocaleString()}</small><strong>{source.source_title || source.original_filename}</strong><p>{source.source_summary || "Derived summary pending."}</p>{source.error_message && <p>{source.error_message}</p>}</div><span className={`state ${source.processing_state}`}>{source.processing_state.replace("_", " ")}</span><button className="button compact" onClick={() => api.get<Source>(`/api/sources/${source.id}`).then(setSourceDetail).catch(error => setNotice(error.message))}>Inspect package</button><a className="button compact" href={`/api/sources/${source.id}/original`}>Open original</a></article>)}</div></section>}
+      <section className="panel"><header><div><small>User-managed and source-cited</small><h2>Project action items</h2></div><div className="header-actions"><span>{project.action_items.filter(item => item.state !== "complete").length} open</span><button className="button compact" onClick={() => addAction().catch(error => setNotice(error.message))}>+ Add action</button></div></header>{project.action_items.length ? project.action_items.map(item => <article className="action-item" key={item.id}><div><Status value={item.state === "complete" ? "Complete" : item.state === "blocked" ? "Red" : "Green"} /><strong>{item.description}</strong><small>{item.assignee_value} · {item.due_date || "No due date"}</small>{item.progress_text && <p>{item.progress_text}</p>}</div>{item.state !== "complete" && <button className="button" onClick={async () => { if (confirm("Complete this action item? This requires your explicit approval.")) { await api.post(`/api/projects/${projectId}/actions/${item.id}/complete`, { confirmed: true }); await load(); } }}>Complete</button>}</article>) : <p className="muted">No action items yet.</p>}</section>
+      <section className="panel archive-chat"><header><div><small>Uses only this project's evidence</small><h2>Project-scoped assistant</h2></div></header><div className="chat-answer">{answer ? <><p>{answer.answer}</p>{answer.evidence_dropped_chunks > 0 && <div className="uncertainty">{answer.evidence_dropped_chunks} matching chunks were outside the configured evidence window.</div>}{answer.uncertainty && <div className="uncertainty">{answer.uncertainty}</div>}{answer.claims?.flatMap((claim: any) => claim.citations).length > 0 && <Citations items={answer.claims.flatMap((claim: any) => claim.citations)} onOpen={openCitation} />}</> : <p className="muted">Ask what changed, what remains unresolved, or what supports a decision.</p>}</div><form className="chat-form" onSubmit={askProject}><label htmlFor="archive-project-question">Ask this project</label><textarea id="archive-project-question" value={question} onChange={event => setQuestion(event.target.value)} required placeholder="Ask about this project" /><button className="button primary" disabled={chatBusy}>{chatBusy ? "Searching evidence…" : "Send ↑"}</button></form></section>
+    </div>
+    {citation && <Modal title="Source evidence" onClose={() => setCitation(null)}><div className="citation-detail"><small>{citation.original_filename} / {citation.locator}</small><blockquote>{citation.text}</blockquote><a className="button" href={citation.citation_id ? `/api/citations/${citation.citation_id}/original` : `/api/sources/${citation.source_id}/original`}>Open cited original</a></div></Modal>}
+    {sourceDetail && <Modal title={sourceDetail.source_title || sourceDetail.original_filename} onClose={() => setSourceDetail(null)}><div className="source-package-detail"><p>{sourceDetail.source_summary}</p><small>{sourceDetail.ingestion_id} / {sourceDetail.capture_method}</small><button className="button" onClick={() => refreshDerived(sourceDetail.id).catch(error => setNotice(error.message))}>Rebuild derived files</button><h3>Original files</h3>{sourceDetail.original_files?.map(file => <article key={file.id}><div><strong>{file.original_name}</strong><small>{file.relative_path} / SHA-256 {file.sha256}</small></div><a className="button compact" href={`/api/original-files/${file.id}`}>Open original</a></article>)}<details><summary>Manifest</summary><pre>{JSON.stringify(sourceDetail.manifest, null, 2)}</pre></details></div></Modal>}
+    {priorSummary && <Modal title={`Compare revision ${priorSummary.revision}`} onClose={() => setPriorSummary(null)}><div className="summary-comparison"><section><small>Selected revision</small>{priorSummary.content.sections.map((section: any, index: number) => <article key={index}><strong>{section.section}</strong><p>{section.text}</p></article>)}</section><section><small>Current valid summary</small>{project.living_summary.current?.content.sections.map((section, index) => <article key={index}><strong>{section.section}</strong><p>{section.text}</p></article>)}</section></div></Modal>}
+    {pasteOpen && <Modal title="Preserve pasted text" onClose={() => setPasteOpen(false)}><form className="form-stack" onSubmit={event => submitPastedText(event).catch(error => setNotice(error.message))}><label>Title<input required value={pasted.title} onChange={event => setPasted({ ...pasted, title: event.target.value })} /></label><label className="check-field"><input type="checkbox" checked={pasted.isTranscript} onChange={event => setPasted({ ...pasted, isTranscript: event.target.checked })} /> This is a meeting transcript</label>{pasted.isTranscript && <><label>Meeting name<input required value={pasted.meetingName} onChange={event => setPasted({ ...pasted, meetingName: event.target.value })} /></label><label>Meeting date<input required type="date" value={pasted.meetingDate} onChange={event => setPasted({ ...pasted, meetingDate: event.target.value })} /></label></>}<label>Text exactly as submitted<textarea required rows={14} value={pasted.text} onChange={event => setPasted({ ...pasted, text: event.target.value })} /></label><p className="muted">The archive records this as pasted text, never as an original email container.</p><button className="button primary">Preserve and process</button></form></Modal>}
+  </>;
+}
 
 function ProjectWorkspace({ projectId, navigate }: { projectId: string; navigate: (path: string) => void }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -261,7 +400,13 @@ function ProjectWorkspace({ projectId, navigate }: { projectId: string; navigate
   </>;
 }
 
-function Citations({ items, onOpen }: { items: Citation[]; onOpen: (item: Citation) => void }) { return <div className="citations">{items.map((item, index) => <button key={`${item.source_id}-${item.chunk_id}`} onClick={() => onOpen(item)}>[{index + 1}] {item.original_filename || `Source ${item.source_id}`}{item.locator ? ` · ${item.locator}` : ""}</button>)}</div>; }
+function Citations({ items, onOpen }: { items: Citation[]; onOpen: (item: Citation) => void }) { return <div className="citations">{items.map((item, index) => <button key={`${item.source_id}-${item.chunk_id}`} onClick={() => onOpen(item)}>[{index + 1}] {item.original_filename || item.display_name || `Source ${item.source_id}`}{item.locator ? ` · ${item.locator}` : ""}</button>)}</div>; }
+
+function IngestionDropZone({ onFiles }: { onFiles: (files: File[]) => void }) {
+  const filesId = useMemo(() => `ingestion-files-${Math.random().toString(36).slice(2)}`, []);
+  const folderId = useMemo(() => `ingestion-folder-${Math.random().toString(36).slice(2)}`, []);
+  return <section className="dropzone ingestion-dropzone" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); const files = [...event.dataTransfer.files]; if (files.length) onFiles(files); }}><span>+</span><strong>Drop files, email, documents, or transcripts</strong><small>Use Choose folder to preserve a folder tree. One selection becomes one durable ingestion package.</small><div className="header-actions"><label className="button" htmlFor={filesId}>Choose files</label><label className="button" htmlFor={folderId}>Choose folder</label></div><input id={filesId} type="file" multiple onChange={event => { const files = [...(event.target.files || [])]; if (files.length) onFiles(files); event.target.value = ""; }} /><input id={folderId} type="file" multiple ref={element => { if (element) element.setAttribute("webkitdirectory", ""); }} onChange={event => { const files = [...(event.target.files || [])]; if (files.length) onFiles(files); event.target.value = ""; }} /></section>;
+}
 
 function DropZone({ label, onFile, description = "MSG, EML, TXT, MD, VTT, SRT, DOCX, or text-layer PDF", accept }: { label: string; onFile: (file: File) => void; description?: string; accept?: string }) {
   const id = useMemo(() => `upload-${Math.random().toString(36).slice(2)}`, []);

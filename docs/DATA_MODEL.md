@@ -20,4 +20,6 @@ Migrations `001_initial.sql` and `002_onedrive_archive.sql` are authoritative. S
 
 Package originals are never rewritten or deleted. Replaceable extracted files and sidecars may be regenerated only after their recorded original hashes pass. Manual status/priority changes are recorded as `manual_field` project updates and deliberately have no source citation because they are direct user mutations rather than derived knowledge.
 
+`Assistant/index.json` is a durable archive sidecar, not just a transient index. For email sources it can contain sender, recipient, and CC display names and addresses, plus inferred organization domains. Treat the OneDrive archive as containing PII and protect its sharing, retention, and access accordingly.
+
 For `snow_comments` rows, the preserved original is the complete imported CSV/XLSX export shared by every ticket source created from that import. Source metadata and chunk locators identify the ticket and row; the API does not disclose the workstation's absolute preservation path.

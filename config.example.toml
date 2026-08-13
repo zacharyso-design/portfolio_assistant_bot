@@ -3,6 +3,7 @@ database_path = "%LOCALAPPDATA%\\PortfolioAssistant\\portfolio.db"
 one_drive_root = "C:\\Users\\USER\\OneDrive - Organization\\CHIO Portfolio"
 bind_host = "127.0.0.1"
 bind_port = 8765
+# Maximum total bytes across one upload or folder ingestion selection.
 max_file_mb = 100
 max_attachments = 25
 max_extracted_text_mb = 5

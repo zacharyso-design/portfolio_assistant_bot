@@ -286,6 +286,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             paths = json.loads(relative_paths) if relative_paths else []
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=422, detail="relative_paths must be a JSON array") from exc
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise HTTPException(status_code=422, detail="relative_paths must be a JSON array of strings")
         source, duplicate = service.capture_sources(
             [(upload.file, upload.filename or "source", paths[index] if index < len(paths) else upload.filename or "source")
              for index, upload in enumerate(uploads)],
@@ -314,6 +316,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             paths = json.loads(relative_paths) if relative_paths else []
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=422, detail="relative_paths must be a JSON array") from exc
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise HTTPException(status_code=422, detail="relative_paths must be a JSON array of strings")
         source, duplicate = service.capture_sources(
             [(upload.file, upload.filename or "source", paths[index] if index < len(paths) else upload.filename or "source")
              for index, upload in enumerate(uploads)], project_id=None,

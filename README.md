@@ -25,7 +25,7 @@ CHIO Portfolio Assistant\
 
 Each project has one stable-ID folder. Every upload becomes a self-contained ingestion package containing byte-preserved originals, hashes, a manifest, extracted text, citations, and knowledge items. Multi-project material is preserved once in `Shared Intake` and linked into projects only after Review Queue confirmation. Where policy permits, mark the `CHIO Portfolio Assistant` folder **Always keep on this device** so originals are locally available for hashing and citation access.
 
-Keep project folders as direct children of `Projects`; the bot owns that layout, and manual regrouping or moving of managed package folders is not supported.
+Keep project folders as direct children of `Projects`; the bot owns that layout, and manual regrouping or moving of managed package folders is not supported. A project's human-readable folder name is fixed when the project is created; renaming the project in the app updates its metadata but does not rename the durable folder.
 
 Start in the background and open `http://127.0.0.1:8765`:
 
@@ -81,6 +81,8 @@ The installer reads `app.daily_run_time` from TOML. If GFE policy blocks task cr
 ## Project archive workflow
 
 Open a project and use the upload area to select one file, multiple files, or a folder. Use **Paste a note or transcript** when no original container exists; the archive records the capture method as `pasted_text` and never represents pasted email text as an original `.msg` or `.eml`.
+
+`app.max_file_mb` limits the combined bytes in one ingestion selection, not each individual file.
 
 Project pages separate three review surfaces:
 

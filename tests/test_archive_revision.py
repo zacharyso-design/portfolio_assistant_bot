@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
@@ -14,7 +15,7 @@ import pytest
 
 from portfolio_assistant.db import Database
 from portfolio_assistant.llm import FakeLlmAdapter, LlmUnavailable
-from portfolio_assistant.services import PortfolioService
+from portfolio_assistant.services import PortfolioService, UnexpectedSummaryError
 
 
 def _process(client, source_id: int):
@@ -83,6 +84,44 @@ def test_project_and_multi_file_packages_are_durable(client, project):
         (Path(collision.json()["source"]["ingestion_path"]) / "manifest.json").read_text(encoding="utf-8")
     )
     assert len({item["relative_path"].casefold() for item in collision_manifest["original_files"]}) == 3
+
+    malformed_paths = client.post(
+        f"/api/projects/{project['id']}/sources",
+        files={"file": ("invalid-paths.md", b"Malformed metadata is rejected.", "text/markdown")},
+        data={"relative_paths": "true"},
+    )
+    assert malformed_paths.status_code == 422
+    malformed_intake_paths = client.post(
+        "/api/intake/multi-project",
+        files={"file": ("invalid-intake-paths.md", b"Malformed intake metadata.", "text/markdown")},
+        data={"relative_paths": "{}"},
+    )
+    assert malformed_intake_paths.status_code == 422
+
+    transcript_without_metadata = client.post(
+        f"/api/projects/{project['id']}/sources",
+        files=[
+            ("files", ("agenda.md", b"Agenda", "text/markdown")),
+            ("files", ("meeting.vtt", b"WEBVTT\n\n00:00.000 --> 00:01.000\nDecision", "text/vtt")),
+        ],
+    )
+    assert transcript_without_metadata.status_code == 422
+    transcript_with_metadata = client.post(
+        f"/api/projects/{project['id']}/sources",
+        files=[
+            ("files", ("agenda.md", b"Agenda with metadata", "text/markdown")),
+            ("files", ("meeting.vtt", b"WEBVTT\n\n00:00.000 --> 00:01.000\nApproved", "text/vtt")),
+        ],
+        data={"meeting_name": "Archive Review", "meeting_date": "2026-08-13"},
+    )
+    assert transcript_with_metadata.status_code == 202, transcript_with_metadata.text
+    transcript_source = transcript_with_metadata.json()["source"]
+    assert transcript_source["source_type"] == "meeting-transcript"
+    transcript_manifest = json.loads(
+        (Path(transcript_source["ingestion_path"]) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert transcript_manifest["source_type"] == "meeting-transcript"
+    assert transcript_manifest["source_date"] == "2026-08-13"
 
 
 def test_email_package_preserves_container_attachment_and_derivatives(client, project):
@@ -198,6 +237,29 @@ def test_failed_summary_keeps_knowledge_and_retry_succeeds(client, project, serv
     assert retried["generation_state"] == "current"
 
 
+def test_unexpected_summary_failure_marks_failed_and_propagates(project, service, monkeypatch):
+    monkeypatch.setattr(
+        service.llm, "living_summary",
+        lambda project_data, knowledge: (_ for _ in ()).throw(RuntimeError("fictional programming error")),
+    )
+    with pytest.raises(UnexpectedSummaryError) as raised:
+        service.regenerate_living_summary(project["id"])
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "fictional programming error"
+    summary = service.get_living_summary(project["id"])
+    assert summary["generation_state"] == "failed"
+    assert summary["error"] == "The operation failed. See application diagnostics for the safe error code."
+
+    source, _ = service.capture_source(
+        BytesIO(b"Knowledge commits even when unexpected summary generation fails."),
+        "summary-programming-error.txt", project_id=project["id"],
+    )
+    assert service.process_source(source["id"]) == "complete"
+    assert service.source_detail(source["id"])["processing_state"] == "complete"
+    assert service.list_knowledge(project["id"])
+    assert service.get_living_summary(project["id"])["generation_state"] == "failed"
+
+
 def test_routed_source_is_canonical_once_and_linked_to_project(client, settings):
     first = client.post("/api/projects", json={"name": "Fictional Archive Alpha"}).json()
     second = client.post("/api/projects", json={"name": "Fictional Archive Beta"}).json()
@@ -270,6 +332,66 @@ def test_fresh_database_rebuilds_from_onedrive_archive(client, project, settings
     assert rebuilt.rebuild_index()["errors"] >= 1
 
 
+def test_rebuild_keeps_distinct_citations_with_a_shared_excerpt_prefix(client, project, settings):
+    source = client.post(
+        f"/api/projects/{project['id']}/sources",
+        files={"file": ("shared-prefix.md", b"Original evidence container.", "text/markdown")},
+    ).json()["source"]
+    _process(client, source["id"])
+    package = Path(source["ingestion_path"])
+    shared = ("The same long evidentiary prefix applies to both independently cited claims. " * 3)[:160]
+    first_excerpt = f"{shared} First distinct cited conclusion."
+    second_excerpt = f"{shared} Second distinct cited conclusion."
+    extracted = next((package / "Assistant" / "Extracted").glob("*.txt"))
+    extracted.write_text(f"{first_excerpt}\n{second_excerpt}\n", encoding="utf-8")
+    (package / "Assistant" / "citations.json").write_text(json.dumps([
+        {
+            "citation_id": "C-SHARED-PREFIX-1", "original_relative_path": "Original/shared-prefix.md",
+            "display_name": "shared-prefix.md", "source_type": "md", "locator": "claim one",
+            "excerpt": first_excerpt, "source_date": "2026-08-13",
+        },
+        {
+            "citation_id": "C-SHARED-PREFIX-2", "original_relative_path": "Original/shared-prefix.md",
+            "display_name": "shared-prefix.md", "source_type": "md", "locator": "claim two",
+            "excerpt": second_excerpt, "source_date": "2026-08-13",
+        },
+    ]), encoding="utf-8")
+    (package / "Assistant" / "knowledge-items.json").write_text(json.dumps([
+        {
+            "knowledge_item_id": "K-SHARED-PREFIX-1", "text": "First rebuilt claim",
+            "category": "decision", "source_date": "2026-08-13",
+            "citation_ids": ["C-SHARED-PREFIX-1"], "review_status": "unreviewed",
+        },
+        {
+            "knowledge_item_id": "K-SHARED-PREFIX-2", "text": "Second rebuilt claim",
+            "category": "decision", "source_date": "2026-08-13",
+            "citation_ids": ["C-SHARED-PREFIX-2"], "review_status": "unreviewed",
+        },
+    ]), encoding="utf-8")
+
+    rebuilt_settings = replace(
+        settings, app=replace(settings.app, database_path=settings.app.database_path.with_name("shared-prefix.db"))
+    )
+    rebuilt_db = Database(rebuilt_settings.app.database_path)
+    rebuilt_db.migrate()
+    rebuilt = PortfolioService(rebuilt_settings, rebuilt_db, FakeLlmAdapter())
+    assert rebuilt.rebuild_index()["errors"] == 0
+    items = {
+        item["id"]: item for item in rebuilt.get_project(project["id"])["knowledge_history"]
+        if item["id"].startswith("K-SHARED-PREFIX-")
+    }
+    assert set(items) == {"K-SHARED-PREFIX-1", "K-SHARED-PREFIX-2"}
+    citation_ids = [items[item_id]["citations"][0]["citation_id"] for item_id in sorted(items)]
+    assert citation_ids == ["C-SHARED-PREFIX-1", "C-SHARED-PREFIX-2"]
+    with rebuilt.db.connect() as connection:
+        chunks = connection.execute(
+            "SELECT chunk_id FROM citation_records WHERE id IN (?, ?) ORDER BY id", citation_ids
+        ).fetchall()
+    assert len(chunks) == 2
+    assert chunks[0]["chunk_id"] != chunks[1]["chunk_id"]
+    assert rebuilt.rebuild_index()["errors"] == 0
+
+
 def test_legacy_attachment_migration_preserves_attachment_in_package(project, service, settings):
     legacy = settings.app.one_drive_root / "Projects" / "legacy-project"
     attachment_dir = legacy / "attachments" / "1"
@@ -317,6 +439,70 @@ def test_legacy_attachment_migration_preserves_attachment_in_package(project, se
         if source["original_filename"] == "legacy.eml"
     )
     assert any(item["is_attachment"] for item in rebuilt.source_detail(rebuilt_source["id"])["original_files"])
+
+
+def test_legacy_attachment_copy_failure_is_recorded_and_migration_continues(
+    project, service, settings, monkeypatch,
+):
+    legacy = settings.app.one_drive_root / "Projects" / "legacy-copy-failure"
+    attachment_dir = legacy / "attachments"
+    attachment_dir.mkdir(parents=True)
+    container = legacy / "legacy-container.eml"
+    attachment = attachment_dir / "unavailable-during-copy.txt"
+    preserved_attachment = attachment_dir / "preserved-after-failure.txt"
+    container.write_bytes(b"legacy container")
+    attachment.write_bytes(b"legacy attachment")
+    preserved_attachment.write_bytes(b"preserved legacy attachment")
+    now = "2026-08-12T12:00:00+00:00"
+    with service.db.transaction() as connection:
+        root = connection.execute(
+            """INSERT INTO sources(
+               project_id, source_type, sha256, original_filename, original_path,
+               metadata_json, processing_state, created_at
+               ) VALUES (?, 'eml', ?, 'legacy-container.eml', ?, '{}', 'complete', ?)""",
+            (project["id"], hashlib.sha256(container.read_bytes()).hexdigest(), str(container), now),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO sources(
+               project_id, parent_source_id, source_type, native_id, sha256, original_filename,
+               original_path, metadata_json, processing_state, created_at
+               ) VALUES (?, ?, 'txt', ?, ?, 'unavailable-during-copy.txt', ?, '{}', 'complete', ?)""",
+            (project["id"], root, f"legacy-copy-failure:{root}",
+             hashlib.sha256(attachment.read_bytes()).hexdigest(), str(attachment), now),
+        )
+        connection.execute(
+            """INSERT INTO sources(
+               project_id, parent_source_id, source_type, native_id, sha256, original_filename,
+               original_path, metadata_json, processing_state, created_at
+               ) VALUES (?, ?, 'txt', ?, ?, 'preserved-after-failure.txt', ?, '{}', 'complete', ?)""",
+            (project["id"], root, f"legacy-copy-success:{root}",
+             hashlib.sha256(preserved_attachment.read_bytes()).hexdigest(),
+             str(preserved_attachment), now),
+        )
+
+    real_copy = shutil.copy2
+
+    def fail_attachment_copy(source, destination, *args, **kwargs):
+        if Path(source) == attachment:
+            raise OSError("fictional attachment read failure")
+        return real_copy(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr("portfolio_assistant.services.shutil.copy2", fail_attachment_copy)
+    result = service.migrate_archive()
+    assert result["sources"] >= 1
+    assert result["missing_originals"] == 1
+    package = Path(service.source_detail(int(root))["ingestion_path"])
+    manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+    assert (
+        "Legacy attachment could not be archived due to a file-system error: "
+        "unavailable-during-copy.txt"
+    ) in manifest["errors"]
+    migrated_attachment = next(
+        item for item in manifest["original_files"]
+        if item.get("original_name") == "preserved-after-failure.txt"
+    )
+    assert migrated_attachment["is_attachment"] is True
+    assert (package / migrated_attachment["relative_path"]).read_bytes() == preserved_attachment.read_bytes()
 
 
 def test_post_rename_database_failure_preserves_incomplete_package(project, service, monkeypatch):

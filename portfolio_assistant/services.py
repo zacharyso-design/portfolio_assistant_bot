@@ -75,6 +75,10 @@ class ValidationError(ValueError):
     pass
 
 
+class UnexpectedSummaryError(RuntimeError):
+    pass
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -218,7 +222,6 @@ class PortfolioService:
                 old = Path(source["original_path"])
                 originals: list[dict[str, Any]] = []
                 errors: list[str] = []
-                new_original: Path | None = None
                 if old.is_file():
                     stored = safe_filename(source["original_filename"], "source")
                     new_original = original_dir / stored
@@ -397,33 +400,59 @@ class PortfolioService:
                     changed = True
                 missing += 1
                 continue
-            digest = sha256_file(old_path)
             name = safe_filename(child["original_filename"], f"attachment-{child['id']}")
             candidate = Path("Original") / "Attachments" / name
             suffix = 2
             while candidate.as_posix().casefold() in used:
                 candidate = candidate.with_name(f"{Path(name).stem}-{suffix}{Path(name).suffix}")
                 suffix += 1
-            used.add(candidate.as_posix().casefold())
             migrated_path = self._under_root(package / candidate)
-            migrated_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = migrated_path.parent / f".{uuid.uuid4().hex}.tmp"
             try:
+                migrated_path.parent.mkdir(parents=True, exist_ok=True)
+                digest = sha256_file(old_path)
                 shutil.copy2(old_path, temporary)
                 if sha256_file(temporary) != digest:
                     raise ConflictError("Legacy attachment copy failed its integrity check")
                 os.replace(temporary, migrated_path)
+                item = {
+                    "relative_path": candidate.as_posix(),
+                    "original_name": child["original_filename"],
+                    "stored_name": migrated_path.name,
+                    "size_bytes": migrated_path.stat().st_size,
+                    "sha256": digest,
+                    "is_attachment": True,
+                    "legacy_source_id": int(child["id"]),
+                }
+            except ConflictError:
+                message = (
+                    "Legacy attachment failed its integrity check after copy: "
+                    f"{child['original_filename']}"
+                )
+                if message not in errors:
+                    errors.append(message)
+                    changed = True
+                missing += 1
+                continue
+            except OSError:
+                message = (
+                    "Legacy attachment could not be archived due to a file-system error: "
+                    f"{child['original_filename']}"
+                )
+                if message not in errors:
+                    errors.append(message)
+                    changed = True
+                missing += 1
+                continue
             finally:
-                temporary.unlink(missing_ok=True)
-            item = {
-                "relative_path": candidate.as_posix(),
-                "original_name": child["original_filename"],
-                "stored_name": migrated_path.name,
-                "size_bytes": migrated_path.stat().st_size,
-                "sha256": digest,
-                "is_attachment": True,
-                "legacy_source_id": int(child["id"]),
-            }
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    message = "Legacy attachment temporary cleanup failed."
+                    if message not in errors:
+                        errors.append(message)
+                        changed = True
+            used.add(candidate.as_posix().casefold())
             originals.append(item)
             with self.db.transaction() as connection:
                 connection.execute(
@@ -969,7 +998,11 @@ class PortfolioService:
             raise ValidationError("At least one source file is required")
         first_name = safe_filename(files[0][1], "source")
         suffix = Path(first_name).suffix.casefold()
-        if (suffix in TRANSCRIPT_SUFFIXES or is_transcript) and (not meeting_name or not meeting_date):
+        transcript_in_selection = is_transcript or any(
+            Path(safe_filename(name, "source")).suffix.casefold() in TRANSCRIPT_SUFFIXES
+            for _, name, _ in files
+        )
+        if transcript_in_selection and (not meeting_name or not meeting_date):
             raise ValidationError("Meeting name and meeting date are required for transcripts")
         if meeting_date:
             try:
@@ -990,7 +1023,7 @@ class PortfolioService:
         (incomplete / "Original").mkdir()
         title = normalize_text(meeting_name or Path(first_name).stem) or "Source"
         source_kind = (
-            "meeting-transcript" if is_transcript or suffix in TRANSCRIPT_SUFFIXES
+            "meeting-transcript" if transcript_in_selection
             else "email" if suffix in {".msg", ".eml"}
             else "uploaded-folder" if any("/" in relative.replace("\\", "/") for _, _, relative in files)
             else "multiple-files" if len(files) > 1
@@ -1292,6 +1325,9 @@ class PortfolioService:
         except ExtractionFailure as exc:
             self._set_source_state(source_id, "error", "extraction_failed", exc)
             return "error"
+        except UnexpectedSummaryError:
+            # Knowledge and the source were committed before summary generation began.
+            return "complete"
         except Exception as exc:
             self._set_source_state(source_id, "error", "processing_failed", exc)
             return "error"
@@ -1741,6 +1777,16 @@ class PortfolioService:
             ("\n".join(lines) + "\n") if lines else "",
         )
 
+    def _mark_summary_failed(self, project_id: str, revision: int, exc: Exception) -> None:
+        with self.db.transaction() as connection:
+            current = self._project(connection, project_id)
+            if int(current["summary_revision"]) == revision:
+                connection.execute(
+                    """UPDATE projects SET summary_generation_state = 'failed', summary_error = ?
+                       WHERE id = ?""",
+                    (_safe_error(exc), project_id),
+                )
+
     def regenerate_living_summary(self, project_id: str, *, advance_revision: bool = True) -> dict[str, Any]:
         with self.db.transaction() as connection:
             project = self._project(connection, project_id)
@@ -1809,15 +1855,10 @@ class PortfolioService:
             self._write_summary_files(project_id, revision, prepared, markdown, now)
             return self.get_living_summary(project_id)
         except Exception as exc:
-            with self.db.transaction() as connection:
-                current = self._project(connection, project_id)
-                if int(current["summary_revision"]) == revision:
-                    connection.execute(
-                        """UPDATE projects SET summary_generation_state = 'failed', summary_error = ?
-                           WHERE id = ?""",
-                        (_safe_error(exc), project_id),
-                    )
-            return self.get_living_summary(project_id)
+            self._mark_summary_failed(project_id, revision, exc)
+            if isinstance(exc, (LlmUnavailable, LlmContractError, ConflictError, OSError)):
+                return self.get_living_summary(project_id)
+            raise UnexpectedSummaryError("Unexpected Living Summary generation failure") from exc
 
     def _write_summary_files(
         self, project_id: str, revision: int, sections: list[dict[str, Any]],
@@ -2291,9 +2332,12 @@ class PortfolioService:
                 )
             except (OSError, ValueError, KeyError, sqlite3.Error):
                 counts["errors"] += 1
-        for archive_id, project_id in project_map.items():
-            counts["summary_versions"] += self._rebuild_project_summaries(project_id)
-            self._write_knowledge_history(project_id)
+        for project_id in project_map.values():
+            try:
+                counts["summary_versions"] += self._rebuild_project_summaries(project_id)
+                self._write_knowledge_history(project_id)
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                counts["errors"] += 1
         return counts
 
     def _rebuild_package_knowledge(self, source_id: int, project_id: str | None, package: Path) -> int:
@@ -2306,23 +2350,45 @@ class PortfolioService:
         count = 0
         with self.db.transaction() as connection:
             citation_map: dict[str, str] = {}
+            used_chunk_ids = {
+                int(row["chunk_id"])
+                for row in connection.execute(
+                    "SELECT chunk_id FROM citation_records WHERE source_id = ?", (source_id,)
+                ).fetchall()
+            }
             for citation in citations:
                 citation_id = str(citation["citation_id"])
+                existing = connection.execute(
+                    "SELECT id, source_id, chunk_id FROM citation_records WHERE id = ?", (citation_id,)
+                ).fetchone()
+                if existing:
+                    if int(existing["source_id"]) == source_id:
+                        citation_map[citation_id] = citation_id
+                        used_chunk_ids.add(int(existing["chunk_id"]))
+                        continue
+                    raise ValueError("Citation ID is already associated with a different source")
                 citation_excerpt = str(citation.get("excerpt") or "")[:120]
-                chunk = (
-                    connection.execute(
+                chunk = None
+                if citation_excerpt:
+                    candidates = connection.execute(
                         """SELECT * FROM source_chunks
-                           WHERE source_id = ? AND instr(text, ?) > 0 ORDER BY id LIMIT 1""",
+                           WHERE source_id = ? AND instr(text, ?) > 0 ORDER BY id""",
                         (source_id, citation_excerpt),
-                    ).fetchone()
-                    if citation_excerpt else None
-                )
+                    ).fetchall()
+                    chunk = next(
+                        (candidate for candidate in candidates if int(candidate["id"]) not in used_chunk_ids),
+                        None,
+                    )
                 if not chunk:
+                    max_sequence = connection.execute(
+                        "SELECT COALESCE(MAX(sequence), -1) FROM source_chunks WHERE source_id = ?",
+                        (source_id,),
+                    ).fetchone()[0]
                     cursor = connection.execute(
                         """INSERT INTO source_chunks(
                            source_id, project_id, sequence, text, locator, processing_state, processed_at
                            ) VALUES (?, ?, ?, ?, ?, 'complete', ?)""",
-                        (source_id, project_id, 1_000_000 + len(citation_map),
+                        (source_id, project_id, max(1_000_000, int(max_sequence) + 1),
                          citation.get("excerpt") or "Citation excerpt unavailable",
                          citation.get("locator") or "Archive citation", utc_now()),
                     )
@@ -2339,7 +2405,13 @@ class PortfolioService:
                      citation.get("locator") or "Archive citation", citation.get("excerpt") or "",
                      citation.get("source_date"), utc_now()),
                 )
-                citation_map[citation_id] = citation_id
+                # INSERT OR IGNORE may have been a no-op; confirm ownership before mapping the ID.
+                rebuilt = connection.execute(
+                    "SELECT id, source_id, chunk_id FROM citation_records WHERE id = ?", (citation_id,)
+                ).fetchone()
+                if rebuilt and int(rebuilt["source_id"]) == source_id:
+                    citation_map[citation_id] = citation_id
+                    used_chunk_ids.add(int(rebuilt["chunk_id"]))
             for item in knowledge:
                 if connection.execute("SELECT 1 FROM knowledge_items WHERE id = ?", (item["knowledge_item_id"],)).fetchone():
                     continue

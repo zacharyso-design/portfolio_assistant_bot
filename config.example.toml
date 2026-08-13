@@ -1,0 +1,23 @@
+[app]
+database_path = "%LOCALAPPDATA%\\PortfolioAssistant\\portfolio.db"
+one_drive_root = "C:\\Users\\USER\\OneDrive - Organization\\CHIO Portfolio"
+bind_host = "127.0.0.1"
+bind_port = 8765
+max_file_mb = 100
+max_attachments = 25
+max_extracted_text_mb = 5
+daily_run_time = "06:00"
+worker_poll_seconds = 2
+automatic_ai_attempts = 2
+
+[llm]
+adapter = "internal"
+base_url = "https://approved-internal-endpoint.example"
+chat_path = "/v1/chat/completions"
+model = "CONFIGURE_ME"
+api_key_env = "PORTFOLIO_ASSISTANT_API_KEY"
+auth_header = "Authorization"
+auth_scheme = "Bearer"
+ca_bundle = ""
+timeout_seconds = 90
+max_evidence_chars = 30000

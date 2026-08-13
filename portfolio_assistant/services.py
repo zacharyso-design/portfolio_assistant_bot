@@ -76,6 +76,8 @@ class ValidationError(ValueError):
 
 
 class UnexpectedSummaryError(RuntimeError):
+    """Programming failure deliberately left without an API handler so direct regeneration returns 500."""
+
     pass
 
 
@@ -448,7 +450,7 @@ class PortfolioService:
                 try:
                     temporary.unlink(missing_ok=True)
                 except OSError:
-                    message = "Legacy attachment temporary cleanup failed."
+                    message = f"Legacy attachment temporary cleanup failed: {child['original_filename']}"
                     if message not in errors:
                         errors.append(message)
                         changed = True
@@ -1856,6 +1858,7 @@ class PortfolioService:
             return self.get_living_summary(project_id)
         except Exception as exc:
             self._mark_summary_failed(project_id, revision, exc)
+            # Operational LLM/filesystem failures are retryable UI states; database and code errors surface.
             if isinstance(exc, (LlmUnavailable, LlmContractError, ConflictError, OSError)):
                 return self.get_living_summary(project_id)
             raise UnexpectedSummaryError("Unexpected Living Summary generation failure") from exc
@@ -1976,7 +1979,11 @@ class PortfolioService:
             )
         self._refresh_source_archive(source_id)
         self._write_knowledge_history(project_id)
-        self.regenerate_living_summary(project_id, advance_revision=False)
+        try:
+            self.regenerate_living_summary(project_id, advance_revision=False)
+        except UnexpectedSummaryError:
+            # The knowledge review committed; its summary remains visibly failed and retryable.
+            pass
         return next(item for item in self.list_knowledge(project_id) if item["id"] == knowledge_id)
 
     def review_summary(self, project_id: str, status: str) -> dict[str, Any]:
@@ -2412,6 +2419,8 @@ class PortfolioService:
                 if rebuilt and int(rebuilt["source_id"]) == source_id:
                     citation_map[citation_id] = citation_id
                     used_chunk_ids.add(int(rebuilt["chunk_id"]))
+                else:
+                    raise ValueError("Citation record could not be rebuilt for its owning source")
             for item in knowledge:
                 if connection.execute("SELECT 1 FROM knowledge_items WHERE id = ?", (item["knowledge_item_id"],)).fetchone():
                     continue
@@ -3154,7 +3163,11 @@ class PortfolioService:
             if derived_source_id and target_project_id:
                 self._refresh_source_archive(int(derived_source_id), processing_status="complete")
                 self._write_knowledge_history(str(target_project_id))
-                self.regenerate_living_summary(str(target_project_id), advance_revision=False)
+                try:
+                    self.regenerate_living_summary(str(target_project_id), advance_revision=False)
+                except UnexpectedSummaryError:
+                    # Routing committed; return that result while its summary remains visibly failed.
+                    pass
         return decoded
 
     def _resolve_routing_review(

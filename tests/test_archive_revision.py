@@ -256,11 +256,15 @@ def test_unexpected_summary_failure_marks_failed_and_propagates(project, service
     )
     assert service.process_source(source["id"]) == "complete"
     assert service.source_detail(source["id"])["processing_state"] == "complete"
-    assert service.list_knowledge(project["id"])
+    knowledge = service.list_knowledge(project["id"])
+    assert knowledge
+    assert service.get_living_summary(project["id"])["generation_state"] == "failed"
+    reviewed = service.review_knowledge(project["id"], knowledge[0]["id"], "approved")
+    assert reviewed["review_status"] == "approved"
     assert service.get_living_summary(project["id"])["generation_state"] == "failed"
 
 
-def test_routed_source_is_canonical_once_and_linked_to_project(client, settings):
+def test_routed_source_is_canonical_once_and_linked_to_project(client, settings, service, monkeypatch):
     first = client.post("/api/projects", json={"name": "Fictional Archive Alpha"}).json()
     second = client.post("/api/projects", json={"name": "Fictional Archive Beta"}).json()
     source = client.post(
@@ -270,6 +274,10 @@ def test_routed_source_is_canonical_once_and_linked_to_project(client, settings)
     ).json()["source"]
     _process(client, source["id"])
     review = next(item for item in client.get("/api/reviews?status=open").json() if item["source_id"] == source["id"])
+    monkeypatch.setattr(
+        service.llm, "living_summary",
+        lambda project_data, knowledge: (_ for _ in ()).throw(RuntimeError("fictional routing summary error")),
+    )
     resolved = client.post(f"/api/reviews/{review['id']}/resolve", json={
         "action": "apply", "target_project_id": second["id"], "rule": review["evidence"][0]["suggested_rule"],
     })

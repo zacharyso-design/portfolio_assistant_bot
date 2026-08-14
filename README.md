@@ -33,7 +33,7 @@ Start in the background and open `http://127.0.0.1:8765`:
 .\scripts\Run.ps1
 ```
 
-For visible diagnostics use `.\scripts\Run.ps1 -Foreground`. Stop the background process with `.\scripts\Stop.ps1`.
+For one-click foreground startup, double-click `portfolio_assistant_launcher.py`; it automatically uses the project's `.venv`, starts the server, and opens the browser. The launcher keeps its window open while the bot is running and pauses on startup errors so the message remains visible. For visible PowerShell diagnostics use `.\scripts\Run.ps1 -Foreground`. Stop the background process with `.\scripts\Stop.ps1`.
 
 ## Windows distribution (no Node.js required)
 

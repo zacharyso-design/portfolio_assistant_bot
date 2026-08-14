@@ -1,25 +1,37 @@
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const method = (init?.method || "GET").toUpperCase();
-  if (!["GET", "HEAD", "OPTIONS"].includes(method)) headers.set("X-Requested-With", "CHIO-Portfolio-Assistant");
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    headers.set("X-Requested-With", "CHIO-Portfolio-Assistant");
+  }
   const response = await fetch(path, { ...init, headers });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) throw new Error(payload !== null && typeof payload === "object" ? (payload as { detail?: string }).detail || "Request failed" : String(payload || "Request failed"));
+  if (!response.ok) {
+    const message = payload !== null && typeof payload === "object"
+      ? (payload as { detail?: string }).detail || "Request failed"
+      : String(payload || "Request failed");
+    throw new Error(message);
+  }
   return payload as T;
 }
 
-export const api = {
+export const apiClient = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) => request<T>(path, {
-    method: "POST", headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    method: "POST",
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   }),
   put: <T>(path: string, body: unknown) => request<T>(path, {
-    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   }),
   patch: <T>(path: string, body: unknown) => request<T>(path, {
-    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   }),
   delete: <T>(path: string) => request<T>(path, { method: "DELETE" }),
   upload: <T>(path: string, file: File, fields: Record<string, string | boolean> = {}) => {

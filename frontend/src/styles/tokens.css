@@ -1,0 +1,14 @@
+/* Change these tokens to rebrand the application without editing feature CSS. */
+:root {
+  font-family: "Segoe UI", Arial, sans-serif;
+  color: #17201e;
+  background: #f3f6f4;
+  font-synthesis: none;
+  --navy: #0c302b;
+  --teal: #166f63;
+  --muted: #6c7874;
+  --line: #dce4e0;
+  --paper: #fff;
+  --canvas: #f3f6f4;
+  --focus: #e5a82e;
+}

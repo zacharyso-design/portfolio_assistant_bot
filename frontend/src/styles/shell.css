@@ -1,0 +1,24 @@
+.app-shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0, 1fr); }
+.sidebar { position: sticky; top: 0; height: 100vh; padding: 24px 14px; color: white; background: var(--navy); display: flex; flex-direction: column; }
+.brand { border: 0; color: white; background: transparent; display: flex; gap: 11px; align-items: center; text-align: left; padding: 0 7px 28px; }
+.brand > span:last-child, .brand strong, .brand small { display: block; }
+.brand small { color: #9db4af; margin-top: 2px; }
+.logo { width: 38px; height: 38px; border: 1px solid #ffffff38; border-radius: 10px; background: #ffffff16; display: grid; place-items: center; font-weight: 800; }
+.nav-label { color: #71918b; text-transform: uppercase; letter-spacing: .13em; font-size: 9px; font-weight: 800; padding: 0 10px 8px; }
+.sidebar nav { display: grid; gap: 4px; }
+.sidebar nav button { border: 0; border-radius: 8px; color: #b9cbc7; background: transparent; padding: 11px 10px; text-align: left; }
+.sidebar nav button span { display: inline-block; width: 24px; }
+.sidebar nav button b { float: right; color: #142e2a; background: #d7aa51; padding: 2px 7px; border-radius: 99px; font-size: 10px; }
+.sidebar nav button.active, .sidebar nav button:hover { color: white; background: #ffffff18; }
+.local-badge { margin-top: auto; border-top: 1px solid #ffffff1e; padding: 18px 8px 0; }
+.local-badge span, .local-badge small { display: block; }
+.local-badge small { color: #84a29c; margin-top: 4px; }
+main { min-width: 0; }
+.topbar { position: sticky; top: 0; z-index: 5; min-height: 88px; padding: 16px 28px; border-bottom: 1px solid var(--line); background: #fffffff5; backdrop-filter: blur(8px); display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.topbar > div:first-child { min-width: 0; }
+.topbar small, .panel header small { color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 9px; font-weight: 800; }
+.topbar h1 { margin: 4px 0 0; font-size: 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.top-actions { display: flex; align-items: center; gap: 8px; }
+.top-actions select, .filterbar select, .form-stack select, .review-detail select { min-height: 37px; border: 1px solid var(--line); background: white; border-radius: 7px; padding: 7px 28px 7px 10px; }
+.search-field input { width: 220px; min-height: 38px; border: 1px solid var(--line); background: #f7f9f8; border-radius: 7px; padding: 8px 10px; }
+.page { padding: 18px 28px 60px; }

@@ -8,7 +8,9 @@ Prerequisite: Windows with Python 3.11 or later.
 
 After cloning or pulling the repository, double-click **Start CHIO Portfolio Assistant.cmd** in the repository root. On first use it automatically creates `config.toml`, selects the current user's organizational OneDrive (falling back to a local runtime folder), creates `.venv`, installs the Python dependencies, and opens the application. The compiled web interface is included, so Node.js is not required.
 
-For manual installation from PowerShell, copy `config.example.toml` to `config.toml`, set the desired archive path, and run `.\scripts\Install.ps1`.
+For manual installation from PowerShell, copy `config.example.toml` to `config.toml`, set the desired archive path, and run `.\scripts\Install.ps1`. If the config is absent, the script creates it and exits with code 2; edit the new file and run the script again.
+
+If first-time setup is interrupted, double-click the launcher again; it detects and repairs the incomplete installation. The completion marker records that installation finished, not that dependency versions are current. If a future dependency update leaves the environment inconsistent, delete `.venv` and double-click the launcher to rebuild it automatically.
 
 The compiled `frontend\dist` files are deliberately committed for Node-free government-workstation installs. After changing `frontend\src`, run `npm run build` in `frontend`, confirm Vite removed obsolete content-hashed files, and stage both additions and deletions in the refreshed `frontend\dist` output.
 

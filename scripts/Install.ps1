@@ -7,14 +7,31 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ConfigPath) { $ConfigPath = Join-Path $repoRoot 'config.toml' }
-$venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
+$venvRoot = Join-Path $repoRoot '.venv'
+$venvPython = Join-Path $venvRoot 'Scripts\python.exe'
+$venvConfig = Join-Path $venvRoot 'pyvenv.cfg'
+$installMarker = Join-Path $venvRoot '.portfolio-assistant-install-complete'
+
+if (Test-Path -LiteralPath $installMarker) {
+    Remove-Item -LiteralPath $installMarker -Force
+}
+
+if ((Test-Path -LiteralPath $venvPython) -and -not (Test-Path -LiteralPath $venvConfig)) {
+    $resolvedVenv = [System.IO.Path]::GetFullPath($venvRoot)
+    $resolvedRepo = [System.IO.Path]::GetFullPath($repoRoot)
+    if ((Split-Path -Parent $resolvedVenv) -ne $resolvedRepo -or (Split-Path -Leaf $resolvedVenv) -ne '.venv') {
+        throw "Refusing to repair unexpected environment path: $resolvedVenv"
+    }
+    Write-Warning "Repairing incomplete project environment: $resolvedVenv"
+    Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
+}
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
     if ($PythonExecutable) {
-        & $PythonExecutable -m venv (Join-Path $repoRoot '.venv')
+        & $PythonExecutable -m venv $venvRoot
     }
     else {
-        py -m venv (Join-Path $repoRoot '.venv')
+        py -m venv $venvRoot
     }
     if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed with exit code $LASTEXITCODE." }
 }
@@ -46,9 +63,10 @@ if (-not (Test-Path -LiteralPath $frontendIndex)) {
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'config.example.toml') -Destination $ConfigPath
     Write-Warning "Created $ConfigPath. Set one_drive_root and the approved internal LLM values before starting."
-    exit 0
+    exit 2
 }
 
 & $venvPython -m portfolio_assistant --config $ConfigPath migrate
 if ($LASTEXITCODE -ne 0) { throw "Database migration failed with exit code $LASTEXITCODE." }
+Set-Content -LiteralPath $installMarker -Value 'installed' -Encoding ASCII
 Write-Host 'Portfolio Assistant installation completed.'

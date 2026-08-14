@@ -30,6 +30,11 @@ def _source_python(root: Path) -> Path:
     return root / ".venv" / "Scripts" / "python.exe"
 
 
+def _install_marker(root: Path) -> Path:
+    # Keep the marker inside .venv so deleting the environment also resets install state.
+    return root / ".venv" / ".portfolio-assistant-install-complete"
+
+
 def _default_archive_root(root: Path) -> Path:
     value = os.environ.get("OneDriveCommercial")
     if value:
@@ -45,7 +50,6 @@ def _ensure_config(root: Path) -> Path:
     if not example_path.is_file():
         raise FileNotFoundError(f"Configuration template not found: {example_path}")
     archive_root = _default_archive_root(root)
-    archive_root.mkdir(parents=True, exist_ok=True)
     escaped_archive_root = str(archive_root).replace("\\", "\\\\").replace('"', '\\"')
     example = example_path.read_text(encoding="utf-8")
     # A callable replacement keeps Windows backslashes out of regex replacement parsing.
@@ -55,13 +59,14 @@ def _ensure_config(root: Path) -> Path:
     )
     if replacements != 1:
         raise ValueError("The configuration template must contain exactly one one_drive_root setting.")
+    archive_root.mkdir(parents=True, exist_ok=True)
     config_path.write_text(configured, encoding="utf-8")
     print(f"Created configuration: {config_path}")
     print(f"Project archive: {archive_root}")
     return config_path
 
 
-def _install_source(root: Path) -> int:
+def _install_source(root: Path, config_path: Path) -> int:
     installer = root / "scripts" / "Install.ps1"
     if not installer.is_file():
         print(f"Installer not found: {installer}")
@@ -82,6 +87,8 @@ def _install_source(root: Path) -> int:
                 str(installer),
                 "-PythonExecutable",
                 sys.executable,
+                "-ConfigPath",
+                str(config_path),
             ],
             cwd=root,
             check=False,
@@ -115,6 +122,12 @@ def run(argv: list[str] | None = None) -> int:
         # Config must exist before Install.ps1 so its first run reaches database migration.
         try:
             config_path = _ensure_config(root)
+        except PermissionError as exc:
+            print(f"Could not create the configuration: {exc}")
+            print("Move or extract the application into one writable approved folder, then try again.")
+            if pause_here:
+                _pause()
+            return 2
         except (OSError, ValueError) as exc:
             print(f"Could not create the configuration: {exc}")
             if pause_here:
@@ -123,18 +136,25 @@ def run(argv: list[str] | None = None) -> int:
 
     if not getattr(sys, "frozen", False):
         project_python = _source_python(root)
-        if not project_python.is_file():
+        install_marker = _install_marker(root)
+        if not project_python.is_file() or not install_marker.is_file():
             if not double_clicked:
-                print(f"The project environment is missing: {project_python}")
+                print(f"The project environment is missing or incomplete: {project_python}")
                 print("Double-click Start CHIO Portfolio Assistant.cmd to run first-time setup.")
                 return 2
-            install_result = _install_source(root)
+            if config_path is None:
+                print("Could not determine the configuration path.")
+                if pause_here:
+                    _pause()
+                return 2
+            install_result = _install_source(root, config_path)
             if install_result:
                 if pause_here:
                     _pause()
                 return install_result
-            if not project_python.is_file():
-                print(f"Installation completed without creating the project environment: {project_python}")
+            if not project_python.is_file() or not install_marker.is_file():
+                missing_artifact = project_python if not project_python.is_file() else install_marker
+                print(f"Installation did not create the required file: {missing_artifact}")
                 if pause_here:
                     _pause()
                 return 2

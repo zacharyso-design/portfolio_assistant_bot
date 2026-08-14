@@ -5,6 +5,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run scripts\Install.ps1 first.' }
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    throw 'Git is required to verify the Node-free frontend bundle.'
+}
+
+& git -C $repoRoot ls-files --error-unmatch 'frontend/dist/index.html' 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'frontend/dist/index.html must be tracked for Node-free source installation.' }
 
 Push-Location (Join-Path $repoRoot 'frontend')
 try {

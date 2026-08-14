@@ -10,7 +10,7 @@
 - SQL uses parameters for values. Dynamic query fragments come exclusively from code allowlists.
 - HTML email is parsed as inert text; scripts, styles, iframes, objects, and embeds are discarded.
 - Arbitrary originals use `Content-Disposition: attachment` and `application/octet-stream`; they are never rendered inline on the application origin.
-- LLM redirects are disabled, host-checked, and TLS verification is mandatory. Keys are read only from the configured environment variable.
+- LLM redirects are disabled, host-checked, and TLS verification is mandatory. Keys pasted in Settings are encrypted with Windows DPAPI for the current Windows account and stored under local application data, outside OneDrive; the per-user DPAPI binding is the credential control, not the file location. `GENAI_API_KEY` is a higher-priority environment override. The API never returns a saved key, although Python necessarily holds the decrypted key in process memory while preparing and sending a request.
 - Safe fixed error codes/messages are stored; model-supplied review text is not placed in source error fields. Source content, complete prompts/model responses, secrets, and attachments are not logged.
 - AI cannot complete action items or projects and cannot mutate manual status/priority without an explicit reviewed user decision.
 - Direct-project evidence is checked for project fit before its first memory commit. That endpoint call includes bounded source evidence plus the full local project roster (IDs, names, and SNOW numbers); low confidence or a better project match requires an explicit keep, move, or archive decision in Review Queue.

@@ -403,7 +403,11 @@ def test_project_scoped_chat_and_citation_validation(client: TestClient):
     assert missing["answer"] == "" and missing["claims"] == [] and missing["uncertainty"]
 
 
-def test_multi_project_review_rule_and_routed_retrieval(client: TestClient):
+def test_multi_project_review_rule_and_routed_retrieval(client: TestClient, service):
+    original_model_for = service.llm.model_for
+    service.llm.model_for = lambda purpose: (
+        "fictional-judgment-model" if purpose == "multi_project_routing" else original_model_for(purpose)
+    )
     atlas = client.post("/api/projects", json={"name": "Fictional Atlas"}).json()
     beacon = client.post("/api/projects", json={"name": "Fictional Beacon"}).json()
     material = b"Fictional Atlas approved its release.\nFictional Beacon needs a new owner."
@@ -414,6 +418,11 @@ def test_multi_project_review_rule_and_routed_retrieval(client: TestClient):
     ).json()["source"]
     result = process(client, captured["id"])
     assert result["needs_review"] == 1
+    with service.db.connect() as connection:
+        routed_model = connection.execute(
+            "SELECT model_id FROM sources WHERE id = ?", (captured["id"],)
+        ).fetchone()["model_id"]
+    assert routed_model == "fictional-judgment-model"
     shared_results = client.get("/api/search", params={"q": "new owner"}).json()
     assert any(item["source_id"] == captured["id"] for item in shared_results)
     assert client.get(f"/api/projects/{atlas['id']}").json()["updates"] == []
@@ -536,7 +545,11 @@ def test_incomplete_action_can_be_completed_in_review(client: TestClient, projec
     assert action["citations"][0]["original_filename"] == "incomplete-action.txt"
 
 
-def test_direct_project_intake_stops_on_other_project(client: TestClient):
+def test_direct_project_intake_stops_on_other_project(client: TestClient, service):
+    original_model_for = service.llm.model_for
+    service.llm.model_for = lambda purpose: (
+        "fictional-fit-model" if purpose == "project_fit_check" else original_model_for(purpose)
+    )
     alpha = client.post("/api/projects", json={"name": "Fictional Alpha Workstream"}).json()
     beta = client.post("/api/projects", json={"name": "Fictional Beta Workstream"}).json()
     source = upload(
@@ -547,6 +560,7 @@ def test_direct_project_intake_stops_on_other_project(client: TestClient):
     assert client.get(f"/api/projects/{alpha['id']}").json()["updates"] == []
     review = next(item for item in client.get("/api/reviews?status=open").json() if item["source_id"] == source["id"])
     assert review["kind"] == "project_fit"
+    assert all(item["model_id"] == "fictional-fit-model" for item in review["evidence"])
     assert {item["project_id"] for item in review["options"]} == {beta["id"]}
     before_retry = len([
         item for item in client.get("/api/reviews?status=open").json() if item["source_id"] == source["id"]
@@ -567,6 +581,26 @@ def test_direct_project_intake_stops_on_other_project(client: TestClient):
     assert moved_source["memory_state"] == "active"
     assert all(item["id"] != source["id"] for item in client.get(f"/api/projects/{alpha['id']}").json()["sources"])
     assert client.get("/api/routing-rules").json() == []
+
+
+def test_project_fit_lifecycle_records_judgment_model(client: TestClient, service):
+    project = client.post("/api/projects", json={"name": "Fictional Fit Audit"}).json()
+    original_model_for = service.llm.model_for
+    service.llm.model_for = lambda purpose: (
+        "fictional-fit-audit-model" if purpose == "project_fit_check" else original_model_for(purpose)
+    )
+    source = upload(
+        client, project["id"], "fit-audit.txt",
+        b"Fictional Fit Audit approved a supported milestone.",
+    ).json()["source"]
+    assert process(client, source["id"])["processed"] == 1
+    with service.db.connect() as connection:
+        event = connection.execute(
+            """SELECT details_json FROM source_lifecycle_events
+               WHERE source_id = ? AND event_type = 'project_fit_confirmed'""",
+            (source["id"],),
+        ).fetchone()
+    assert json.loads(event["details_json"])["model_id"] == "fictional-fit-audit-model"
 
 
 def test_security_size_traversal_and_uncited_rejection(client: TestClient, project, service):

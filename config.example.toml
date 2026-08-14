@@ -13,12 +13,19 @@ automatic_ai_attempts = 2
 
 [llm]
 adapter = "internal"
-base_url = "https://approved-internal-endpoint.example"
+base_url = "https://api.genai.mil"
 chat_path = "/v1/chat/completions"
-model = "CONFIGURE_ME"
-api_key_env = "PORTFOLIO_ASSISTANT_API_KEY"
+model = "gemini-3.5-flash"
+judgment_model = "gemini-3.1-pro-preview"
+api_key_env = "GENAI_API_KEY"
 auth_header = "Authorization"
 auth_scheme = "Bearer"
 ca_bundle = ""
-timeout_seconds = 90
+timeout_seconds = 240
+max_tokens = 32000
+# At most 3 total attempts, including corrective JSON and transient retries.
+max_attempts = 3
+# Set requests to 0 to disable the process-wide sliding-window limiter.
+rate_limit_requests = 120
+rate_limit_window_seconds = 60
 max_evidence_chars = 30000

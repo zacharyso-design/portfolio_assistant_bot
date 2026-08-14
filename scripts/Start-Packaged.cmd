@@ -13,7 +13,7 @@ if not exist "config.toml" (
     )
     echo First-time setup is required.
     echo.
-    echo Configure the government OneDrive path and approved internal AI endpoint,
+    echo Configure the government OneDrive path,
     echo save the file, then double-click this launcher again.
     echo.
     start "" notepad.exe "%~dp0config.toml"

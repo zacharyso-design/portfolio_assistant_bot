@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from . import APPLICATION_ID
 from .config import Settings, ensure_runtime_paths, load_settings
@@ -79,6 +79,10 @@ class ReviewResolution(StrictModel):
 
 class SourceRemoval(StrictModel):
     reason: str = Field(default="Removed from active project memory by the user.", max_length=500)
+
+
+class ApiKeyUpdate(StrictModel):
+    api_key: SecretStr = Field(min_length=1, max_length=20_000)
 
 
 class ActionCreate(StrictModel):
@@ -242,6 +246,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/configuration")
     def configuration(test_llm: bool = False) -> dict[str, Any]:
         return service.configuration_status(test_llm=test_llm)
+
+    @app.put("/api/llm/credential")
+    def save_llm_credential(body: ApiKeyUpdate) -> dict[str, Any]:
+        return service.save_llm_api_key(body.api_key.get_secret_value())
+
+    @app.delete("/api/llm/credential")
+    def remove_llm_credential() -> dict[str, Any]:
+        return service.remove_llm_api_key()
+
+    @app.post("/api/llm/health")
+    def llm_health() -> dict[str, Any]:
+        return service.llm_health()
 
     @app.get("/api/groups")
     def groups() -> list[dict[str, Any]]:

@@ -15,9 +15,13 @@ export const api = {
     method: "POST", headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   }),
+  put: <T>(path: string, body: unknown) => request<T>(path, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }),
   patch: <T>(path: string, body: unknown) => request<T>(path, {
     method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }),
+  delete: <T>(path: string) => request<T>(path, { method: "DELETE" }),
   upload: <T>(path: string, file: File, fields: Record<string, string | boolean> = {}) => {
     const form = new FormData();
     form.append("file", file);

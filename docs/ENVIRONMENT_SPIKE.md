@@ -17,6 +17,6 @@ Recorded 2026-08-12 on the build workstation before feature implementation.
 | text-layer PDF | `pypdf 6.0.0`; blank/scanned PDF correctly reports `unsupported`. |
 | Web server | `FastAPI 0.116.1`, `Uvicorn 0.35.0`; loopback Host/Origin rejection tests passed. |
 | HTTP client | `httpx 0.28.1`; redirects are disabled and endpoint host/scheme are validated. |
-| Internal LLM | Endpoint details, model, key method, and DoD CA bundle were not supplied. The internal connection test is implemented and does not block fake-adapter acceptance testing. TLS verification cannot be disabled. |
+| GenAI.mil LLM | Endpoint/model details are configured from the supplied working-project handoff. The key can be DPAPI-encrypted from Settings or supplied by `GENAI_API_KEY`; the live health test remains user-triggered. TLS verification cannot be disabled, and an optional DoD CA bundle remains supported. |
 
 Decision: use one FastAPI backend, Python SQLite/FTS5, compiled React static assets, `extract-msg`, `openpyxl`, `python-docx`, and `pypdf`. Support both venv installation and a PyInstaller one-folder distribution from the same codebase.

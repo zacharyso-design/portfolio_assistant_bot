@@ -4,14 +4,19 @@
 
 Outside the automated test harness, selecting the fake adapter also requires the explicit process-level opt-in `PORTFOLIO_ASSISTANT_ALLOW_FAKE_LLM=1`. Production configuration should always use `adapter = "internal"`.
 
-`InternalHttpLlmAdapter` is the only production adapter. Configuration controls the HTTPS base URL, chat path, model, authentication header/scheme, key environment variable, CA bundle, timeout, and evidence bound. It sends OpenAI-compatible JSON messages but contains no commercial provider SDK or provider-specific destination.
+`InternalHttpLlmAdapter` is the only production adapter. Its production defaults target `https://api.genai.mil/v1/chat/completions`, use `gemini-3.5-flash` for routine extraction/rewriting, and use `gemini-3.1-pro-preview` for multi-project routing and project-fit judgment. Configuration still controls the endpoint, models, authentication header/scheme, CA bundle, timeout, token limit, retry count, process-wide sliding-window rate limit, and evidence bound. It sends OpenAI-compatible JSON messages directly with `httpx` and contains no commercial provider SDK.
 
 Controls:
 
 - HTTPS and a stable configured host/port are mandatory.
 - TLS verification is always enabled; an optional CA bundle replaces the trust path without disabling verification.
 - Redirect following is disabled; an off-host redirect is explicitly rejected.
-- Source text is labeled as untrusted evidence and all responses must be JSON objects.
+- A key entered in Settings is Windows-DPAPI encrypted under local application data. `GENAI_API_KEY` takes priority when present; neither status nor health responses contain the key.
+- Source text is delimited and labeled as untrusted evidence, with the JSON-only output contract repeated adjacent to the data.
+- Requests use temperature `0.0`, explicit token bounds, and JSON Schema response format. An HTTP 400 caches a process-lifetime fallback to JSON Object mode.
+- Successful content is accepted only from `choices[0].message.content`. The parser accepts a plain object, a fenced object, an object surrounded by prose, and invalid Windows-path backslashes without corrupting valid JSON escapes. Invalid output receives a corrective retry containing the bounded prior reply; there are never more than three attempts.
+- Network failures, timeouts, HTTP 429, and 5xx responses use bounded 5/10-second backoff and honor `Retry-After` up to a 60-second safety ceiling so the worker cannot be stalled indefinitely by a hostile or mistaken header. Authentication and other permanent 4xx failures fail immediately. Every retry passes through the same thread-safe rate limiter.
+- Optional multimodal requests use the supplied image MIME type in a base64 data URL, the routine model, and a 4,000-token response bound.
 - Citation source/chunk pairs must exist in the exact supplied evidence package.
 - The same bounded evidence list is used both for the model call and the citation allow-list; chunks are kept whole and a boundary chunk is never partially supplied. Oversized/non-fitting chunks are counted in source metadata and shown as a partial-evidence warning instead of being silently hidden.
 - Source processing returns cited knowledge updates; validated updates become durable `knowledge_items` rather than being appended to prior summary prose.
@@ -23,4 +28,4 @@ Controls:
 - Status/priority recommendations go to Review Queue; action closure requests always go to review.
 - Logs and raised HTTP details do not include prompts, source bodies, keys, or model responses.
 
-Run `portfolio-assistant --config config.toml config-test --connect` after production endpoint values are supplied. It reports a safe success/error and model ID without revealing the key.
+Open **Settings** and choose **Test API health**, or run `portfolio-assistant --config config.toml config-test --connect`. Both report a safe success/error and model ID without revealing the key or sending project data.

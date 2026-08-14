@@ -2,13 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import type { BoardResult, Citation, Group, KnowledgeItem, Project, ProjectDetail, Review, SearchResult, Source } from "./types";
 
-type Route = { page: "portfolio" | "project" | "review" | "import"; id?: string };
+type Route = { page: "portfolio" | "project" | "review" | "import" | "settings"; id?: string };
 
 function currentRoute(): Route {
   const project = location.pathname.match(/^\/projects\/([^/]+)$/);
   if (project) return { page: "project", id: project[1] };
   if (location.pathname === "/review") return { page: "review" };
   if (location.pathname === "/import") return { page: "import" };
+  if (location.pathname === "/settings") return { page: "settings" };
   return { page: "portfolio" };
 }
 
@@ -60,6 +61,7 @@ function App() {
           <button className={route.page === "portfolio" ? "active" : ""} onClick={() => navigate("/")}><span>▦</span> Portfolio</button>
           <button className={route.page === "review" ? "active" : ""} onClick={() => navigate("/review")}><span>◇</span> Review queue <b>{reviewCount}</b></button>
           <button className={route.page === "import" ? "active" : ""} onClick={() => navigate("/import")}><span>⇩</span> SNOW import</button>
+          <button className={route.page === "settings" ? "active" : ""} onClick={() => navigate("/settings")}><span>⚙</span> Settings</button>
         </nav>
         <div className="local-badge"><span>Local</span><small>Government workspace</small></div>
       </aside>
@@ -68,6 +70,7 @@ function App() {
         {route.page === "project" && route.id && <ProjectArchiveWorkspace projectId={route.id} navigate={navigate} />}
         {route.page === "review" && <ReviewQueue navigate={navigate} onChange={refreshCount} />}
         {route.page === "import" && <SnowImport navigate={navigate} />}
+        {route.page === "settings" && <SettingsPage />}
       </main>
     </div>
   );
@@ -75,6 +78,112 @@ function App() {
 
 function PageHeader({ eyebrow, title, children }: { eyebrow: string; title: string; children?: React.ReactNode }) {
   return <header className="topbar"><div><small>{eyebrow}</small><h1>{title}</h1></div><div className="top-actions">{children}</div></header>;
+}
+
+type ConfigurationStatus = {
+  llm_adapter: string;
+  llm_model: string;
+  llm_judgment_model: string;
+  llm_endpoint: string | null;
+  api_key_present: boolean;
+  api_key_source: "environment" | "encrypted_local" | "none" | "fake";
+  api_key_environment_override: boolean;
+  api_key_local_saved: boolean;
+  credential_error: boolean;
+};
+
+type LlmHealth = {
+  ok: boolean;
+  configured: boolean;
+  model_id: string;
+  endpoint?: string;
+  latency_ms?: number;
+  error?: string;
+};
+
+function SettingsPage() {
+  const [configuration, setConfiguration] = useState<ConfigurationStatus | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [health, setHealth] = useState<LlmHealth | null>(null);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState<"save" | "remove" | "health" | "">("");
+  const load = useCallback(async () => {
+    setConfiguration(await api.get<ConfigurationStatus>("/api/configuration"));
+  }, []);
+  useEffect(() => { load().catch(value => setError(value.message)); }, [load]);
+
+  async function save(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("save"); setNotice(""); setError(""); setHealth(null);
+    try {
+      await api.put("/api/llm/credential", { api_key: apiKey });
+      setApiKey("");
+      await load();
+      setNotice("API key encrypted for this Windows account. The key itself is never displayed by the app.");
+    } catch (value) { setError((value as Error).message); }
+    finally { setBusy(""); }
+  }
+
+  async function remove() {
+    if (!confirm("Remove the locally saved GenAI.mil API key? AI features will stop unless GENAI_API_KEY is set.")) return;
+    setBusy("remove"); setNotice(""); setError(""); setHealth(null);
+    try {
+      await api.delete("/api/llm/credential");
+      await load();
+      setNotice("The locally encrypted API key was removed.");
+    } catch (value) { setError((value as Error).message); }
+    finally { setBusy(""); }
+  }
+
+  async function testHealth() {
+    setBusy("health"); setNotice(""); setError(""); setHealth(null);
+    try {
+      const result = await api.post<LlmHealth>("/api/llm/health", {});
+      setHealth(result);
+      if (!result.ok) setError(result.error || "GenAI.mil health check failed.");
+    } catch (value) { setError((value as Error).message); }
+    finally { setBusy(""); }
+  }
+
+  const internal = configuration?.llm_adapter === "internal";
+  const sourceLabel = configuration?.credential_error
+    ? "Saved credential unavailable"
+    : configuration?.api_key_source === "environment"
+    ? "GENAI_API_KEY environment override"
+    : configuration?.api_key_source === "encrypted_local" ? "Encrypted local key" : "Not configured";
+  return <>
+    <PageHeader eyebrow="Local AI connection" title="GenAI.mil settings" />
+    <div className="settings-page">
+      {notice && <div className="notice" role="status">{notice}<button aria-label="Dismiss" onClick={() => setNotice("")}>×</button></div>}
+      {error && <div className="notice error" role="alert">{error}<button aria-label="Dismiss" onClick={() => setError("")}>×</button></div>}
+      <section className="panel settings-card">
+        <header><div><small>OpenAI-compatible endpoint</small><h2>API connection</h2></div><span className={`connection-state ${configuration?.api_key_present ? "ready" : ""}`}>{configuration?.api_key_present ? "Configured" : "Key required"}</span></header>
+        {!configuration ? <p className="loading">Loading configuration…</p> : <div className="settings-facts">
+          <div><small>Endpoint</small><strong>{configuration.llm_endpoint || "Fake test adapter"}</strong></div>
+          <div><small>Routine model</small><strong>{configuration.llm_model}</strong></div>
+          <div><small>Judgment model</small><strong>{configuration.llm_judgment_model}</strong></div>
+          <div><small>Credential</small><strong>{sourceLabel}</strong></div>
+        </div>}
+        <form className="credential-form" onSubmit={save}>
+          <label>GenAI.mil API key
+            <input type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={configuration?.api_key_present ? "Paste a replacement key" : "Paste API key"} disabled={!internal || Boolean(busy)} />
+          </label>
+          <div className="settings-actions">
+            <button className="button primary" disabled={!internal || !apiKey.trim() || Boolean(busy)}>{busy === "save" ? "Encrypting…" : "Save encrypted key"}</button>
+            <button type="button" className="button" onClick={remove} disabled={!internal || !configuration?.api_key_local_saved || Boolean(busy)}>{busy === "remove" ? "Removing…" : "Remove saved key"}</button>
+          </div>
+        </form>
+        <p className="security-note">Saved keys are protected by Windows DPAPI for your current Windows account and stored outside OneDrive. A <code>GENAI_API_KEY</code> environment variable takes priority and cannot be removed from this page.</p>
+      </section>
+      <section className="panel settings-card">
+        <header><div><small>Live request</small><h2>API health</h2></div>{health && <span className={`connection-state ${health.ok ? "ready" : "failed"}`}>{health.ok ? "Healthy" : "Unavailable"}</span>}</header>
+        <p>This sends a small JSON-only request to GenAI.mil using the routine model. It does not send project data.</p>
+        {health?.ok && <div className="health-result"><strong>Connection succeeded</strong><span>{health.model_id}{health.latency_ms !== undefined ? ` · ${health.latency_ms} ms` : ""}</span></div>}
+        <button className="button" onClick={testHealth} disabled={!internal || !configuration?.api_key_present || Boolean(busy)}>{busy === "health" ? "Testing…" : "Test API health"}</button>
+      </section>
+    </div>
+  </>;
 }
 
 function Portfolio({ navigate }: { navigate: (path: string) => void }) {

@@ -1,6 +1,6 @@
 # CHIO Portfolio Assistant
 
-CHIO Portfolio Assistant is a single-user Windows application for preserving project material, maintaining cited project knowledge, importing cumulative ServiceNow exports, and asking one project questions against its local evidence. It binds only to `127.0.0.1`, stores its rebuildable SQLite index outside OneDrive, and makes no public runtime calls.
+CHIO Portfolio Assistant is a single-user Windows application for preserving project material, maintaining cited project knowledge, importing cumulative ServiceNow exports, and asking one project questions against its local evidence. It binds only to `127.0.0.1`, stores its rebuildable SQLite index outside OneDrive, and sends AI requests only to the configured government GenAI.mil endpoint.
 
 ## Install from source
 
@@ -12,7 +12,7 @@ Copy-Item config.example.toml config.toml
 .\scripts\Install.ps1
 ```
 
-Set `one_drive_root` to the locally synced portfolio root. Configure only the approved internal LLM endpoint. Put its key in the environment variable named by `llm.api_key_env`; never put the key in TOML.
+Set `one_drive_root` to the locally synced portfolio root. The supplied LLM defaults target the OpenAI-compatible GenAI.mil chat-completions endpoint. After the bot starts, open **Settings**, paste the GenAI.mil API key, choose **Save encrypted key**, and run **Test API health**. The saved key is encrypted to the current Windows user with DPAPI outside OneDrive and is never written to TOML. An administrator-provided `GENAI_API_KEY` environment variable remains supported and takes priority.
 
 The application creates this durable archive below that root:
 
@@ -43,7 +43,7 @@ Build on an approved build workstation:
 .\scripts\Build-Distribution.ps1
 ```
 
-The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml` and opens it in Notepad. Configure the file, save it, and double-click the launcher again. It starts the local server and opens the application in the default browser; keep its command window open while using the application.
+The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml` and opens it in Notepad. Configure the OneDrive path, save the file, and double-click the launcher again. It starts the local server and opens the application in the default browser; keep its command window open while using the application. Open **Settings** to save the API key and verify GenAI.mil health.
 
 The equivalent manual command is:
 
@@ -74,7 +74,7 @@ The installer reads `app.daily_run_time` from TOML. If GFE policy blocks task cr
 .\.venv\Scripts\python.exe -m portfolio_assistant --config config.toml acceptance-setup --projects 250
 ```
 
-`config-test` never displays secrets. The fake adapter is for fictional tests and demonstrations only; production configuration uses `adapter = "internal"`.
+`config-test` never displays secrets. The fake adapter is for fictional tests and demonstrations only; production configuration uses `adapter = "internal"`. The health button makes a live key-authenticated request but sends no project data.
 
 `rebuild-index` and `rescan-onedrive` rebuild the local SQLite index from the OneDrive manifests and assistant sidecars without modifying or reprocessing original files. The Portfolio page also provides a **Rescan OneDrive** button.
 
@@ -109,7 +109,7 @@ If processing is interrupted, startup safely recovers `processing` records and r
 ## Production values still required
 
 - Actual locally synced government OneDrive root.
-- Internal LLM base URL, chat path, authentication header/scheme, key environment variable, and model.
+- An authorized GenAI.mil account and API key, saved in Settings or provided through `GENAI_API_KEY`.
 - DoD CA bundle path when the approved endpoint certificate chain requires one.
 - Approved GFE package/install method.
 - Confirmation that Task Scheduler is permitted and the desired local run time.

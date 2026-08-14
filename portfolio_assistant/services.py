@@ -1507,6 +1507,7 @@ class PortfolioService:
                 "selected_project_confidence": selected_confidence,
                 "recommended_project_id": recommended,
                 "confidence": confidence,
+                "model_id": self.llm.model_for("project_fit_check"),
             } for item in evidence]
             self._create_review(
                 kind="project_fit", source_id=source_id, project_id=selected_project["id"],
@@ -1536,7 +1537,11 @@ class PortfolioService:
             self._record_source_lifecycle(
                 connection, source, "project_fit_confirmed", reason,
                 from_project_id=source["project_id"], to_project_id=source["project_id"],
-                details={"selected_project_confidence": selected_confidence, "confidence": confidence},
+                details={
+                    "selected_project_confidence": selected_confidence,
+                    "confidence": confidence,
+                    "model_id": self.llm.model_for("project_fit_check"),
+                },
             )
         self._refresh_source_archive(source_id)
         return False
@@ -3578,7 +3583,7 @@ class PortfolioService:
                     )
                 connection.execute(
                     "UPDATE sources SET processing_state = 'needs_review', model_id = ?, processed_at = ? WHERE id = ?",
-                    (self.llm.model_id, now, source_id),
+                    (self.llm.model_for("multi_project_routing"), now, source_id),
                 )
             self._refresh_source_archive(source_id, processing_status="needs_review")
             return "needs_review"
@@ -4444,6 +4449,7 @@ class PortfolioService:
         }
 
     def configuration_status(self, *, test_llm: bool = False) -> dict[str, Any]:
+        credential = self.llm.credential_status()
         status = {
             "database_path": str(self.settings.app.database_path),
             "one_drive_root": str(self.settings.app.one_drive_root),
@@ -4451,7 +4457,13 @@ class PortfolioService:
             "retrieval_mode": self.db.fts_mode,
             "llm_adapter": self.settings.llm.adapter,
             "llm_model": self.llm.model_id,
-            "api_key_present": bool(os.environ.get(self.settings.llm.api_key_env)) if self.settings.llm.adapter == "internal" else True,
+            "llm_judgment_model": self.settings.llm.judgment_model,
+            "llm_endpoint": self.llm.endpoint_url,
+            "api_key_present": credential["configured"],
+            "api_key_source": credential["source"],
+            "api_key_environment_override": credential["environment_override"],
+            "api_key_local_saved": credential["local_key_present"],
+            "credential_error": credential.get("credential_error", False),
             "scheduler": self.scheduler_status(),
         }
         if test_llm:
@@ -4460,3 +4472,24 @@ class PortfolioService:
             except (LlmUnavailable, LlmContractError) as exc:
                 status["llm_test"] = {"ok": False, "error": _safe_error(exc)}
         return status
+
+    def save_llm_api_key(self, api_key: str) -> dict[str, Any]:
+        return self.llm.save_api_key(api_key)
+
+    def remove_llm_api_key(self) -> dict[str, Any]:
+        return self.llm.remove_api_key()
+
+    def llm_health(self) -> dict[str, Any]:
+        credential = self.llm.credential_status()
+        if not credential["configured"]:
+            return {
+                "ok": False, "configured": False, "error": "No GenAI.mil API key is configured",
+                "model_id": self.llm.model_id,
+            }
+        try:
+            return {**self.llm.test_connection(), "configured": True}
+        except (LlmUnavailable, LlmContractError) as exc:
+            return {
+                "ok": False, "configured": True, "error": _safe_error(exc),
+                "model_id": self.llm.model_id,
+            }

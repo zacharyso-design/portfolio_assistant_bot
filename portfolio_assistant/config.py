@@ -37,14 +37,19 @@ class AppSettings:
 @dataclass(frozen=True)
 class LlmSettings:
     adapter: str = "internal"
-    base_url: str = ""
+    base_url: str = "https://api.genai.mil"
     chat_path: str = "/v1/chat/completions"
-    model: str = "CONFIGURE_ME"
-    api_key_env: str = "PORTFOLIO_ASSISTANT_API_KEY"
+    model: str = "gemini-3.5-flash"
+    judgment_model: str = "gemini-3.1-pro-preview"
+    api_key_env: str = "GENAI_API_KEY"
     auth_header: str = "Authorization"
     auth_scheme: str = "Bearer"
     ca_bundle: str = ""
-    timeout_seconds: float = 90.0
+    timeout_seconds: float = 240.0
+    max_tokens: int = 32_000
+    max_attempts: int = 3
+    rate_limit_requests: int = 120
+    rate_limit_window_seconds: float = 60.0
     max_evidence_chars: int = 30_000
 
 
@@ -89,14 +94,19 @@ def load_settings(path: str | Path | None = None, *, testing: bool = False) -> S
         raise ConfigurationError(f"Missing required [app] key: {exc.args[0]}") from exc
     llm = LlmSettings(
         adapter=str(llm_raw.get("adapter", "internal")),
-        base_url=str(llm_raw.get("base_url", "")),
+        base_url=str(llm_raw.get("base_url", "https://api.genai.mil")),
         chat_path=str(llm_raw.get("chat_path", "/v1/chat/completions")),
-        model=str(llm_raw.get("model", "CONFIGURE_ME")),
-        api_key_env=str(llm_raw.get("api_key_env", "PORTFOLIO_ASSISTANT_API_KEY")),
+        model=str(llm_raw.get("model", "gemini-3.5-flash")),
+        judgment_model=str(llm_raw.get("judgment_model", "gemini-3.1-pro-preview")),
+        api_key_env=str(llm_raw.get("api_key_env", "GENAI_API_KEY")),
         auth_header=str(llm_raw.get("auth_header", "Authorization")),
         auth_scheme=str(llm_raw.get("auth_scheme", "Bearer")),
         ca_bundle=str(llm_raw.get("ca_bundle", "")),
-        timeout_seconds=float(llm_raw.get("timeout_seconds", 90)),
+        timeout_seconds=float(llm_raw.get("timeout_seconds", 240)),
+        max_tokens=int(llm_raw.get("max_tokens", 32_000)),
+        max_attempts=int(llm_raw.get("max_attempts", 3)),
+        rate_limit_requests=int(llm_raw.get("rate_limit_requests", 120)),
+        rate_limit_window_seconds=float(llm_raw.get("rate_limit_window_seconds", 60)),
         max_evidence_chars=int(llm_raw.get("max_evidence_chars", 30_000)),
     )
     _validate(app, llm)
@@ -122,8 +132,14 @@ def _validate(app: AppSettings, llm: LlmSettings) -> None:
             raise ConfigurationError("internal llm.base_url must be an absolute HTTPS URL")
         if not llm.model or llm.model == "CONFIGURE_ME":
             raise ConfigurationError("internal llm.model must be configured")
+        if not llm.judgment_model or llm.judgment_model == "CONFIGURE_ME":
+            raise ConfigurationError("internal llm.judgment_model must be configured")
         if llm.ca_bundle and not _expanded_path(llm.ca_bundle).is_file():
             raise ConfigurationError("configured llm.ca_bundle does not exist")
+        if llm.timeout_seconds <= 0 or llm.max_tokens < 1 or not 1 <= llm.max_attempts <= 3:
+            raise ConfigurationError("LLM timeout/max_tokens must be positive and max_attempts must be between 1 and 3")
+        if llm.rate_limit_requests < 0 or llm.rate_limit_window_seconds <= 0:
+            raise ConfigurationError("LLM rate limit must be disabled with 0 requests or use a positive window")
 
 
 def ensure_runtime_paths(settings: Settings) -> None:

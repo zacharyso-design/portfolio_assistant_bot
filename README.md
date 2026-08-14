@@ -4,15 +4,15 @@ CHIO Portfolio Assistant is a single-user Windows application for preserving pro
 
 ## Install from source
 
-Prerequisites: Windows, Python 3.11 or later, and Node.js only for the one-time frontend build.
+Prerequisite: Windows with Python 3.11 or later.
 
-```powershell
-Copy-Item config.example.toml config.toml
-# Edit config.toml before continuing.
-.\scripts\Install.ps1
-```
+After cloning or pulling the repository, double-click **Start CHIO Portfolio Assistant.cmd** in the repository root. On first use it automatically creates `config.toml`, selects the current user's organizational OneDrive (falling back to a local runtime folder), creates `.venv`, installs the Python dependencies, and opens the application. The compiled web interface is included, so Node.js is not required.
 
-Set `one_drive_root` to the locally synced portfolio root. The supplied LLM defaults target the OpenAI-compatible GenAI.mil chat-completions endpoint. After the bot starts, open **Settings**, paste the GenAI.mil API key, choose **Save encrypted key**, and run **Test API health**. The saved key is encrypted to the current Windows user with DPAPI outside OneDrive and is never written to TOML. An administrator-provided `GENAI_API_KEY` environment variable remains supported and takes priority.
+For manual installation from PowerShell, copy `config.example.toml` to `config.toml`, set the desired archive path, and run `.\scripts\Install.ps1`.
+
+The compiled `frontend\dist` files are deliberately committed for Node-free government-workstation installs. After changing `frontend\src`, run `npm run build` in `frontend`, confirm Vite removed obsolete content-hashed files, and stage both additions and deletions in the refreshed `frontend\dist` output.
+
+The one-click launcher sets `one_drive_root` automatically; edit it in `config.toml` only if you want a different locally synced portfolio root. The supplied LLM defaults target the OpenAI-compatible GenAI.mil chat-completions endpoint. After the bot starts, open **Settings**, paste the GenAI.mil API key, choose **Save encrypted key**, and run **Test API health**. The saved key is encrypted to the current Windows user with DPAPI outside OneDrive and is never written to TOML. An administrator-provided `GENAI_API_KEY` environment variable remains supported and takes priority.
 
 The application creates this durable archive below that root:
 
@@ -33,7 +33,7 @@ Start in the background and open `http://127.0.0.1:8765`:
 .\scripts\Run.ps1
 ```
 
-For one-click foreground startup, double-click `portfolio_assistant_launcher.py`; it automatically uses the project's `.venv`, starts the server, and opens the browser. The launcher keeps its window open while the bot is running and pauses on startup errors so the message remains visible. For visible PowerShell diagnostics use `.\scripts\Run.ps1 -Foreground`. Stop the background process with `.\scripts\Stop.ps1`.
+For subsequent one-click foreground startup, use the same `.cmd` file or double-click `portfolio_assistant_launcher.py`. The launcher keeps its window open while the bot is running and pauses on startup errors so the message remains visible. For visible PowerShell diagnostics use `.\scripts\Run.ps1 -Foreground`. Stop the background process with `.\scripts\Stop.ps1`.
 
 ## Windows distribution (no Node.js required)
 
@@ -43,7 +43,7 @@ Build on an approved build workstation:
 .\scripts\Build-Distribution.ps1
 ```
 
-The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml` and opens it in Notepad. Configure the OneDrive path, save the file, and double-click the launcher again. It starts the local server and opens the application in the default browser; keep its command window open while using the application. Open **Settings** to save the API key and verify GenAI.mil health.
+The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml`, selects an archive location, starts the local server, and opens the application in the default browser; keep its command window open while using the application. Open **Settings** to save the API key and verify GenAI.mil health.
 
 The equivalent manual command is:
 

@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param([string]$ConfigPath = '')
+param(
+    [string]$ConfigPath = '',
+    [string]$PythonExecutable = ''
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -7,7 +10,12 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $repoRoot 'config.toml' }
 $venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
-    py -m venv (Join-Path $repoRoot '.venv')
+    if ($PythonExecutable) {
+        & $PythonExecutable -m venv (Join-Path $repoRoot '.venv')
+    }
+    else {
+        py -m venv (Join-Path $repoRoot '.venv')
+    }
     if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed with exit code $LASTEXITCODE." }
 }
 

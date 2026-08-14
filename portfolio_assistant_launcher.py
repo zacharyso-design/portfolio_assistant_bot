@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -8,6 +10,7 @@ from pathlib import Path
 
 
 RELAUNCHED_ENV = "PORTFOLIO_ASSISTANT_RELAUNCHED"
+ONE_DRIVE_ROOT_LINE = re.compile(r"^[ \t]*one_drive_root[ \t]*=[^\r\n]*$", re.MULTILINE)
 
 
 def _pause() -> None:
@@ -25,6 +28,68 @@ def _application_root() -> Path:
 
 def _source_python(root: Path) -> Path:
     return root / ".venv" / "Scripts" / "python.exe"
+
+
+def _default_archive_root(root: Path) -> Path:
+    value = os.environ.get("OneDriveCommercial")
+    if value:
+        return Path(value).expanduser().resolve() / "CHIO Portfolio"
+    return root / ".runtime" / "one-drive"
+
+
+def _ensure_config(root: Path) -> Path:
+    config_path = root / "config.toml"
+    if config_path.is_file():
+        return config_path
+    example_path = root / "config.example.toml"
+    if not example_path.is_file():
+        raise FileNotFoundError(f"Configuration template not found: {example_path}")
+    archive_root = _default_archive_root(root)
+    archive_root.mkdir(parents=True, exist_ok=True)
+    escaped_archive_root = str(archive_root).replace("\\", "\\\\").replace('"', '\\"')
+    example = example_path.read_text(encoding="utf-8")
+    # A callable replacement keeps Windows backslashes out of regex replacement parsing.
+    configured, replacements = ONE_DRIVE_ROOT_LINE.subn(
+        lambda _match: f'one_drive_root = "{escaped_archive_root}"',
+        example,
+    )
+    if replacements != 1:
+        raise ValueError("The configuration template must contain exactly one one_drive_root setting.")
+    config_path.write_text(configured, encoding="utf-8")
+    print(f"Created configuration: {config_path}")
+    print(f"Project archive: {archive_root}")
+    return config_path
+
+
+def _install_source(root: Path) -> int:
+    installer = root / "scripts" / "Install.ps1"
+    if not installer.is_file():
+        print(f"Installer not found: {installer}")
+        return 2
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        print("Windows PowerShell is required to install the application.")
+        return 2
+    print("First-time setup: installing the Portfolio Assistant. This may take a few minutes...")
+    try:
+        completed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(installer),
+                "-PythonExecutable",
+                sys.executable,
+            ],
+            cwd=root,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"Could not run the installer: {exc}")
+        return 2
+    return completed.returncode
 
 
 def _is_same_executable(first: Path, second: Path) -> bool:
@@ -45,14 +110,34 @@ def run(argv: list[str] | None = None) -> int:
     pause_here = double_clicked and not relaunched
     root = _application_root()
 
-    if not getattr(sys, "frozen", False):
-        project_python = _source_python(root)
-        if not project_python.is_file():
-            print(f"The project environment is missing: {project_python}")
-            print("Run scripts\\Install.ps1 once, then double-click this launcher again.")
+    config_path: Path | None = None
+    if double_clicked:
+        # Config must exist before Install.ps1 so its first run reaches database migration.
+        try:
+            config_path = _ensure_config(root)
+        except (OSError, ValueError) as exc:
+            print(f"Could not create the configuration: {exc}")
             if pause_here:
                 _pause()
             return 2
+
+    if not getattr(sys, "frozen", False):
+        project_python = _source_python(root)
+        if not project_python.is_file():
+            if not double_clicked:
+                print(f"The project environment is missing: {project_python}")
+                print("Double-click Start CHIO Portfolio Assistant.cmd to run first-time setup.")
+                return 2
+            install_result = _install_source(root)
+            if install_result:
+                if pause_here:
+                    _pause()
+                return install_result
+            if not project_python.is_file():
+                print(f"Installation completed without creating the project environment: {project_python}")
+                if pause_here:
+                    _pause()
+                return 2
         if not _is_same_executable(Path(sys.executable), project_python):
             if relaunched:
                 print(f"Could not switch to the project environment: {project_python}")
@@ -82,10 +167,8 @@ def run(argv: list[str] | None = None) -> int:
         from portfolio_assistant.cli import main
 
         if double_clicked:
-            config_path = root / "config.toml"
-            if not config_path.is_file():
-                print(f"Configuration file not found: {config_path}")
-                print("Copy config.example.toml to config.toml and set the government OneDrive path.")
+            if config_path is None:
+                print("Could not determine the configuration path.")
                 if pause_here:
                     _pause()
                 return 2

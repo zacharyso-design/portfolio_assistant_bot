@@ -5,7 +5,6 @@ __pycache__/
 .coverage
 htmlcov/
 node_modules/
-frontend/dist/
 build/
 dist/
 *.spec
@@ -20,3 +19,6 @@ test-results/
 playwright-report/
 index.html
 portfolio-assistant-prototype.zip
+# These exceptions must remain last so the source checkout ships a Node-free UI.
+!frontend/dist/
+!frontend/dist/**

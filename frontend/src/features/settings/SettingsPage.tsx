@@ -3,6 +3,7 @@ import { backend } from "../../api/backend";
 import type { ConfigurationStatus, LlmHealth } from "../../api/contracts";
 import { Notice } from "../../components/Feedback";
 import { PageHeader } from "../../components/PageHeader";
+import { credentialDisplayState } from "./credentialStatus";
 
 export function SettingsPage() {
   const [configuration, setConfiguration] = useState<ConfigurationStatus | null>(null);
@@ -77,6 +78,7 @@ export function SettingsPage() {
   }
 
   const internal = configuration?.llm_adapter === "internal";
+  const credentialState = configuration ? credentialDisplayState(configuration) : null;
   const sourceLabel = configuration?.credential_error
     ? "Saved credential unavailable"
     : configuration?.api_key_source === "environment"
@@ -100,7 +102,14 @@ export function SettingsPage() {
           <div><small>Credential</small><strong>{sourceLabel}</strong></div>
         </div>}
         <form className="credential-form" onSubmit={save}>
-          <label>GenAI.mil API key<input type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={configuration?.api_key_present ? "Paste a replacement key" : "Paste API key"} disabled={!internal || Boolean(busy)} /></label>
+          <div className="credential-field">
+            <label htmlFor="genai-api-key">GenAI.mil API key</label>
+            <input id="genai-api-key" type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={configuration?.api_key_present ? "Paste a replacement key" : "Paste API key"} disabled={!internal || Boolean(busy)} />
+            {credentialState && <div className={`credential-saved-state ${credentialState.tone}`} role="status" aria-live="polite">
+              <span className="credential-state-dot" aria-hidden="true" />
+              <span><strong>{credentialState.label}</strong><small>{credentialState.detail}</small></span>
+            </div>}
+          </div>
           <div className="settings-actions">
             <button className="button primary" disabled={!internal || !apiKey.trim() || Boolean(busy)}>{busy === "save" ? "Encrypting..." : "Save encrypted key"}</button>
             <button type="button" className="button" onClick={remove} disabled={!internal || !configuration?.api_key_local_saved || Boolean(busy)}>{busy === "remove" ? "Removing..." : "Remove saved key"}</button>

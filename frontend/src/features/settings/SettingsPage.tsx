@@ -4,6 +4,7 @@ import type { ConfigurationStatus, LlmHealth } from "../../api/contracts";
 import { Notice } from "../../components/Feedback";
 import { PageHeader } from "../../components/PageHeader";
 import { credentialDisplayState } from "./credentialStatus";
+import { mergeModelOptions } from "./modelOptions";
 
 export function SettingsPage() {
   const [configuration, setConfiguration] = useState<ConfigurationStatus | null>(null);
@@ -12,6 +13,7 @@ export function SettingsPage() {
   const [judgmentModel, setJudgmentModel] = useState("");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [health, setHealth] = useState<LlmHealth | null>(null);
+  const [catalogError, setCatalogError] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"save" | "remove" | "models" | "health" | "">("");
@@ -21,9 +23,21 @@ export function SettingsPage() {
     setConfiguration(current);
     setRoutineModel(current.llm_model);
     setJudgmentModel(current.llm_judgment_model);
-    setAvailableModels(previous => Array.from(new Set([
-      ...previous, current.llm_model, current.llm_judgment_model,
-    ])).sort((left, right) => left.localeCompare(right)));
+    setAvailableModels(mergeModelOptions([], current.llm_model, current.llm_judgment_model));
+    setCatalogError("");
+    if (current.llm_adapter === "internal" && current.api_key_present) {
+      try {
+        const catalog = await backend.configuration.listModels();
+        if (catalog.available_models?.length) {
+          setAvailableModels(mergeModelOptions(
+            catalog.available_models, current.llm_model, current.llm_judgment_model,
+          ));
+        }
+        if (!catalog.ok) setCatalogError(catalog.error || "GenAI.mil model refresh failed.");
+      } catch (value) {
+        setCatalogError((value as Error).message);
+      }
+    }
   }, []);
 
   useEffect(() => { load().catch(value => setError(value.message)); }, [load]);
@@ -67,11 +81,13 @@ export function SettingsPage() {
   }
 
   async function testHealth() {
-    setBusy("health"); setNotice(""); setError(""); setHealth(null);
+    setBusy("health"); setNotice(""); setError(""); setCatalogError(""); setHealth(null);
     try {
       const result = await backend.configuration.testHealth();
       setHealth(result);
-      if (result.available_models?.length) setAvailableModels(result.available_models);
+      if (result.available_models?.length) {
+        setAvailableModels(mergeModelOptions(result.available_models, routineModel, judgmentModel));
+      }
       if (!result.ok) setError(result.error || "GenAI.mil health check failed.");
     } catch (value) { setError((value as Error).message); }
     finally { setBusy(""); }
@@ -84,9 +100,7 @@ export function SettingsPage() {
     : configuration?.api_key_source === "environment"
       ? "GENAI_API_KEY environment fallback"
       : configuration?.api_key_source === "encrypted_local" ? "Encrypted local key" : "Not configured";
-  const modelOptions = Array.from(new Set([
-    ...availableModels, routineModel, judgmentModel,
-  ].filter(Boolean))).sort((left, right) => left.localeCompare(right));
+  const modelOptions = mergeModelOptions(availableModels, routineModel, judgmentModel);
 
   return <>
     <PageHeader eyebrow="Local AI connection" title="GenAI.mil settings" />
@@ -119,7 +133,8 @@ export function SettingsPage() {
       </section>
       <section className="panel settings-card">
         <header><div><small>Workload routing</small><h2>Model selection</h2></div></header>
-        <p>Choose separate models for routine processing and higher-judgment routing. Refresh API health to renew this pick list from GenAI.mil.</p>
+        <p>The GenAI.mil model catalog refreshes automatically when the app starts. API health forces another refresh before testing the selected models.</p>
+        {catalogError && <Notice error>Automatic model refresh failed: {catalogError} Existing choices remain available.</Notice>}
         {configuration?.model_preference_error && <Notice error>Saved model choices could not be read, so the packaged defaults are active.</Notice>}
         <form className="model-form" onSubmit={saveModels}>
           <label>Routine model<select value={routineModel} onChange={event => setRoutineModel(event.target.value)} disabled={!internal || Boolean(busy)}>{modelOptions.map(model => <option key={model} value={model}>{model}</option>)}</select></label>

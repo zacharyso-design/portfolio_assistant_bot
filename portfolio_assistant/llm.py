@@ -23,6 +23,9 @@ from .preferences import (
 )
 
 
+MODEL_CATALOG_TIMEOUT_SECONDS = 15.0
+
+
 class LlmUnavailable(RuntimeError):
     pass
 
@@ -541,7 +544,8 @@ class InternalHttpLlmAdapter:
         verify: bool | str = self.settings.ca_bundle or True
         try:
             with self._client_factory(
-                timeout=self.settings.timeout_seconds, verify=verify, follow_redirects=False,
+                timeout=min(self.settings.timeout_seconds, MODEL_CATALOG_TIMEOUT_SECONDS),
+                verify=verify, follow_redirects=False,
             ) as client:
                 response = client.get(models_url, headers=headers)
         except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as exc:

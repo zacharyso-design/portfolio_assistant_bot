@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -408,6 +409,247 @@ def test_model_catalog_uses_active_key_and_same_host_models_endpoint(monkeypatch
     }
     assert sequence.options[0]["verify"] is True
     assert sequence.options[0]["follow_redirects"] is False
+    assert sequence.options[0]["timeout"] == 15.0
+
+
+def test_model_catalog_api_fetches_once_and_reuses_the_session_cache(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    sequence = SequenceClient([model_catalog("new-model", "gemini-3.5-flash")])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    with TestClient(
+        api_module.create_app(app_settings), base_url="http://127.0.0.1:8765",
+        headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+    ) as client:
+        first = client.get("/api/llm/models")
+        second = client.get("/api/llm/models")
+
+    assert first.status_code == 200
+    assert first.json() == {
+        "ok": True,
+        "configured": True,
+        "available_models": ["gemini-3.5-flash", "new-model"],
+    }
+    assert second.json() == first.json()
+    assert [call["method"] for call in sequence.calls] == ["GET"]
+
+
+def test_app_start_refreshes_model_catalog_without_a_chat_probe(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            worker_poll_seconds=0.05, testing=False,
+        ),
+        llm=settings(),
+    )
+    catalog_received = threading.Event()
+
+    class SignalingSequenceClient(SequenceClient):
+        def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            response = super().get(url, **kwargs)
+            catalog_received.set()
+            return response
+
+    sequence = SignalingSequenceClient([model_catalog("startup-model")])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    with TestClient(
+        api_module.create_app(app_settings), base_url="http://127.0.0.1:8765",
+        headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+    ) as client:
+        assert client.get("/api/health").status_code == 200
+        assert catalog_received.wait(timeout=2)
+
+    assert [call["method"] for call in sequence.calls] == ["GET"]
+
+
+def test_saving_a_replacement_key_invalidates_the_model_catalog_cache(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    sequence = SequenceClient([
+        model_catalog("old-entitlement"),
+        model_catalog("new-entitlement"),
+    ])
+    store = MemoryCredentialStore("old-key")
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=store,
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    with TestClient(
+        api_module.create_app(app_settings), base_url="http://127.0.0.1:8765",
+        headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+    ) as client:
+        assert client.get("/api/llm/models").json()["available_models"] == ["old-entitlement"]
+        assert client.put("/api/llm/credential", json={"api_key": "new-key"}).status_code == 200
+        assert client.get("/api/llm/models").json()["available_models"] == ["new-entitlement"]
+
+    assert store.value == "new-key"
+    assert [call["method"] for call in sequence.calls] == ["GET", "GET"]
+
+
+def test_credential_replacement_does_not_wait_for_or_cache_an_old_key_refresh(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    catalog_started = threading.Event()
+    release_catalog = threading.Event()
+
+    class BlockingCatalogClient(SequenceClient):
+        def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            self.calls.append({"method": "GET", "url": url, **kwargs})
+            if len(self.calls) == 1:
+                catalog_started.set()
+                assert release_catalog.wait(timeout=2)
+                return model_catalog("old-key-model")
+            return model_catalog("new-key-model")
+
+    sequence = BlockingCatalogClient([])
+    store = MemoryCredentialStore("old-key")
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=store,
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    service = api_module.create_app(app_settings).state.service
+    refresh_result: dict[str, Any] = {}
+
+    def refresh_catalog() -> None:
+        refresh_result.update(service.refresh_llm_model_catalog())
+
+    refresh_thread = threading.Thread(target=refresh_catalog, daemon=True)
+    refresh_thread.start()
+    assert catalog_started.wait(timeout=1)
+
+    replacement_finished = threading.Event()
+
+    def replace_credential() -> None:
+        service.save_llm_api_key("new-key")
+        replacement_finished.set()
+
+    replacement_thread = threading.Thread(target=replace_credential, daemon=True)
+    replacement_thread.start()
+    replacement_did_not_wait = replacement_finished.wait(timeout=0.25)
+    release_catalog.set()
+    refresh_thread.join(timeout=2)
+    replacement_thread.join(timeout=2)
+
+    assert replacement_did_not_wait is True
+    assert store.value == "new-key"
+    assert refresh_result["available_models"] == ["new-key-model"]
+    assert service.refresh_llm_model_catalog()["available_models"] == ["new-key-model"]
+    assert [call["method"] for call in sequence.calls] == ["GET", "GET"]
+
+
+def test_failed_startup_catalog_result_is_reused_until_a_forced_refresh(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    sequence = SequenceClient([httpx.Response(503), httpx.Response(503)])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    service = api_module.create_app(app_settings).state.service
+
+    first = service.refresh_llm_model_catalog()
+    second = service.refresh_llm_model_catalog()
+
+    assert first == second
+    assert first["ok"] is False
+    assert len(sequence.calls) == 1
+    forced = service.refresh_llm_model_catalog(force=True)
+    assert forced["ok"] is False
+    assert len(sequence.calls) == 2
+
+
+def test_shutdown_does_not_wait_for_an_inflight_startup_catalog_request(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            worker_poll_seconds=0.05, testing=False,
+        ),
+        llm=settings(),
+    )
+    catalog_started = threading.Event()
+    release_catalog = threading.Event()
+
+    class BlockingStartupClient(SequenceClient):
+        def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            self.calls.append({"method": "GET", "url": url, **kwargs})
+            catalog_started.set()
+            assert release_catalog.wait(timeout=2)
+            return model_catalog("startup-model")
+
+    sequence = BlockingStartupClient([])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    app = api_module.create_app(app_settings)
+    context_exited = threading.Event()
+
+    def run_app_lifespan() -> None:
+        with TestClient(
+            app, base_url="http://127.0.0.1:8765",
+            headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+        ):
+            assert catalog_started.wait(timeout=1)
+        context_exited.set()
+
+    app_thread = threading.Thread(target=run_app_lifespan, daemon=True)
+    app_thread.start()
+    assert catalog_started.wait(timeout=1)
+    shutdown_did_not_wait = context_exited.wait(timeout=0.25)
+    release_catalog.set()
+    app_thread.join(timeout=2)
+
+    assert shutdown_did_not_wait is True
 
 
 @pytest.mark.parametrize(

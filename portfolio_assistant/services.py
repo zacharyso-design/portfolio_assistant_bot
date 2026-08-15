@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from email.utils import getaddresses
@@ -105,6 +106,10 @@ class PortfolioService:
         self.settings = settings
         self.db = db
         self.llm = llm
+        self._llm_model_catalog_lock = threading.Lock()
+        self._llm_model_catalog_result: dict[str, Any] | None = None
+        self._llm_model_catalog_generation = 0
+        self._llm_model_catalog_inflight: threading.Event | None = None
         self.archive_paths = ensure_archive_roots(settings.app.one_drive_root)
         self.migrate_archive()
 
@@ -4479,30 +4484,95 @@ class PortfolioService:
         return status
 
     def save_llm_api_key(self, api_key: str) -> dict[str, Any]:
-        return self.llm.save_api_key(api_key)
+        result = self.llm.save_api_key(api_key)
+        self._invalidate_llm_model_catalog()
+        return result
 
     def remove_llm_api_key(self) -> dict[str, Any]:
-        return self.llm.remove_api_key()
+        result = self.llm.remove_api_key()
+        self._invalidate_llm_model_catalog()
+        return result
 
     def save_llm_models(self, routine_model: str, judgment_model: str) -> dict[str, str]:
         return self.llm.save_models(routine_model, judgment_model)
 
+    def _invalidate_llm_model_catalog(self) -> None:
+        with self._llm_model_catalog_lock:
+            self._llm_model_catalog_generation += 1
+            self._llm_model_catalog_result = None
+
+    @staticmethod
+    def _copy_llm_model_catalog_result(result: dict[str, Any]) -> dict[str, Any]:
+        copied = dict(result)
+        if "available_models" in copied:
+            copied["available_models"] = list(copied["available_models"])
+        return copied
+
+    def refresh_llm_model_catalog(self, *, force: bool = False) -> dict[str, Any]:
+        while True:
+            while True:
+                with self._llm_model_catalog_lock:
+                    if self._llm_model_catalog_result is not None and not force:
+                        return self._copy_llm_model_catalog_result(self._llm_model_catalog_result)
+                    pending = self._llm_model_catalog_inflight
+                    if pending is None:
+                        pending = threading.Event()
+                        self._llm_model_catalog_inflight = pending
+                        generation = self._llm_model_catalog_generation
+                        stale_result = self._llm_model_catalog_result
+                        break
+                pending.wait()
+
+            result: dict[str, Any] | None = None
+            try:
+                credential = self.llm.credential_status()
+                if not credential["configured"]:
+                    result = {
+                        "ok": False, "configured": False,
+                        "error": "No GenAI.mil API key is configured",
+                    }
+                else:
+                    try:
+                        available_models = self.llm.list_models()
+                    except (LlmUnavailable, LlmContractError) as exc:
+                        result = {
+                            "ok": False, "configured": True, "error": _safe_error(exc),
+                        }
+                        if stale_result and stale_result.get("available_models"):
+                            result["available_models"] = list(stale_result["available_models"])
+                            result["stale"] = True
+                    else:
+                        result = {
+                            "ok": True, "configured": True,
+                            "available_models": list(available_models),
+                        }
+            finally:
+                with self._llm_model_catalog_lock:
+                    generation_is_current = generation == self._llm_model_catalog_generation
+                    if result is not None and generation_is_current:
+                        self._llm_model_catalog_result = self._copy_llm_model_catalog_result(result)
+                    if self._llm_model_catalog_inflight is pending:
+                        self._llm_model_catalog_inflight = None
+                    pending.set()
+
+            if generation_is_current:
+                return self._copy_llm_model_catalog_result(result)
+
     def llm_health(self) -> dict[str, Any]:
-        credential = self.llm.credential_status()
-        if not credential["configured"]:
+        catalog = self.refresh_llm_model_catalog(force=True)
+        if not catalog["configured"]:
             return {
                 "ok": False, "configured": False, "error": "No GenAI.mil API key is configured",
                 "routine_model": self.llm.model_id,
                 "judgment_model": self.llm.judgment_model_id,
             }
-        try:
-            available_models = self.llm.list_models()
-        except (LlmUnavailable, LlmContractError) as exc:
+        if not catalog["ok"]:
             return {
-                "ok": False, "configured": True, "error": _safe_error(exc),
+                **catalog,
                 "routine_model": self.llm.model_id,
                 "judgment_model": self.llm.judgment_model_id,
             }
+        available_models = catalog["available_models"]
         missing = [
             model for model in {self.llm.model_id, self.llm.judgment_model_id}
             if model not in available_models

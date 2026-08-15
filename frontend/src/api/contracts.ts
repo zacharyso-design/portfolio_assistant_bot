@@ -199,6 +199,14 @@ export type LlmHealth = {
 
 export type ModelSelection = { routine_model: string; judgment_model: string };
 
+export type ModelCatalog = {
+  ok: boolean;
+  configured: boolean;
+  available_models?: string[];
+  error?: string;
+  stale?: boolean;
+};
+
 export type DailySummary = { summary_text?: string; updated_at?: string };
 export type SourceCaptureResult = { duplicate: boolean; source?: Source };
 export type ArchiveRescanResult = { projects: number; sources: number; errors: number };

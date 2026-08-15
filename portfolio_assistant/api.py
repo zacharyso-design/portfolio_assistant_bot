@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -207,6 +208,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     pass
 
         task = None if settings.app.testing else asyncio.create_task(worker(), name="source-worker")
+        if not settings.app.testing and settings.llm.adapter == "internal":
+            threading.Thread(
+                target=service.refresh_llm_model_catalog,
+                name="genai-model-catalog-refresh",
+                daemon=True,
+            ).start()
         yield
         stop.set()
         if task:
@@ -263,6 +270,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.put("/api/llm/models")
     def save_llm_models(body: ModelSelection) -> dict[str, Any]:
         return service.save_llm_models(body.routine_model, body.judgment_model)
+
+    @app.get("/api/llm/models")
+    def llm_models() -> dict[str, Any]:
+        return service.refresh_llm_model_catalog()
 
     @app.post("/api/llm/health")
     def llm_health() -> dict[str, Any]:

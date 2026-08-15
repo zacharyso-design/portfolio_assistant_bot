@@ -4461,13 +4461,14 @@ class PortfolioService:
             "retrieval_mode": self.db.fts_mode,
             "llm_adapter": self.settings.llm.adapter,
             "llm_model": self.llm.model_id,
-            "llm_judgment_model": self.settings.llm.judgment_model,
+            "llm_judgment_model": self.llm.judgment_model_id,
             "llm_endpoint": self.llm.endpoint_url,
             "api_key_present": credential["configured"],
             "api_key_source": credential["source"],
             "api_key_environment_override": credential["environment_override"],
             "api_key_local_saved": credential["local_key_present"],
             "credential_error": credential.get("credential_error", False),
+            "model_preference_error": self.llm.model_preference_error,
             "scheduler": self.scheduler_status(),
         }
         if test_llm:
@@ -4483,17 +4484,67 @@ class PortfolioService:
     def remove_llm_api_key(self) -> dict[str, Any]:
         return self.llm.remove_api_key()
 
+    def save_llm_models(self, routine_model: str, judgment_model: str) -> dict[str, str]:
+        return self.llm.save_models(routine_model, judgment_model)
+
     def llm_health(self) -> dict[str, Any]:
         credential = self.llm.credential_status()
         if not credential["configured"]:
             return {
                 "ok": False, "configured": False, "error": "No GenAI.mil API key is configured",
-                "model_id": self.llm.model_id,
+                "routine_model": self.llm.model_id,
+                "judgment_model": self.llm.judgment_model_id,
             }
         try:
-            return {**self.llm.test_connection(), "configured": True}
+            available_models = self.llm.list_models()
         except (LlmUnavailable, LlmContractError) as exc:
             return {
                 "ok": False, "configured": True, "error": _safe_error(exc),
-                "model_id": self.llm.model_id,
+                "routine_model": self.llm.model_id,
+                "judgment_model": self.llm.judgment_model_id,
             }
+        missing = [
+            model for model in {self.llm.model_id, self.llm.judgment_model_id}
+            if model not in available_models
+        ]
+        if missing:
+            return {
+                "ok": False, "configured": True,
+                "error": "Choose available models in Settings before testing the API",
+                "available_models": available_models,
+                "unavailable_configured_models": sorted(missing, key=str.casefold),
+                "routine_model": self.llm.model_id,
+                "judgment_model": self.llm.judgment_model_id,
+            }
+
+        def probe(model_id: str) -> dict[str, Any]:
+            try:
+                return self.llm.test_connection(model_id)
+            except (LlmUnavailable, LlmContractError) as exc:
+                return {
+                    "ok": False, "configured_model": model_id,
+                    "error": _safe_error(exc),
+                }
+
+        routine = probe(self.llm.model_id)
+        judgment = (
+            routine if self.llm.judgment_model_id == self.llm.model_id
+            else probe(self.llm.judgment_model_id)
+        )
+        result = {
+            "ok": routine.get("ok") is True and judgment.get("ok") is True,
+            "configured": True,
+            "available_models": available_models,
+            "routine": routine,
+            "judgment": judgment,
+            "routine_model": self.llm.model_id,
+            "judgment_model": self.llm.judgment_model_id,
+        }
+        failures = []
+        for label, health in (("Routine model", routine), ("Judgment model", judgment)):
+            if health.get("ok") is not True:
+                detail = health.get("error") or "did not report a successful response"
+                failures.append(f"{label}: {detail}")
+        if failures:
+            result["error"] = "; ".join(failures)
+        return result

@@ -14,7 +14,7 @@ If first-time setup is interrupted, double-click the launcher again; it detects 
 
 The compiled `frontend\dist` files are deliberately committed for Node-free government-workstation installs. After changing `frontend\src`, run `npm run build` in `frontend`, confirm Vite removed obsolete content-hashed files, and stage both additions and deletions in the refreshed `frontend\dist` output.
 
-The one-click launcher sets `one_drive_root` automatically; edit it in `config.toml` only if you want a different locally synced portfolio root. The supplied LLM defaults target the OpenAI-compatible GenAI.mil chat-completions endpoint. After the bot starts, open **Settings**, paste the GenAI.mil API key, choose **Save encrypted key**, and run **Test API health**. The saved key is encrypted to the current Windows user with DPAPI outside OneDrive and is never written to TOML. An administrator-provided `GENAI_API_KEY` environment variable remains supported and takes priority.
+The one-click launcher sets `one_drive_root` automatically; edit it in `config.toml` only if you want a different locally synced portfolio root. The supplied LLM defaults target the OpenAI-compatible GenAI.mil chat-completions endpoint. After the bot starts, open **Settings**, paste the GenAI.mil API key, choose **Save encrypted key**, and run **Refresh models & test API**. The saved key is encrypted to the current Windows user with DPAPI outside OneDrive and is never written to TOML. A saved Settings key takes priority; an administrator-provided `GENAI_API_KEY` remains supported as a fallback when no local key is saved. The health check renews the model pick list, tests the separate routine and judgment selections, and applies saved model choices without a restart.
 
 The application creates this durable archive below that root:
 
@@ -45,7 +45,7 @@ Build on an approved build workstation:
 .\scripts\Build-Distribution.ps1
 ```
 
-The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml`, selects an archive location, starts the local server, and opens the application in the default browser; keep its command window open while using the application. Open **Settings** to save the API key and verify GenAI.mil health.
+The output is `dist\CHIO-Portfolio-Assistant-Windows.zip`. Extract it, then double-click **Start CHIO Portfolio Assistant.cmd**. On first use it creates `config.toml`, selects an archive location, starts the local server, and opens the application in the default browser; keep its command window open while using the application. Open **Settings** to save the API key, refresh the GenAI.mil model list, and choose the routine and judgment models.
 
 The equivalent manual command is:
 

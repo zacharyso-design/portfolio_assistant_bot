@@ -10,6 +10,7 @@
   .knowledge-filters { grid-template-columns: 1fr; }
   .summary-claim, .knowledge-item { flex-direction: column; }
   .summary-comparison { grid-template-columns: 1fr; }
-  .settings-facts, .credential-form { grid-template-columns: 1fr; }
+  .settings-facts, .credential-form, .model-form { grid-template-columns: 1fr; }
+  .model-form .settings-actions { grid-column: auto; }
   .settings-actions { flex-wrap: wrap; }
 }

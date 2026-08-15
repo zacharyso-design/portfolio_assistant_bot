@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import json
 import logging
 import sys
 from pathlib import Path
@@ -16,6 +18,7 @@ from portfolio_assistant.llm import (
     InternalHttpLlmAdapter, LlmContractError, LlmUnavailable,
     SlidingWindowRateLimiter, _json_object_from_text,
 )
+from portfolio_assistant.preferences import ModelPreferenceError
 
 
 class MemoryCredentialStore:
@@ -36,6 +39,20 @@ class MemoryCredentialStore:
         return existed
 
 
+class MemoryModelPreferenceStore:
+    def __init__(self, value: dict[str, str] | None = None):
+        self.value = value
+
+    def load(self) -> dict[str, str] | None:
+        return self.value
+
+    def save(self, routine_model: str, judgment_model: str) -> None:
+        self.value = {
+            "routine_model": routine_model,
+            "judgment_model": judgment_model,
+        }
+
+
 def completion(
     content: str, status: int = 200, headers: dict[str, str] | None = None,
     model: str | None = None,
@@ -47,6 +64,16 @@ def completion(
         status,
         headers=headers,
         json=payload,
+    )
+
+
+def model_catalog(*model_ids: str, status: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json={
+            "object": "list",
+            "data": [{"id": model_id, "object": "model"} for model_id in model_ids],
+        },
     )
 
 
@@ -67,7 +94,14 @@ class SequenceClient:
         return None
 
     def post(self, url: str, **kwargs: Any) -> httpx.Response:
-        self.calls.append({"url": url, **kwargs})
+        self.calls.append({"method": "POST", "url": url, **kwargs})
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        self.calls.append({"method": "GET", "url": url, **kwargs})
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -92,12 +126,14 @@ def settings(**overrides: Any) -> LlmSettings:
 def adapter_with(
     responses: list[Any], *, llm_settings: LlmSettings | None = None,
     store: MemoryCredentialStore | None = None, sleeper: Any = None,
+    model_store: MemoryModelPreferenceStore | None = None,
 ) -> tuple[InternalHttpLlmAdapter, SequenceClient, list[float]]:
     sequence = SequenceClient(responses)
     sleeps: list[float] = []
     sleep = sleeper or sleeps.append
     adapter = InternalHttpLlmAdapter(
         llm_settings or settings(), credential_store=store or MemoryCredentialStore(),
+        model_preference_store=model_store or MemoryModelPreferenceStore(),
         client_factory=sequence.factory, sleeper=sleep,
     )
     return adapter, sequence, sleeps
@@ -233,12 +269,46 @@ def test_network_failure_retries_and_does_not_log_key(caplog):
     assert key not in caplog.text
 
 
-def test_environment_key_has_priority_over_encrypted_store(monkeypatch):
+def test_encrypted_store_has_priority_over_environment_fallback(monkeypatch):
     monkeypatch.setenv("TEST_GENAI_KEY", "environment-key")
     adapter, sequence, _ = adapter_with([completion('{"ok":true}')], store=MemoryCredentialStore("stored-key"))
     adapter.test_connection()
+    assert sequence.calls[0]["headers"]["Authorization"] == "Bearer stored-key"
+    assert adapter.credential_status() == {
+        "configured": True, "source": "encrypted_local", "environment_override": False,
+        "local_key_present": True,
+    }
+
+
+def test_environment_key_remains_a_fallback_when_no_local_key_exists(monkeypatch):
+    monkeypatch.setenv("TEST_GENAI_KEY", "environment-key")
+    adapter, sequence, _ = adapter_with(
+        [completion('{"ok":true}')], store=MemoryCredentialStore(None),
+    )
+    adapter.test_connection()
     assert sequence.calls[0]["headers"]["Authorization"] == "Bearer environment-key"
     assert adapter.credential_status()["source"] == "environment"
+
+
+@pytest.mark.parametrize(
+    ("stored_key", "environment_key", "expected_source"),
+    [
+        ("stored-secret", "stale-environment-secret", "API key saved in Settings"),
+        (None, "environment-secret", "TEST_GENAI_KEY environment fallback"),
+    ],
+)
+def test_401_identifies_the_active_credential_source_without_exposing_keys(
+    monkeypatch, stored_key, environment_key, expected_source,
+):
+    monkeypatch.setenv("TEST_GENAI_KEY", environment_key)
+    adapter, _, _ = adapter_with([httpx.Response(401)], store=MemoryCredentialStore(stored_key))
+    with pytest.raises(LlmUnavailable) as rejected:
+        adapter.test_connection()
+    message = str(rejected.value)
+    assert expected_source in message
+    assert "HTTP 401" in message
+    assert stored_key is None or stored_key not in message
+    assert environment_key not in message
 
 
 def test_judgment_tasks_use_pro_model():
@@ -258,6 +328,145 @@ def test_health_reports_endpoint_model_when_present():
     health = adapter.test_connection()
     assert health["model_id"] == "served-model-version"
     assert health["configured_model"] == "gemini-3.5-flash"
+
+
+def test_json_model_preferences_round_trip_atomically(tmp_path: Path):
+    try:
+        preferences = importlib.import_module("portfolio_assistant.preferences")
+    except ModuleNotFoundError:
+        pytest.fail("model preference storage is not implemented")
+    path = tmp_path / "settings" / "llm-models.json"
+    store = preferences.JsonModelPreferenceStore(path)
+    assert store.load() is None
+    store.save("routine-model", "judgment-model")
+    assert store.load() == {
+        "routine_model": "routine-model",
+        "judgment_model": "judgment-model",
+    }
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "routine_model": "routine-model",
+        "judgment_model": "judgment-model",
+    }
+    assert list(path.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("routine_model", ["bad\nmodel", "x" * 257])
+def test_json_model_preferences_reject_invalid_persisted_ids(tmp_path: Path, routine_model: str):
+    preferences = importlib.import_module("portfolio_assistant.preferences")
+    path = tmp_path / "settings" / "llm-models.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "routine_model": routine_model,
+        "judgment_model": "valid-judgment-model",
+    }), encoding="utf-8")
+    with pytest.raises(ModelPreferenceError, match="could not be read"):
+        preferences.JsonModelPreferenceStore(path).load()
+
+
+def test_saved_model_preferences_override_toml_and_apply_without_restart():
+    model_store = MemoryModelPreferenceStore({
+        "routine_model": "saved-routine",
+        "judgment_model": "saved-judgment",
+    })
+    adapter, _, _ = adapter_with([], model_store=model_store)
+    assert adapter.model_id == "saved-routine"
+    assert adapter.model_for("multi_project_routing") == "saved-judgment"
+    saved = adapter.save_models("new-routine", "new-judgment")
+    assert saved == {
+        "routine_model": "new-routine",
+        "judgment_model": "new-judgment",
+    }
+    assert model_store.value == saved
+    assert adapter.model_id == "new-routine"
+    assert adapter.model_for("project_fit_check") == "new-judgment"
+
+
+def test_saved_routine_model_applies_to_image_analysis():
+    model_store = MemoryModelPreferenceStore({
+        "routine_model": "saved-routine",
+        "judgment_model": "saved-judgment",
+    })
+    adapter, sequence, _ = adapter_with(
+        [completion('{"description":"image"}')], model_store=model_store,
+    )
+    adapter.analyze_image(b"image-bytes", "image/png", "Describe the image")
+    assert sequence.calls[0]["json"]["model"] == "saved-routine"
+
+
+def test_model_catalog_uses_active_key_and_same_host_models_endpoint(monkeypatch):
+    monkeypatch.setenv("TEST_GENAI_KEY", "stale-environment-key")
+    adapter, sequence, _ = adapter_with(
+        [model_catalog("z-model", "a-model", "z-model")],
+        store=MemoryCredentialStore("saved-key"),
+    )
+    assert adapter.list_models() == ["a-model", "z-model"]
+    call = sequence.calls[0]
+    assert call == {
+        "method": "GET",
+        "url": "https://api.genai.mil/v1/models",
+        "headers": {"Authorization": "Bearer saved-key", "Accept": "application/json"},
+    }
+    assert sequence.options[0]["verify"] is True
+    assert sequence.options[0]["follow_redirects"] is False
+
+
+@pytest.mark.parametrize(
+    ("routine_model", "judgment_model"),
+    [
+        ("", "judgment-model"),
+        ("routine-model", "bad\nmodel"),
+        ("x" * 257, "judgment-model"),
+    ],
+)
+def test_invalid_model_choices_are_not_persisted_or_applied(routine_model, judgment_model):
+    model_store = MemoryModelPreferenceStore({
+        "routine_model": "original-routine",
+        "judgment_model": "original-judgment",
+    })
+    adapter, _, _ = adapter_with([], model_store=model_store)
+    with pytest.raises(LlmUnavailable, match="valid model"):
+        adapter.save_models(routine_model, judgment_model)
+    assert model_store.value == {
+        "routine_model": "original-routine",
+        "judgment_model": "original-judgment",
+    }
+    assert adapter.model_id == "original-routine"
+    assert adapter.model_for("project_fit_check") == "original-judgment"
+
+
+def test_corrupt_saved_model_preferences_fall_back_to_toml_defaults():
+    class BrokenModelStore(MemoryModelPreferenceStore):
+        def load(self) -> dict[str, str] | None:
+            raise ModelPreferenceError("corrupt test preferences")
+
+    adapter, _, _ = adapter_with([], model_store=BrokenModelStore())
+    assert adapter.model_id == "gemini-3.5-flash"
+    assert adapter.model_for("multi_project_routing") == "gemini-3.1-pro-preview"
+    assert adapter.model_preference_error is True
+    adapter.save_models("fixed-routine", "fixed-judgment")
+    assert adapter.model_preference_error is False
+    assert adapter.model_id == "fixed-routine"
+    assert adapter.model_for("multi_project_routing") == "fixed-judgment"
+
+
+def test_model_catalog_redirects_are_rejected_without_following():
+    adapter, _, _ = adapter_with([
+        httpx.Response(302, headers={"location": "https://attacker.invalid/v1/models"}),
+    ])
+    with pytest.raises(LlmUnavailable, match="off-host redirect"):
+        adapter.list_models()
+
+
+def test_model_catalog_401_identifies_saved_gui_key_without_exposing_it():
+    adapter, _, _ = adapter_with(
+        [httpx.Response(401)], store=MemoryCredentialStore("saved-gui-secret"),
+    )
+    with pytest.raises(LlmUnavailable) as rejected:
+        adapter.list_models()
+    message = str(rejected.value)
+    assert "API key saved in Settings" in message
+    assert "HTTP 401" in message
+    assert "saved-gui-secret" not in message
 
 
 def test_undecryptable_local_credential_can_still_be_removed():
@@ -329,9 +538,18 @@ def test_credential_and_health_api_never_returns_key(tmp_path: Path, monkeypatch
         llm=settings(),
     )
     store = MemoryCredentialStore(None)
-    sequence = SequenceClient([completion('{"ok":true}')])
+    model_store = MemoryModelPreferenceStore()
+    sequence = SequenceClient([
+        model_catalog(
+            "new-judgment", "gemini-3.1-pro-preview",
+            "new-routine", "gemini-3.5-flash",
+        ),
+        completion('{"ok":true}', model="gemini-3.5-flash"),
+        completion('{"ok":true}', model="gemini-3.1-pro-preview"),
+    ])
     injected = InternalHttpLlmAdapter(
-        app_settings.llm, credential_store=store, client_factory=sequence.factory,
+        app_settings.llm, credential_store=store, model_preference_store=model_store,
+        client_factory=sequence.factory,
         sleeper=lambda _: None,
     )
     monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
@@ -347,6 +565,99 @@ def test_credential_and_health_api_never_returns_key(tmp_path: Path, monkeypatch
         assert "api-secret-from-ui" not in str(configuration)
         health = client.post("/api/llm/health", json={}).json()
         assert health["ok"] is True
+        assert health["available_models"] == [
+            "gemini-3.1-pro-preview", "gemini-3.5-flash", "new-judgment", "new-routine",
+        ]
+        assert health["routine"]["ok"] is True
+        assert health["routine"]["configured_model"] == "gemini-3.5-flash"
+        assert health["judgment"]["ok"] is True
+        assert health["judgment"]["configured_model"] == "gemini-3.1-pro-preview"
+        assert [call["method"] for call in sequence.calls] == ["GET", "POST", "POST"]
+        assert [call["json"]["model"] for call in sequence.calls[1:]] == [
+            "gemini-3.5-flash", "gemini-3.1-pro-preview",
+        ]
+        selected = client.put("/api/llm/models", json={
+            "routine_model": "new-routine",
+            "judgment_model": "new-judgment",
+        })
+        assert selected.status_code == 200
+        assert selected.json() == {
+            "routine_model": "new-routine", "judgment_model": "new-judgment",
+        }
+        refreshed = client.get("/api/configuration").json()
+        assert refreshed["llm_model"] == "new-routine"
+        assert refreshed["llm_judgment_model"] == "new-judgment"
+        assert model_store.value == selected.json()
         removed = client.delete("/api/llm/credential")
         assert removed.json()["configured"] is False
         assert "api-secret-from-ui" not in removed.text
+
+
+def test_health_refresh_returns_models_without_probing_missing_selections(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    sequence = SequenceClient([model_catalog("available-routine", "available-judgment")])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    with TestClient(
+        api_module.create_app(app_settings), base_url="http://127.0.0.1:8765",
+        headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+    ) as client:
+        health = client.post("/api/llm/health", json={}).json()
+    assert health["ok"] is False
+    assert health["available_models"] == ["available-judgment", "available-routine"]
+    assert health["unavailable_configured_models"] == [
+        "gemini-3.1-pro-preview", "gemini-3.5-flash",
+    ]
+    assert "Choose available models" in health["error"]
+    assert [call["method"] for call in sequence.calls] == ["GET"]
+
+
+def test_health_keeps_refreshed_models_when_a_probe_is_rejected(tmp_path: Path, monkeypatch):
+    one_drive = tmp_path / "one-drive"
+    one_drive.mkdir()
+    app_settings = Settings(
+        app=AppSettings(
+            database_path=tmp_path / "portfolio.db", one_drive_root=one_drive,
+            testing=True,
+        ),
+        llm=settings(),
+    )
+    sequence = SequenceClient([
+        model_catalog("gemini-3.1-pro-preview", "gemini-3.5-flash"),
+        httpx.Response(401),
+        completion('{"ok":true}', model="gemini-3.1-pro-preview"),
+    ])
+    injected = InternalHttpLlmAdapter(
+        app_settings.llm, credential_store=MemoryCredentialStore("saved-key"),
+        model_preference_store=MemoryModelPreferenceStore(),
+        client_factory=sequence.factory, sleeper=lambda _: None,
+    )
+    monkeypatch.setattr(api_module, "build_adapter", lambda _: injected)
+    with TestClient(
+        api_module.create_app(app_settings), base_url="http://127.0.0.1:8765",
+        headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+    ) as client:
+        health = client.post("/api/llm/health", json={}).json()
+    assert health["ok"] is False
+    assert health["available_models"] == [
+        "gemini-3.1-pro-preview", "gemini-3.5-flash",
+    ]
+    assert health["routine"]["ok"] is False
+    assert health["routine"]["configured_model"] == "gemini-3.5-flash"
+    assert health["judgment"]["ok"] is True
+    assert health["judgment"]["configured_model"] == "gemini-3.1-pro-preview"
+    assert "API key saved in Settings" in health["error"]
+    assert "saved-key" not in str(health)
+    assert [call["method"] for call in sequence.calls] == ["GET", "POST", "POST"]

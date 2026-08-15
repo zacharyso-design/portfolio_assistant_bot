@@ -88,6 +88,8 @@
 .settings-facts small { color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .08em; font-size: 8px; }
 .settings-facts strong { overflow-wrap: anywhere; font-size: 11px; }
 .credential-form { display: grid; grid-template-columns: minmax(260px, 1fr) auto; align-items: end; gap: 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+.model-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 12px; }
+.model-form .settings-actions { grid-column: 1 / -1; }
 .settings-actions { display: flex; gap: 8px; }
 .security-note { margin: 12px 0 0; font-size: 10px; }
 .security-note code { color: var(--teal); }

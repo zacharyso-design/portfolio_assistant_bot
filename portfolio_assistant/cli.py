@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import http.client
 import json
 import os
+import sys
 import threading
 import webbrowser
 from datetime import date
@@ -20,6 +22,7 @@ from .services import PortfolioService, ValidationError
 
 
 STARTUP_PROBE_ATTEMPTS = 150
+SERVER_STARTUP_FAILURE = 3
 
 
 def _app_url(settings: Settings) -> str:
@@ -67,6 +70,27 @@ def _open_app_when_ready(settings: Settings, stop: threading.Event) -> None:
         if stop.wait(0.2):
             return
     print(f"Startup is taking longer than expected. Open {_app_url(settings)} when the server is ready.")
+
+
+def _windows_selector_loop() -> asyncio.AbstractEventLoop:
+    loop = asyncio.SelectorEventLoop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def _run_server(server: uvicorn.Server) -> int:
+    try:
+        if sys.platform == "win32":
+            try:
+                with asyncio.Runner(loop_factory=_windows_selector_loop) as runner:
+                    runner.run(server.serve())
+            finally:
+                asyncio.set_event_loop(None)
+        else:
+            server.run()
+    except KeyboardInterrupt:
+        pass
+    return 0 if server.started else SERVER_STARTUP_FAILURE
 
 
 def _service(config: str, *, testing: bool = False) -> PortfolioService:
@@ -142,10 +166,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 opener.start()
             try:
-                uvicorn.run(
-                    create_app(settings), host=settings.app.bind_host, port=settings.app.bind_port,
-                    reload=args.command == "serve" and args.reload, log_config=None,
-                )
+                app = create_app(settings)
+                if args.command == "launch":
+                    config = uvicorn.Config(
+                        app, host=settings.app.bind_host, port=settings.app.bind_port,
+                        reload=False, log_config=None,
+                    )
+                    exit_code = _run_server(uvicorn.Server(config))
+                    if exit_code:
+                        return exit_code
+                else:
+                    uvicorn.run(
+                        app, host=settings.app.bind_host, port=settings.app.bind_port,
+                        reload=args.reload, log_config=None,
+                    )
             finally:
                 stop.set()
                 if opener:

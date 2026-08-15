@@ -170,17 +170,34 @@ export type ConfigurationStatus = {
   api_key_environment_override: boolean;
   api_key_local_saved: boolean;
   credential_error: boolean;
+  model_preference_error: boolean;
   scheduler?: { message?: string };
+};
+
+export type LlmProbe = {
+  ok: boolean;
+  model_id?: string;
+  configured_model: string;
+  latency_ms?: number;
+  error?: string;
 };
 
 export type LlmHealth = {
   ok: boolean;
   configured: boolean;
-  model_id: string;
+  model_id?: string;
   endpoint?: string;
   latency_ms?: number;
   error?: string;
+  available_models?: string[];
+  unavailable_configured_models?: string[];
+  routine_model?: string;
+  judgment_model?: string;
+  routine?: LlmProbe;
+  judgment?: LlmProbe;
 };
+
+export type ModelSelection = { routine_model: string; judgment_model: string };
 
 export type DailySummary = { summary_text?: string; updated_at?: string };
 export type SourceCaptureResult = { duplicate: boolean; source?: Source };

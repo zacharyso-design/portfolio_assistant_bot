@@ -11,7 +11,8 @@ Controls:
 - HTTPS and a stable configured host/port are mandatory.
 - TLS verification is always enabled; an optional CA bundle replaces the trust path without disabling verification.
 - Redirect following is disabled; an off-host redirect is explicitly rejected.
-- A key entered in Settings is Windows-DPAPI encrypted under local application data. `GENAI_API_KEY` takes priority when present; neither status nor health responses contain the key.
+- A key entered in Settings is Windows-DPAPI encrypted under local application data and takes priority. `GENAI_API_KEY` remains a fallback when no local key is saved; neither status nor health responses contain the key.
+- The Settings health action reads the same-host OpenAI-compatible `/v1/models` catalog with redirects disabled, then runs a small JSON-only probe for each selected model. Routine and judgment choices are written atomically under local application data, outside OneDrive, and apply immediately without a restart.
 - Source text is delimited and labeled as untrusted evidence, with the JSON-only output contract repeated adjacent to the data.
 - Requests use temperature `0.0`, explicit token bounds, and JSON Schema response format. An HTTP 400 caches a process-lifetime fallback to JSON Object mode.
 - Successful content is accepted only from `choices[0].message.content`. The parser accepts a plain object, a fenced object, an object surrounded by prose, and invalid Windows-path backslashes without corrupting valid JSON escapes. Invalid output receives a corrective retry containing the bounded prior reply; there are never more than three attempts.
@@ -28,4 +29,4 @@ Controls:
 - Status/priority recommendations go to Review Queue; action closure requests always go to review.
 - Logs and raised HTTP details do not include prompts, source bodies, keys, or model responses.
 
-Open **Settings** and choose **Test API health**, or run `portfolio-assistant --config config.toml config-test --connect`. Both report a safe success/error and model ID without revealing the key or sending project data.
+Open **Settings** and choose **Refresh models & test API**, or run `portfolio-assistant --config config.toml config-test --connect`. Both report a safe success/error without revealing the key or sending project data; the Settings action also refreshes the selectable model catalog and tests both chosen models.

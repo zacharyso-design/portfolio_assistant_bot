@@ -4,6 +4,8 @@ param()
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
+$artifactDirectory = Join-Path $repoRoot 'dist'
+$artifactPath = Join-Path $artifactDirectory 'CHIO-Portfolio-Assistant-Windows.zip'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run scripts\Install.ps1 first.' }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw 'Git is required to verify the Node-free frontend bundle.'
@@ -25,6 +27,7 @@ finally {
 
 Push-Location $repoRoot
 try {
+    New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
     $workPath = Join-Path $repoRoot "build\pyinstaller-$PID"
     $distPath = Join-Path $repoRoot "build\distribution-$PID"
     & $python -m PyInstaller --noconfirm --clean --onedir --name PortfolioAssistant `
@@ -43,7 +46,7 @@ try {
     Copy-Item -LiteralPath 'scripts\Start-Packaged.cmd' -Destination (Join-Path $bundle 'Start CHIO Portfolio Assistant.cmd') -Force
     Copy-Item -LiteralPath 'scripts\Install-MorningTask.ps1' -Destination $bundleScripts -Force
     Copy-Item -LiteralPath 'scripts\Remove-MorningTask.ps1' -Destination $bundleScripts -Force
-    Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath 'dist\CHIO-Portfolio-Assistant-Windows.zip' -Force
+    Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath $artifactPath -Force
 }
 finally {
     Pop-Location

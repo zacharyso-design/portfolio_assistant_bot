@@ -85,6 +85,11 @@ class ApiKeyUpdate(StrictModel):
     api_key: SecretStr = Field(min_length=1, max_length=20_000)
 
 
+class ModelSelection(StrictModel):
+    routine_model: str = Field(min_length=1, max_length=256)
+    judgment_model: str = Field(min_length=1, max_length=256)
+
+
 class ActionCreate(StrictModel):
     description: str
     assignee_type: str = "me"
@@ -254,6 +259,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.delete("/api/llm/credential")
     def remove_llm_credential() -> dict[str, Any]:
         return service.remove_llm_api_key()
+
+    @app.put("/api/llm/models")
+    def save_llm_models(body: ModelSelection) -> dict[str, Any]:
+        return service.save_llm_models(body.routine_model, body.judgment_model)
 
     @app.post("/api/llm/health")
     def llm_health() -> dict[str, Any]:

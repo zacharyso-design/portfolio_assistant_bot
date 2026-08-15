@@ -18,6 +18,9 @@ import httpx
 
 from .config import LlmSettings
 from .credentials import CredentialError, CredentialStore, WindowsDpapiCredentialStore
+from .preferences import (
+    JsonModelPreferenceStore, ModelPreferenceError, ModelPreferenceStore, valid_model_id,
+)
 
 
 class LlmUnavailable(RuntimeError):
@@ -34,7 +37,9 @@ class LlmProtocolError(LlmContractError):
 
 class LlmAdapter(Protocol):
     model_id: str
+    judgment_model_id: str
     endpoint_url: str | None
+    model_preference_error: bool
 
     def model_for(self, purpose: str) -> str: ...
 
@@ -47,11 +52,13 @@ class LlmAdapter(Protocol):
     ) -> dict[str, Any]: ...
     def living_summary(self, project: dict[str, Any], knowledge_items: list[dict[str, Any]]) -> dict[str, Any]: ...
     def daily(self, evidence: list[dict[str, Any]], counts: dict[str, Any]) -> dict[str, Any]: ...
-    def test_connection(self) -> dict[str, Any]: ...
+    def test_connection(self, model_id: str | None = None) -> dict[str, Any]: ...
     def analyze_image(self, image_bytes: bytes, mime_type: str, instruction: str) -> dict[str, Any]: ...
     def credential_status(self) -> dict[str, Any]: ...
     def save_api_key(self, api_key: str) -> dict[str, Any]: ...
     def remove_api_key(self) -> dict[str, Any]: ...
+    def list_models(self) -> list[str]: ...
+    def save_models(self, routine_model: str, judgment_model: str) -> dict[str, str]: ...
 
 
 @dataclass
@@ -59,6 +66,12 @@ class FakeLlmAdapter:
     model_id: str = "fake-llm-v1"
     available: bool = True
     endpoint_url: str | None = None
+    judgment_model_id: str = ""
+    model_preference_error: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.judgment_model_id:
+            self.judgment_model_id = self.model_id
 
     def model_for(self, purpose: str) -> str:
         return self.model_id
@@ -211,9 +224,13 @@ class FakeLlmAdapter:
             "update_ids": [item["update_id"] for item in evidence if item.get("kind") == "project_update"],
         }
 
-    def test_connection(self) -> dict[str, Any]:
+    def test_connection(self, model_id: str | None = None) -> dict[str, Any]:
         self._check()
-        return {"ok": True, "model_id": self.model_id, "adapter": "fake"}
+        configured_model = model_id or self.model_id
+        return {
+            "ok": True, "model_id": configured_model,
+            "configured_model": configured_model, "adapter": "fake",
+        }
 
     def analyze_image(self, image_bytes: bytes, mime_type: str, instruction: str) -> dict[str, Any]:
         self._check()
@@ -230,6 +247,18 @@ class FakeLlmAdapter:
 
     def remove_api_key(self) -> dict[str, Any]:
         raise LlmContractError("The fake test adapter does not use an API key")
+
+    def list_models(self) -> list[str]:
+        return sorted({self.model_id, self.judgment_model_id}, key=str.casefold)
+
+    def save_models(self, routine_model: str, judgment_model: str) -> dict[str, str]:
+        routine = routine_model.strip()
+        judgment = judgment_model.strip()
+        if not routine or not judgment:
+            raise LlmContractError("Choose a model for both routine and judgment work")
+        self.model_id = routine
+        self.judgment_model_id = judgment
+        return {"routine_model": routine, "judgment_model": judgment}
 
 
 _OUTPUT_CONTRACT = (
@@ -389,13 +418,24 @@ class InternalHttpLlmAdapter:
 
     def __init__(
         self, settings: LlmSettings, *, credential_store: CredentialStore | None = None,
+        model_preference_store: ModelPreferenceStore | None = None,
         client_factory: Callable[..., Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ):
         self.settings = settings
-        self.model_id = settings.model
         self._credential_store = credential_store or WindowsDpapiCredentialStore()
+        self._model_preference_store = model_preference_store or JsonModelPreferenceStore()
+        self.model_preference_error = False
+        try:
+            preferences = self._model_preference_store.load()
+        except ModelPreferenceError:
+            preferences = None
+            self.model_preference_error = True
+        self.model_id = preferences["routine_model"] if preferences else settings.model
+        self.judgment_model_id = (
+            preferences["judgment_model"] if preferences else settings.judgment_model
+        )
         self._client_factory = client_factory or httpx.Client
         self._clock = clock
         self._sleeper = sleeper
@@ -414,7 +454,25 @@ class InternalHttpLlmAdapter:
             raise LlmContractError("LLM chat URL must remain on the configured HTTPS host")
 
     def model_for(self, purpose: str) -> str:
-        return self.settings.judgment_model if purpose in self._JUDGMENT_PURPOSES else self.settings.model
+        return self.judgment_model_id if purpose in self._JUDGMENT_PURPOSES else self.model_id
+
+    @staticmethod
+    def _valid_model_id(value: str) -> bool:
+        return valid_model_id(value)
+
+    def save_models(self, routine_model: str, judgment_model: str) -> dict[str, str]:
+        routine = routine_model.strip()
+        judgment = judgment_model.strip()
+        if not self._valid_model_id(routine) or not self._valid_model_id(judgment):
+            raise LlmUnavailable("Choose a valid model for both routine and judgment work")
+        try:
+            self._model_preference_store.save(routine, judgment)
+        except ModelPreferenceError as exc:
+            raise LlmUnavailable(str(exc)) from exc
+        self.model_preference_error = False
+        self.model_id = routine
+        self.judgment_model_id = judgment
+        return {"routine_model": routine, "judgment_model": judgment}
 
     def credential_status(self) -> dict[str, Any]:
         environment_present = bool(os.environ.get(self.settings.api_key_env, "").strip())
@@ -427,16 +485,21 @@ class InternalHttpLlmAdapter:
                 "environment_override": environment_present,
                 "local_key_present": True, "credential_error": True,
             }
+        if stored:
+            return {
+                "configured": True, "source": "encrypted_local", "environment_override": False,
+                "local_key_present": True,
+            }
         if environment_present:
             return {
                 "configured": True, "source": "environment", "environment_override": True,
-                "local_key_present": stored,
+                "local_key_present": False,
             }
         return {
-            "configured": stored,
-            "source": "encrypted_local" if stored else "none",
+            "configured": False,
+            "source": "none",
             "environment_override": False,
-            "local_key_present": stored,
+            "local_key_present": False,
         }
 
     def save_api_key(self, api_key: str) -> dict[str, Any]:
@@ -453,17 +516,69 @@ class InternalHttpLlmAdapter:
             raise LlmUnavailable(str(exc)) from exc
         return {**self.credential_status(), "removed": removed}
 
-    def _api_key(self) -> str:
-        environment_key = os.environ.get(self.settings.api_key_env, "").strip()
-        if environment_key:
-            return environment_key
+    def _active_api_key(self) -> tuple[str, str]:
         try:
             stored = self._credential_store.get()
         except CredentialError as exc:
             raise LlmUnavailable(str(exc)) from exc
-        if not stored:
-            raise LlmUnavailable("No GenAI.mil API key is configured; save one in Settings")
-        return stored
+        if stored:
+            return stored, "encrypted_local"
+        environment_key = os.environ.get(self.settings.api_key_env, "").strip()
+        if environment_key:
+            return environment_key, "environment"
+        raise LlmUnavailable("No GenAI.mil API key is configured; save one in Settings")
+
+    def list_models(self) -> list[str]:
+        key, credential_source = self._active_api_key()
+        models_url = urljoin(self.settings.base_url.rstrip("/") + "/", "v1/models")
+        target = urlparse(models_url)
+        if target.hostname != self._base.hostname or target.port != self._base.port:
+            raise LlmContractError("LLM models URL must remain on the configured HTTPS host")
+        headers = {
+            self.settings.auth_header: f"{self.settings.auth_scheme} {key}".strip(),
+            "Accept": "application/json",
+        }
+        verify: bool | str = self.settings.ca_bundle or True
+        try:
+            with self._client_factory(
+                timeout=self.settings.timeout_seconds, verify=verify, follow_redirects=False,
+            ) as client:
+                response = client.get(models_url, headers=headers)
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as exc:
+            raise LlmUnavailable("The GenAI.mil model catalog could not be reached") from exc
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("location", "")
+            redirected = urlparse(urljoin(models_url, location))
+            if redirected.hostname != self._base.hostname or redirected.port != self._base.port:
+                raise LlmUnavailable("The AI endpoint attempted an off-host redirect")
+            raise LlmUnavailable("The AI endpoint returned a redirect; redirects are disabled")
+        if response.status_code in {401, 403}:
+            credential_label = (
+                "API key saved in Settings" if credential_source == "encrypted_local"
+                else f"{self.settings.api_key_env} environment fallback"
+            )
+            raise LlmUnavailable(
+                f"GenAI.mil rejected the {credential_label} (HTTP {response.status_code})"
+            )
+        if response.status_code >= 400:
+            raise LlmUnavailable(
+                f"The GenAI.mil model catalog returned HTTP {response.status_code}"
+            )
+        try:
+            decoded = response.json()
+            items = decoded["data"]
+            model_ids = {
+                item["id"].strip() for item in items
+                if (
+                    isinstance(item, dict) and isinstance(item.get("id"), str)
+                    and self._valid_model_id(item["id"].strip())
+                )
+            }
+        except (ValueError, TypeError, KeyError) as exc:
+            raise LlmProtocolError("The GenAI.mil model catalog response was malformed") from exc
+        if not model_ids:
+            raise LlmProtocolError("The GenAI.mil model catalog returned no models")
+        return sorted(model_ids, key=str.casefold)
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> float | None:
@@ -536,7 +651,7 @@ class InternalHttpLlmAdapter:
         max_tokens_override: int | None = None,
     ) -> dict[str, Any]:
         self._request_context.reported_model = None
-        key = self._api_key()
+        key, credential_source = self._active_api_key()
         auth_value = f"{self.settings.auth_scheme} {key}".strip()
         headers = {self.settings.auth_header: auth_value, "Content-Type": "application/json"}
         verify: bool | str = self.settings.ca_bundle or True
@@ -596,7 +711,13 @@ class InternalHttpLlmAdapter:
                     continue
                 raise last_error
             if status in {401, 403}:
-                raise LlmUnavailable(f"GenAI.mil rejected the configured API key (HTTP {status})")
+                credential_label = (
+                    "API key saved in Settings" if credential_source == "encrypted_local"
+                    else f"{self.settings.api_key_env} environment fallback"
+                )
+                raise LlmUnavailable(
+                    f"GenAI.mil rejected the {credential_label} (HTTP {status})"
+                )
             if status == 429 or status >= 500:
                 last_error = LlmUnavailable(f"The GenAI.mil endpoint returned transient HTTP {status}")
                 if attempt < self.settings.max_attempts:
@@ -652,7 +773,7 @@ class InternalHttpLlmAdapter:
         ]
         return self._call(
             "image_analysis", {}, messages_override=messages,
-            model_override=self.settings.model, max_tokens_override=4_000,
+            model_override=self.model_id, max_tokens_override=4_000,
         )
 
     def knowledge_update(self, summary: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
@@ -705,14 +826,18 @@ class InternalHttpLlmAdapter:
     def daily(self, evidence: list[dict[str, Any]], counts: dict[str, Any]) -> dict[str, Any]:
         return self._call("daily_update", {"evidence": evidence, "counts": counts})
 
-    def test_connection(self) -> dict[str, Any]:
+    def test_connection(self, model_id: str | None = None) -> dict[str, Any]:
+        configured_model = model_id or self.model_id
         started = self._clock()
-        result = self._call("connection_test", {"instruction": "Return {\"ok\": true}."})
+        result = self._call(
+            "connection_test", {"instruction": "Return {\"ok\": true}."},
+            model_override=configured_model,
+        )
         reported_model = getattr(self._request_context, "reported_model", None)
         return {
             "ok": result.get("ok") is True,
-            "model_id": reported_model or self.model_id,
-            "configured_model": self.model_id,
+            "model_id": reported_model or configured_model,
+            "configured_model": configured_model,
             "adapter": "internal",
             "endpoint": self._url,
             "latency_ms": round((self._clock() - started) * 1000),

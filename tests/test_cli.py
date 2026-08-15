@@ -1,9 +1,146 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import threading
 
 from portfolio_assistant import cli
+
+
+def test_windows_selector_loop_factory_sets_the_current_loop():
+    loop = cli._windows_selector_loop()
+    try:
+        assert isinstance(loop, asyncio.SelectorEventLoop)
+        assert asyncio.get_event_loop() is loop
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def test_launch_uses_selector_event_loop_on_windows(settings, monkeypatch):
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class InspectingServer:
+        started = True
+
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def serve(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        def run(self) -> None:
+            raise AssertionError("Windows startup must not use Uvicorn's Proactor-based runner")
+
+    def reject_default_runner(*args, **kwargs) -> None:
+        raise AssertionError("Windows launch must bypass Uvicorn's Proactor-based runner")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "_app_is_running", lambda _: False)
+    monkeypatch.setattr(cli, "_open_app_when_ready", lambda *args: None)
+    monkeypatch.setattr(cli, "create_app", lambda _: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", InspectingServer)
+    monkeypatch.setattr(cli.uvicorn, "run", reject_default_runner)
+
+    assert cli.main(["--config", "unused.toml", "launch"]) == 0
+    assert len(observed_loops) == 1
+    assert isinstance(observed_loops[0], asyncio.SelectorEventLoop)
+
+
+def test_launch_returns_uvicorn_failure_when_server_never_starts(settings, monkeypatch):
+    class FailedServer:
+        started = False
+
+        def __init__(self, config) -> None:
+            self.config = config
+
+        async def serve(self) -> None:
+            return None
+
+        def run(self) -> None:
+            raise AssertionError("Windows startup must not use Uvicorn's Proactor-based runner")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "_app_is_running", lambda _: False)
+    monkeypatch.setattr(cli, "_open_app_when_ready", lambda *args: None)
+    monkeypatch.setattr(cli, "create_app", lambda _: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", FailedServer)
+
+    assert cli.main(["--config", "unused.toml", "launch"]) == 3
+
+
+def test_run_server_preserves_uvicorn_runner_on_other_platforms(monkeypatch):
+    calls: list[str] = []
+
+    class InspectingServer:
+        started = True
+
+        async def serve(self) -> None:
+            raise AssertionError("Non-Windows startup must retain Uvicorn's runner")
+
+        def run(self) -> None:
+            calls.append("run")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert cli._run_server(InspectingServer()) == 0
+    assert calls == ["run"]
+
+
+def test_run_server_treats_keyboard_interrupt_as_normal_windows_shutdown(monkeypatch, capsys):
+    class InterruptingServer:
+        started = True
+
+        async def serve(self) -> None:
+            raise KeyboardInterrupt
+
+        def run(self) -> None:
+            raise AssertionError("Windows startup must not use Uvicorn's Proactor-based runner")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert cli._run_server(InterruptingServer()) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_run_server_treats_keyboard_interrupt_as_normal_non_windows_shutdown(monkeypatch):
+    class InterruptingServer:
+        started = True
+
+        async def serve(self) -> None:
+            raise AssertionError("Non-Windows startup must retain Uvicorn's runner")
+
+        def run(self) -> None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert cli._run_server(InterruptingServer()) == 0
+
+
+def test_serve_reload_preserves_uvicorn_runner(settings, monkeypatch):
+    app = object()
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def record_run(selected_app, **kwargs) -> None:
+        calls.append((selected_app, kwargs))
+
+    class UnexpectedServer:
+        def __init__(self, config) -> None:
+            raise AssertionError("serve --reload must retain uvicorn.run")
+
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "create_app", lambda _: app)
+    monkeypatch.setattr(cli.uvicorn, "run", record_run)
+    monkeypatch.setattr(cli.uvicorn, "Server", UnexpectedServer)
+
+    assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
+    assert calls == [(app, {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "reload": True,
+        "log_config": None,
+    })]
 
 
 def test_launch_opens_an_existing_server(settings, monkeypatch):

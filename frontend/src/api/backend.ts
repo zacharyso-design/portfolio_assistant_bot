@@ -8,6 +8,7 @@ import type {
   DailySummary,
   Group,
   LlmHealth,
+  ModelSelection,
   Project,
   ProjectDetail,
   RebuildKnowledgeResult,
@@ -49,6 +50,7 @@ export const backend = {
     get: () => apiClient.get<ConfigurationStatus>("/api/configuration"),
     saveCredential: (apiKey: string) => apiClient.put<void>("/api/llm/credential", { api_key: apiKey }),
     removeCredential: () => apiClient.delete<void>("/api/llm/credential"),
+    saveModels: (selection: ModelSelection) => apiClient.put<ModelSelection>("/api/llm/models", selection),
     testHealth: () => apiClient.post<LlmHealth>("/api/llm/health", {}),
   },
   groups: {

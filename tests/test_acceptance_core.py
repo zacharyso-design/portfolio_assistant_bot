@@ -4,8 +4,10 @@ import csv
 import io
 import hashlib
 import json
+import re
 import sqlite3
 import time
+import zipfile
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -111,14 +113,29 @@ def snow_csv(comments: str, *, updated: str = "2026-08-12 10:00:00", state: str 
     return output.getvalue().encode("utf-8")
 
 
-def snow_xlsx(comments: str) -> bytes:
+def snow_xlsx(comments: str, *, underreported_dimensions: bool = False) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["Number", "Short description", "Assignment group", "Updated", "Comments and Work notes"])
     sheet.append(["REQ0099002", "Fictional XLSX Intake", "Fictional Infrastructure", datetime(2026, 8, 12, 11, 0), comments])
     stream = io.BytesIO()
     workbook.save(stream)
-    return stream.getvalue()
+    data = stream.getvalue()
+    if not underreported_dimensions:
+        return data
+    broken = io.BytesIO()
+    replacements = 0
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(broken, "w") as target:
+        for item in source.infolist():
+            payload = source.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                payload, count = re.subn(
+                    br'<dimension ref="[^"]+"', b'<dimension ref="A1"', payload, count=1
+                )
+                replacements += count
+            target.writestr(item, payload)
+    assert replacements == 1, "Test fixture did not rewrite exactly one worksheet dimension"
+    return broken.getvalue()
 
 
 def test_environment_loopback_configuration_and_restart(settings, client: TestClient):
@@ -330,7 +347,7 @@ def test_snow_csv_xlsx_incremental_stale_and_malformed(client: TestClient, servi
         ).fetchall()
         assert [row["text"] for row in comments] == ["Initial fictional design approved.", "First new fictional entry.", "Second new fictional entry."]
     xlsx_comment = "2026-08-12 10:30:00 - Jordan Lee (Work note)\nFictional XLSX entry."
-    xlsx = client.post("/api/import/servicenow", files={"file": ("snow.xlsx", snow_xlsx(xlsx_comment), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}).json()
+    xlsx = client.post("/api/import/servicenow", files={"file": ("snow.xlsx", snow_xlsx(xlsx_comment, underreported_dimensions=True), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}).json()
     assert xlsx["new_comments_applied"] == 1
     malformed = client.post("/api/import/servicenow", files={"file": ("bad.csv", snow_csv("Freeform text without a deterministic header", updated="2026-08-13 12:00:00"), "text/csv")}).json()
     assert malformed["review_or_error_count"] == 1

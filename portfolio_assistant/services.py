@@ -3273,6 +3273,10 @@ class PortfolioService:
         workbook = load_workbook(path, read_only=True, data_only=True)
         try:
             sheet = workbook.active
+            # Some ServiceNow-generated workbooks underreport their used range as A1 even
+            # though the worksheet contains a full table. Read-only mode otherwise trusts
+            # that metadata and silently returns only the first header cell.
+            sheet.reset_dimensions()
             iterator = sheet.iter_rows(values_only=True)
             header = next(iterator, None)
             if not header:

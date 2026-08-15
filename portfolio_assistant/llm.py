@@ -562,11 +562,13 @@ class InternalHttpLlmAdapter:
                 else f"{self.settings.api_key_env} environment fallback"
             )
             raise LlmUnavailable(
-                f"GenAI.mil rejected the {credential_label} (HTTP {response.status_code})"
+                self._rejection_message(credential_label, response.status_code, response)
             )
         if response.status_code >= 400:
+            detail = self._error_detail(response)
+            suffix = f": {detail}" if detail else ""
             raise LlmUnavailable(
-                f"The GenAI.mil model catalog returned HTTP {response.status_code}"
+                f"The GenAI.mil model catalog returned HTTP {response.status_code}{suffix}"
             )
         try:
             decoded = response.json()
@@ -583,6 +585,42 @@ class InternalHttpLlmAdapter:
         if not model_ids:
             raise LlmProtocolError("The GenAI.mil model catalog returned no models")
         return sorted(model_ids, key=str.casefold)
+
+    @classmethod
+    def _rejection_message(
+        cls, credential_label: str, status: int, response: httpx.Response,
+    ) -> str:
+        message = f"GenAI.mil rejected the {credential_label} (HTTP {status})"
+        detail = cls._error_detail(response)
+        return f"{message}: {detail}" if detail else message
+
+    @staticmethod
+    def _error_detail(response: httpx.Response, limit: int = 300) -> str:
+        """Return a short, safe summary of an error response body.
+
+        GenAI.mil puts actionable guidance in the body of a rejection - notably
+        the unlock URL for a key that has hit its periodic auto-lock. Reporting
+        only the status code discards that and leaves the operator with an
+        unactionable "rejected the API key (HTTP 401)".
+        """
+        detail = ""
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                detail = str(error.get("message") or error.get("detail") or "")
+            elif isinstance(error, str):
+                detail = error
+            if not detail:
+                detail = str(payload.get("message") or payload.get("detail") or "")
+        if not detail:
+            detail = response.text
+        detail = re.sub(r"<[^>]+>", " ", detail)
+        detail = re.sub(r"\s+", " ", detail).strip()
+        return detail[:limit]
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> float | None:
@@ -720,7 +758,7 @@ class InternalHttpLlmAdapter:
                     else f"{self.settings.api_key_env} environment fallback"
                 )
                 raise LlmUnavailable(
-                    f"GenAI.mil rejected the {credential_label} (HTTP {status})"
+                    self._rejection_message(credential_label, status, response)
                 )
             if status == 429 or status >= 500:
                 last_error = LlmUnavailable(f"The GenAI.mil endpoint returned transient HTTP {status}")

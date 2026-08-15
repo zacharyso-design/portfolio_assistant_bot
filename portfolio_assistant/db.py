@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+ALREADY_APPLIED_MESSAGE = re.compile(r"duplicate column name|already exists", re.IGNORECASE)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -46,6 +49,25 @@ class Database:
         finally:
             connection.close()
 
+    @staticmethod
+    def _split_statements(script: str) -> Iterator[str]:
+        """Split a migration into statements, keeping CREATE TRIGGER bodies intact.
+
+        ``sqlite3.complete_statement`` understands that a trigger is not finished
+        until its ``END;``, so nested semicolons do not split the body.
+        """
+        buffer = ""
+        for line in script.splitlines(keepends=True):
+            buffer += line
+            if sqlite3.complete_statement(buffer):
+                statement = buffer.strip()
+                if statement:
+                    yield statement
+                buffer = ""
+        remainder = buffer.strip()
+        if remainder:
+            yield remainder
+
     def migrate(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         migration_dir = Path(__file__).with_name("migrations")
@@ -57,11 +79,31 @@ class Database:
                 ).fetchone() if self._table_exists(connection, "schema_migrations") else None
                 if exists:
                     continue
-                connection.executescript(migration.read_text(encoding="utf-8"))
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (version, utc_now()),
-                )
+                # executescript() commits after every statement, which would leave a
+                # half-applied schema with no recorded version if the process died
+                # mid-migration; the next start then fails on "duplicate column name"
+                # and the application never opens again. Applying the statements and
+                # the version row in one transaction makes an interrupted migration
+                # roll back cleanly and simply replay on the next start.
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in self._split_statements(migration.read_text(encoding="utf-8")):
+                        try:
+                            connection.execute(statement)
+                        except sqlite3.OperationalError as exc:
+                            # Databases left half-migrated by an earlier build still
+                            # need to start: replay the migration and skip the parts
+                            # that are demonstrably already in place.
+                            if not ALREADY_APPLIED_MESSAGE.search(str(exc)):
+                                raise
+                    connection.execute(
+                        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (version, utc_now()),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
             self._install_search(connection)
             connection.commit()
 
@@ -95,9 +137,22 @@ class Database:
                 END;
                 """
             )
-            count = connection.execute("SELECT count(*) FROM source_chunks_fts").fetchone()[0]
-            source_count = connection.execute("SELECT count(*) FROM source_chunks").fetchone()[0]
-            if count != source_count:
+            # source_chunks_fts is an external-content table, so counting its rows
+            # reads source_chunks and can never detect a stale or empty index. Ask
+            # FTS5 instead. rank = 1 is required: the bare integrity-check only
+            # verifies the index is internally consistent, and an index that is
+            # simply empty is perfectly consistent with itself.
+            try:
+                connection.execute(
+                    "INSERT INTO source_chunks_fts(source_chunks_fts, rank)"
+                    " VALUES ('integrity-check', 1)"
+                )
+            except sqlite3.OperationalError:
+                # SQLite older than 3.37 cannot compare against the content table.
+                connection.execute(
+                    "INSERT INTO source_chunks_fts(source_chunks_fts) VALUES ('integrity-check')"
+                )
+            except sqlite3.DatabaseError:
                 connection.execute("INSERT INTO source_chunks_fts(source_chunks_fts) VALUES ('rebuild')")
             self.fts_mode = "fts5"
         except sqlite3.OperationalError:

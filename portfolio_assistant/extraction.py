@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import re
 from dataclasses import dataclass, field
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import extract_msg
@@ -18,6 +19,11 @@ from pypdf import PdfReader
 
 SUPPORTED_SUFFIXES = {".eml", ".msg", ".txt", ".md", ".vtt", ".srt", ".docx", ".pdf", ".xlsx"}
 TRANSCRIPT_SUFFIXES = {".vtt", ".srt"}
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 class UnsupportedSource(ValueError):
@@ -57,9 +63,49 @@ def normalize_text(value: str) -> str:
 
 
 def safe_filename(value: str, fallback: str = "source") -> str:
-    name = Path(value or fallback).name
+    """Reduce an untrusted name to one safe Windows filename.
+
+    Windows separator semantics are applied on every platform so the stored name
+    never depends on the host OS: ``Path().name`` does not treat a backslash as a
+    separator on POSIX, which leaves traversal segments such as ``..\\..\\evil.txt``
+    embedded in the stored name.
+    """
+    raw = str(value or fallback).replace("/", "\\")
+    name = PureWindowsPath(raw).name
     name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "_", name).strip(" .")
-    return (name[:180] or fallback)
+    name = name[:180].strip(" .")
+    if not name:
+        return fallback
+    if PureWindowsPath(name).stem.upper() in WINDOWS_RESERVED_NAMES:
+        # CON, NUL, COM1 and friends resolve to devices rather than files, so an
+        # archive copy written under that name silently discards its bytes.
+        name = f"_{name}"
+    return name
+
+
+def decode_text_bytes(path: Path) -> str:
+    """Decode a plain-text source, honouring byte-order marks before falling back.
+
+    cp1252 accepts any byte sequence, so without the BOM check a UTF-16 file
+    decodes to NUL-riddled mojibake instead of raising.
+    """
+    raw = path.read_bytes()
+    # UTF-32 LE starts with the UTF-16 LE mark, so it has to be tested first.
+    for mark, encoding in (
+        (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+    ):
+        if raw.startswith(mark):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError as exc:
+                raise ExtractionFailure("The text file encoding is unsupported") from exc
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ExtractionFailure("The text file encoding is unsupported")
 
 
 def html_to_text(value: str) -> str:
@@ -281,13 +327,7 @@ def extract_source(path: Path, *, max_attachments: int, max_text_bytes: int) -> 
     elif suffix == ".xlsx":
         result = _extract_xlsx(path)
     else:
-        try:
-            text = path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                text = path.read_text(encoding="cp1252")
-            except UnicodeDecodeError as exc:
-                raise ExtractionFailure("The text file encoding is unsupported") from exc
+        text = decode_text_bytes(path)
         if not text.strip():
             raise UnsupportedSource("The text file is empty")
         result = ExtractedSource(suffix.lstrip("."), None, {}, _chunk_lines(text, "lines"))

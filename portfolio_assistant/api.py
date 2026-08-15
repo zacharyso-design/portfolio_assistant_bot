@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import date
@@ -21,6 +22,11 @@ from .llm import LlmContractError, LlmUnavailable, build_adapter
 from .services import (
     ConflictError, NotFoundError, PortfolioService, ValidationError,
 )
+
+
+LOGGER = logging.getLogger(__name__)
+WORKER_MAX_BACKOFF_MULTIPLIER = 30
+SHUTDOWN_GRACE_SECONDS = 10.0
 
 
 class StrictModel(BaseModel):
@@ -200,10 +206,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stop = asyncio.Event()
 
         async def worker() -> None:
+            consecutive_failures = 0
             while not stop.is_set():
-                await asyncio.to_thread(service.process_pending, manual=False, limit=10)
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=settings.app.worker_poll_seconds)
+                    await asyncio.to_thread(service.process_pending, manual=False, limit=10)
+                    consecutive_failures = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A single filesystem, OneDrive or SQLite error must not end the
+                    # worker: an unguarded raise here leaves every future upload stuck
+                    # in 'captured' with no error surfaced anywhere in the interface.
+                    consecutive_failures += 1
+                    LOGGER.exception(
+                        "Background source processing failed (attempt %s); retrying",
+                        consecutive_failures,
+                    )
+                multiplier = min(2 ** consecutive_failures, WORKER_MAX_BACKOFF_MULTIPLIER)
+                delay = settings.app.worker_poll_seconds * (multiplier if consecutive_failures else 1)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=delay)
                 except asyncio.TimeoutError:
                     pass
 
@@ -218,8 +240,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stop.set()
         if task:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # cancel() cannot interrupt work already running inside to_thread, so an
+            # in-flight batch of LLM calls would otherwise hold shutdown for as long
+            # as its timeouts and retries take.
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=SHUTDOWN_GRACE_SECONDS)
 
     app = FastAPI(title="CHIO Portfolio Assistant", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings

@@ -84,6 +84,16 @@ class UnexpectedSummaryError(RuntimeError):
     pass
 
 
+def _like_pattern(value: str, limit: int = 200) -> str:
+    """Build a contains-pattern with LIKE wildcards escaped.
+
+    Callers must pair this with ESCAPE '\\' so that a query containing % or _
+    matches those characters literally instead of matching every row.
+    """
+    escaped = value[:limit].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -211,8 +221,13 @@ class PortfolioService:
                 counts["projects"] += 1
 
         with self.db.connect() as connection:
+            # snow_comments rows point original_path at the shared multi-ticket
+            # export and legitimately carry no ingestion_path, so migrating them
+            # here would copy every ticket's export into each ticket's project
+            # folder — leaking other projects' work notes across the portfolio.
             roots = connection.execute(
-                "SELECT * FROM sources WHERE parent_source_id IS NULL AND ingestion_path IS NULL ORDER BY id"
+                "SELECT * FROM sources WHERE parent_source_id IS NULL AND ingestion_path IS NULL"
+                " AND source_type <> 'snow_comments' ORDER BY id"
             ).fetchall()
         for source in roots:
             ingestion_id = str(source["ingestion_id"] or self._legacy_ingestion_id(source))
@@ -774,9 +789,9 @@ class PortfolioService:
         clauses: list[str] = []
         params: list[Any] = []
         if query.strip():
-            pattern = f"%{query.strip()[:200]}%"
+            pattern = _like_pattern(query.strip())
             clauses.append(
-                "(p.name LIKE ? OR p.snow_number LIKE ? OR p.owner_text LIKE ? OR p.assignment_group LIKE ? OR p.next_action LIKE ? OR p.latest_change LIKE ?)"
+                "(p.name LIKE ? ESCAPE '\\' OR p.snow_number LIKE ? ESCAPE '\\' OR p.owner_text LIKE ? ESCAPE '\\' OR p.assignment_group LIKE ? ESCAPE '\\' OR p.next_action LIKE ? ESCAPE '\\' OR p.latest_change LIKE ? ESCAPE '\\')"
             )
             params.extend([pattern] * 6)
         if portfolio_group_id is not None:
@@ -1941,23 +1956,42 @@ class PortfolioService:
         ).fetchone()
         if not row:
             raise LlmContractError("Citation source excerpt is unavailable")
-        citation_key = f"{citation['source_id']}:{citation['chunk_id']}"
-        citation_id = f"C-{hashlib.sha256(citation_key.encode()).hexdigest()[:8].upper()}"
         package = Path(root_source["ingestion_path"] or Path(root_source["original_path"]).parent)
         original_path = Path(row["original_path"])
         try:
             original_relative = original_path.resolve().relative_to(package.resolve()).as_posix()
         except ValueError:
             original_relative = f"Original/{safe_filename(row['original_filename'], 'source')}"
-        connection.execute(
-            """INSERT OR IGNORE INTO citation_records(
-               id, source_id, chunk_id, original_relative_path, display_name, source_type,
-               locator, excerpt, source_date, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (citation_id, root_source["id"], row["id"], original_relative,
-             row["original_filename"], row["source_type"], row["locator"], row["text"][:1200],
-             row["meeting_date"] or row["created_at"], now),
-        )
+        existing = connection.execute(
+            "SELECT id FROM citation_records WHERE source_id = ? AND chunk_id = ?",
+            (root_source["id"], row["id"]),
+        ).fetchone()
+        if existing:
+            citation_id = str(existing["id"])
+        else:
+            # A truncated hash is only 32 bits, so identifiers collide well within a
+            # single portfolio's citation count. INSERT OR IGNORE would silently keep
+            # the row that got there first and hand this project the other project's
+            # citation, exposing an unrelated original file. Lengthen on collision.
+            citation_key = f"{citation['source_id']}:{citation['chunk_id']}"
+            digest = hashlib.sha256(citation_key.encode()).hexdigest().upper()
+            citation_id = f"C-{digest}"
+            for length in range(8, len(digest), 4):
+                candidate = f"C-{digest[:length]}"
+                if not connection.execute(
+                    "SELECT 1 FROM citation_records WHERE id = ?", (candidate,)
+                ).fetchone():
+                    citation_id = candidate
+                    break
+            connection.execute(
+                """INSERT OR IGNORE INTO citation_records(
+                   id, source_id, chunk_id, original_relative_path, display_name, source_type,
+                   locator, excerpt, source_date, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (citation_id, root_source["id"], row["id"], original_relative,
+                 row["original_filename"], row["source_type"], row["locator"], row["text"][:1200],
+                 row["meeting_date"] or row["created_at"], now),
+            )
         return {
             "source_id": int(citation["source_id"]),
             "chunk_id": int(citation["chunk_id"]),
@@ -2144,8 +2178,8 @@ class PortfolioService:
             clauses.append("k.category = ?")
             params.append(category)
         if query.strip():
-            clauses.append("k.text LIKE ?")
-            params.append(f"%{query.strip()[:200]}%")
+            clauses.append("k.text LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(query.strip()))
         with self.db.connect() as connection:
             self._project(connection, project_id)
             rows = connection.execute(
@@ -2678,7 +2712,7 @@ class PortfolioService:
         clean = normalize_text(query)
         if not clean:
             return []
-        pattern = f"%{clean[:200]}%"
+        pattern = _like_pattern(clean)
         limit = max(1, min(limit, 100))
         project_clause = " AND p.id = ?" if project_id else ""
         results: list[dict[str, Any]] = []
@@ -2687,7 +2721,7 @@ class PortfolioService:
                 f"""SELECT p.id AS project_id, p.name AS project_name, p.name AS title,
                            'project' AS result_type, p.name AS excerpt, NULL AS source_id,
                            NULL AS source_type, p.updated_at AS source_date
-                    FROM projects p WHERE p.name LIKE ?{project_clause}
+                    FROM projects p WHERE p.name LIKE ? ESCAPE '\\'{project_clause}
                     LIMIT ?""",
                 ((pattern, project_id, limit) if project_id else (pattern, limit)),
             ).fetchall():
@@ -2716,8 +2750,8 @@ class PortfolioService:
                            'source_ingestion' AS result_type, s.source_summary AS excerpt,
                            s.id AS source_id, s.source_type, coalesce(s.source_date, s.created_at) AS source_date
                     FROM sources s LEFT JOIN projects p ON p.id = s.project_id
-                    WHERE (s.source_title LIKE ? OR s.original_filename LIKE ? OR s.source_summary LIKE ?
-                           OR s.metadata_json LIKE ?) AND s.memory_state <> 'removed'{project_clause}
+                    WHERE (s.source_title LIKE ? ESCAPE '\\' OR s.original_filename LIKE ? ESCAPE '\\' OR s.source_summary LIKE ? ESCAPE '\\'
+                           OR s.metadata_json LIKE ? ESCAPE '\\') AND s.memory_state <> 'removed'{project_clause}
                     ORDER BY s.created_at DESC LIMIT ?""",
                 ((pattern, pattern, pattern, pattern, project_id, limit) if project_id
                  else (pattern, pattern, pattern, pattern, limit)),
@@ -2729,7 +2763,7 @@ class PortfolioService:
                            s.source_type, k.source_date
                     FROM knowledge_items k JOIN projects p ON p.id = k.project_id
                     JOIN sources s ON s.id = k.source_id
-                    WHERE (k.text LIKE ? OR k.category LIKE ?) AND s.memory_state = 'active'{project_clause}
+                    WHERE (k.text LIKE ? ESCAPE '\\' OR k.category LIKE ? ESCAPE '\\') AND s.memory_state = 'active'{project_clause}
                     ORDER BY k.created_at DESC LIMIT ?""",
                 ((pattern, pattern, project_id, limit) if project_id else (pattern, pattern, limit)),
             ).fetchall():
@@ -2742,7 +2776,7 @@ class PortfolioService:
                            f.id AS original_file_id
                     FROM original_files f JOIN sources s ON s.id = f.source_id
                     LEFT JOIN projects p ON p.id = s.project_id
-                    WHERE f.original_name LIKE ? AND s.memory_state <> 'removed'{project_clause}
+                    WHERE f.original_name LIKE ? ESCAPE '\\' AND s.memory_state <> 'removed'{project_clause}
                     ORDER BY f.created_at DESC LIMIT ?""",
                 ((pattern, project_id, limit) if project_id else (pattern, limit)),
             ).fetchall():
@@ -2756,7 +2790,7 @@ class PortfolioService:
                                c.locator
                         FROM source_chunks c JOIN sources s ON s.id = c.source_id
                         LEFT JOIN projects p ON p.id = c.project_id
-                        WHERE c.text LIKE ? AND s.memory_state <> 'removed'{project_clause}
+                        WHERE c.text LIKE ? ESCAPE '\\' AND s.memory_state <> 'removed'{project_clause}
                         ORDER BY c.id DESC LIMIT ?""",
                     ((pattern, project_id, limit) if project_id else (pattern, limit)),
                 ).fetchall():
@@ -3603,6 +3637,12 @@ class PortfolioService:
             self._set_source_state(source_id, "pending_ai", "llm_unavailable", exc, increment_retry=True)
             return "pending_ai"
         except (ExtractionFailure, LlmContractError, ValidationError) as exc:
+            self._set_source_state(source_id, "error", "multi_project_processing_failed", exc)
+            return "error"
+        except Exception as exc:  # noqa: BLE001 - must not strand the source in 'processing'
+            # Anything else (OSError from a locked OneDrive path, sqlite3 errors, a
+            # source removed mid-flight) would otherwise escape into the background
+            # worker and leave this source permanently in 'processing'.
             self._set_source_state(source_id, "error", "multi_project_processing_failed", exc)
             return "error"
 

@@ -22,6 +22,7 @@ from . import APPLICATION_ID
 from .config import Settings, diagnostic_log_path, ensure_runtime_paths, load_settings
 from .credentials import InvalidApiKeyError
 from .db import Database
+from .diagnostics import start_publisher
 from .llm import LlmContractError, LlmUnavailable, build_adapter
 from .services import (
     ConflictError, NotFoundError, PortfolioService, ValidationError,
@@ -265,6 +266,8 @@ def create_app(settings: Settings | None = None, *, configure_logging: bool = Tr
     async def lifespan(app: FastAPI):
         service.recover_interrupted()
         stop = asyncio.Event()
+        publisher_stop = threading.Event()
+        start_publisher(settings, publisher_stop)
 
         async def worker() -> None:
             consecutive_failures = 0
@@ -297,15 +300,20 @@ def create_app(settings: Settings | None = None, *, configure_logging: bool = Tr
                 name="genai-model-catalog-refresh",
                 daemon=True,
             ).start()
-        yield
-        stop.set()
-        if task:
-            task.cancel()
-            # cancel() cannot interrupt work already running inside to_thread, so an
-            # in-flight batch of LLM calls would otherwise hold shutdown for as long
-            # as its timeouts and retries take.
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(task), timeout=SHUTDOWN_GRACE_SECONDS)
+        try:
+            yield
+        finally:
+            # Cleanup must run even when the app exits via an exception, or
+            # the worker task and publisher thread outlive the server.
+            stop.set()
+            publisher_stop.set()
+            if task:
+                task.cancel()
+                # cancel() cannot interrupt work already running inside to_thread, so an
+                # in-flight batch of LLM calls would otherwise hold shutdown for as long
+                # as its timeouts and retries take.
+                with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=SHUTDOWN_GRACE_SECONDS)
 
     app = FastAPI(title="CHIO Portfolio Assistant", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings

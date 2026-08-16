@@ -1718,3 +1718,36 @@ class TestMalformedSidecarRebuildIsolation:
         assert bad["ingestion_id"] not in {
             item["ingestion_id"] for item in rebuilt_sources
         }
+
+
+class TestRemovedSourceReupload:
+    """Re-uploading a removed file returned a silent duplicate that stayed removed."""
+
+    def test_same_file_upload_restores_removed_source_instead_of_discarding_it(
+        self, client: TestClient, project,
+    ):
+        payload = b"Fictional source that the user intentionally uploads again."
+        first = upload(client, project["id"], "restore-on-upload.txt", payload).json()
+        source = first["source"]
+        removed = client.post(
+            f"/api/projects/{project['id']}/sources/{source['id']}/remove",
+            json={"reason": "Fictional removal before a deliberate re-upload"},
+        )
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["memory_state"] == "removed"
+
+        reuploaded = upload(
+            client, project["id"], "restore-on-upload.txt", payload
+        )
+
+        assert reuploaded.status_code == 202, reuploaded.text
+        result = reuploaded.json()
+        assert result["duplicate"] is False
+        assert result["source"]["id"] == source["id"]
+        assert result["source"]["memory_state"] != "removed"
+        assert Path(result["source"]["ingestion_path"]).parent == Path(project["folder_path"])
+        detail = client.get(f"/api/sources/{source['id']}").json()
+        assert detail["original_files"]
+        assert any(
+            event["event_type"] == "restored_to_memory" for event in detail["lifecycle"]
+        )

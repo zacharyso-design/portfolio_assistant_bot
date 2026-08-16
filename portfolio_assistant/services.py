@@ -1575,6 +1575,13 @@ class PortfolioService:
                 )
             if existing:
                 shutil.rmtree(incomplete)
+                if existing["memory_state"] == "removed" and project_id is not None:
+                    restored = self.restore_source_to_memory(
+                        project_id,
+                        int(existing["id"]),
+                        reason="Restored because the same source was uploaded again.",
+                    )
+                    return restored, False
                 return self._decode_source(existing), True
             now = utc_now()
             self._initial_assistant_files(incomplete, ingestion_id, project_id, title)
@@ -1643,6 +1650,13 @@ class PortfolioService:
             if insert_error is not None:
                 shutil.rmtree(final_package)
                 if concurrent:
+                    if concurrent["memory_state"] == "removed" and project_id is not None:
+                        restored = self.restore_source_to_memory(
+                            project_id,
+                            int(concurrent["id"]),
+                            reason="Restored because the same source was uploaded again.",
+                        )
+                        return restored, False
                     return self._decode_source(concurrent), True
                 raise ConflictError("Source insert conflict") from insert_error
             source_committed = True
@@ -3045,7 +3059,10 @@ class PortfolioService:
                 pass
         return self.source_detail(source_id)
 
-    def restore_source_to_memory(self, project_id: str, source_id: int) -> dict[str, Any]:
+    def restore_source_to_memory(
+        self, project_id: str, source_id: int, *,
+        reason: str = "Restored to active project memory by the user.",
+    ) -> dict[str, Any]:
         with self.db.connect() as connection:
             project = self._project(connection, project_id)
             source = connection.execute(
@@ -3061,7 +3078,7 @@ class PortfolioService:
         destination = Path(project["folder_path"]) / Path(source["ingestion_path"]).name
         result = self._move_source_package(
             source_id, destination, memory_state=restored_state,
-            event_type="restored_to_memory", reason="Restored to active project memory by the user.",
+            event_type="restored_to_memory", reason=reason,
             project_fit_confirmed=bool(source["project_fit_confirmed"]),
         )
         if restored_state == "active":

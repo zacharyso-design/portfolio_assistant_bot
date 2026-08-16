@@ -126,15 +126,20 @@ def daily_window(target: date, tz: tzinfo | None = None) -> tuple[str, str]:
     platform's rules for their own date from ``astimezone()``; ``tz`` exists
     so tests can supply a DST-observing zone deterministically.
     """
-    start = datetime.combine(target - timedelta(days=1), time.min)
-    end = datetime.combine(target, time.min)
-    if tz is not None:
-        start = start.replace(tzinfo=tz)
-        end = end.replace(tzinfo=tz)
-    return (
-        start.astimezone(timezone.utc).isoformat(),
-        end.astimezone(timezone.utc).isoformat(),
-    )
+    # Windows' mktime cannot resolve local offsets before 1970 or past the
+    # year 3000, and no real daily run is outside this range; reject typo'd
+    # years as a 422 instead of an OSError-turned-500.
+    if not 1971 <= target.year <= 3000:
+        raise ValidationError(f"run_date {target.isoformat()} is outside the supported range")
+    start = datetime.combine(target - timedelta(days=1), time.min, tzinfo=tz)
+    end = datetime.combine(target, time.min, tzinfo=tz)
+    try:
+        return (
+            start.astimezone(timezone.utc).isoformat(),
+            end.astimezone(timezone.utc).isoformat(),
+        )
+    except (OSError, OverflowError) as exc:  # pragma: no cover - platform edge
+        raise ValidationError(f"run_date {target.isoformat()} is outside the supported range") from exc
 
 
 class PortfolioService:

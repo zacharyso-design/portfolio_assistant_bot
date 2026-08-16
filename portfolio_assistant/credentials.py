@@ -20,39 +20,75 @@ class InvalidApiKeyError(CredentialError):
     """The supplied key cannot be used. The message never contains the key."""
 
 
-# Word, Outlook and Teams wrap pasted values in matched smart quotes.
-_QUOTE_CHARACTERS = "\"'`´‘’‚‛“”„‟«»‹›"
-# Printable ASCII without space: exactly what survives HTTP header encoding.
+# Matched wrapper pairs that documents put around pasted values. Only a
+# matched pair is unwrapped; a key that merely starts or ends with a quote
+# character is left alone rather than guessed at.
+_QUOTE_PAIRS = frozenset({
+    ('"', '"'), ("'", "'"), ("`", "`"), ("´", "´"),
+    ("“", "”"), ("‘", "’"), ("„", "“"), ("„", "”"),
+    ("‚", "‘"), ("‚", "’"), ("‟", "”"), ("‛", "’"),
+    ("«", "»"), ("‹", "›"), ("＂", "＂"), ("＇", "＇"),
+})
+# Printable ASCII without space: what a freshly saved key must reduce to.
 _HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
+# Printable ASCII including space: every key the pre-validation releases
+# could store or serve successfully. Lets legacy values keep working verbatim.
+_LEGACY_SENDABLE = re.compile(r"[\x20-\x7e]+")
+# Characters that mark a second line. str.strip() removes them at the ends;
+# in the interior they mean the paste was never a single key.
+_LINE_BREAKS = frozenset("\r\n\x0b\x0c\x1c\x1d\x1e\x85  ")
+
+
+def sendable_api_key(value: str) -> bool:
+    """True when a key can be sent in an HTTP header exactly as given."""
+    return bool(_LEGACY_SENDABLE.fullmatch(value))
+
+
+def _unwrap_quotes(text: str) -> str:
+    while len(text) >= 2 and (text[0], text[-1]) in _QUOTE_PAIRS:
+        text = text[1:-1].strip()
+    return text
 
 
 def normalize_api_key(raw: str) -> str:
     """Repair paste damage, then require a header-safe key.
 
-    Keys arrive pasted out of documents far more often than they are typed, so
-    the invisible characters that ride along are repaired rather than rejected.
-    What cannot be repaired is refused here instead of at request time, where
-    the failure surfaces as an opaque encoding error or a bare 401.
+    Keys arrive pasted out of documents far more often than they are typed.
+    Damage that leaves the key intact is repaired: surrounding whitespace and
+    line breaks, matched wrapping quotes, and zero-width format characters.
+    Damage that makes the key ambiguous is rejected rather than guessed at —
+    joining the pieces of a multi-line or space-split paste would store a
+    different wrong key that fails with a bare 401 at request time.
 
     Raises InvalidApiKeyError, whose message never contains the key.
     """
-    # Structural damage, unlike invisible damage, is not repairable: joining the
-    # lines of a two-line paste just yields a different wrong key. Rejecting CR
-    # and LF here is also what forecloses header injection.
-    if any(ch in raw for ch in "\r\n\x00"):
+    if _HEADER_SAFE.fullmatch(raw) and (len(raw) < 2 or (raw[0], raw[-1]) not in _QUOTE_PAIRS):
+        return raw
+    if "\x00" in raw:
+        raise InvalidApiKeyError("The API key contains unusable control characters.")
+    # Trim end padding (str.strip removes every _LINE_BREAKS member too) and
+    # unwrap quotes before NFKC: U+00B4 decomposes under NFKC into a space
+    # plus a combining accent and would stop matching its pair.
+    text = _unwrap_quotes(raw.strip())
+    if any(ch in _LINE_BREAKS for ch in text):
         raise InvalidApiKeyError(
             "The API key must be a single line. Paste only the key itself."
         )
-    text = unicodedata.normalize("NFKC", raw)
-    # Cc and Cf cover tab, zero-width joiners, soft hyphen and the UTF-8 BOM.
-    text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
-    text = text.strip()
-    while len(text) >= 2 and text[0] in _QUOTE_CHARACTERS and text[-1] in _QUOTE_CHARACTERS:
-        text = text[1:-1].strip()
-    # NFKC has already folded NBSP and friends down to plain spaces.
-    text = "".join(ch for ch in text if not ch.isspace())
+    text = unicodedata.normalize("NFKC", text)
+    # Zero-width and joiner characters (category Cf: ZWSP, BOM, soft hyphen,
+    # word joiner) are invisible — removing them restores what the user saw.
+    # Other C categories (controls, surrogates, private use) are NOT removed:
+    # deleting visible-in-effect garbage would fabricate a different key.
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = _unwrap_quotes(text.strip())
     if not text:
         raise InvalidApiKeyError("Enter a GenAI.mil API key before saving")
+    if any(ch.isspace() for ch in text):
+        # An interior space is a wrap artifact or a two-part paste; joining
+        # the parts silently would store a different wrong key.
+        raise InvalidApiKeyError(
+            "The API key contains spaces. Paste only the key itself, with nothing around it."
+        )
     if not _HEADER_SAFE.fullmatch(text):
         raise InvalidApiKeyError(
             "The API key contains characters that cannot be sent in an HTTP header. "
@@ -62,6 +98,12 @@ def normalize_api_key(raw: str) -> str:
 
 
 class CredentialStore(Protocol):
+    """Stores one secret verbatim.
+
+    Callers own validation: InternalHttpLlmAdapter.save_api_key normalizes
+    before calling set(), so every implementation receives a header-safe key.
+    """
+
     def get(self) -> str | None: ...
     def set(self, value: str) -> None: ...
     def delete(self) -> bool: ...
@@ -162,13 +204,28 @@ class WindowsDpapiCredentialStore:
             raise CredentialError("The saved GenAI.mil API key could not be read") from exc
         if not value:
             return None
-        # Keys stored before this validation existed can still be damaged on disk,
-        # so repair on the way out rather than failing at request time.
-        return normalize_api_key(value)
+        if sendable_api_key(value):
+            # Every key this store ever accepted was sendable; legacy values
+            # (which may hold interior spaces) keep working verbatim instead
+            # of being silently rewritten into a different key.
+            return value
+        try:
+            # A pre-validation save may hold repairable paste damage on disk.
+            return normalize_api_key(value)
+        except InvalidApiKeyError as exc:
+            raise InvalidApiKeyError(
+                "The saved GenAI.mil API key cannot be used. Remove it and save it again in Settings."
+            ) from exc
 
     def set(self, value: str) -> None:
-        key = normalize_api_key(value)
-        ciphertext = self._protect(key.encode("utf-8"))
+        key = value.strip()
+        if not key:
+            raise CredentialError("Enter a GenAI.mil API key before saving")
+        try:
+            encoded = key.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise CredentialError("The GenAI.mil API key could not be encoded for storage") from exc
+        ciphertext = self._protect(encoded)
         temporary = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )

@@ -123,19 +123,23 @@ def test_serve_reload_passes_an_import_string(settings, monkeypatch):
     # app instance with exit code 1, so --reload must get an import string.
     # The previous version of this test asserted the instance was passed,
     # which kept the suite green while the command always failed.
+    import importlib
+
     calls: list[tuple[object, dict[str, object]]] = []
+    validations: list[object] = []
 
     def record_run(selected_app, **kwargs) -> None:
         calls.append((selected_app, kwargs))
 
-    def unexpected_create_app(_settings) -> object:
-        raise AssertionError("--reload must defer app construction to the reload child")
-
     monkeypatch.setattr(cli, "load_settings", lambda _: settings)
-    monkeypatch.setattr(cli, "create_app", unexpected_create_app)
+    monkeypatch.setattr(cli, "create_app", lambda s: validations.append(s) or object())
     monkeypatch.setattr(cli.uvicorn, "run", record_run)
 
     assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
+    # The parent validates the configuration by building the app once before
+    # the reloader starts, so config errors surface as Error: lines, not as
+    # endlessly retried child tracebacks.
+    assert validations == [settings]
     assert calls == [("portfolio_assistant.api:create_app", {
         "factory": True,
         "host": "127.0.0.1",
@@ -143,21 +147,8 @@ def test_serve_reload_passes_an_import_string(settings, monkeypatch):
         "reload": True,
         "log_config": None,
     })]
-
-
-def test_serve_reload_import_string_resolves_to_the_app_factory(settings, monkeypatch):
-    import importlib
-
-    recorded: list[str] = []
-    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
-    monkeypatch.setattr(
-        cli.uvicorn, "run",
-        lambda target, **kwargs: recorded.append(target),
-    )
-    assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
-    module_name, _, attribute = recorded[0].partition(":")
-    factory = getattr(importlib.import_module(module_name), attribute)
-    assert callable(factory)
+    module_name, _, attribute = calls[0][0].partition(":")
+    assert callable(getattr(importlib.import_module(module_name), attribute))
 
 
 def test_serve_without_reload_keeps_the_app_instance(settings, monkeypatch):

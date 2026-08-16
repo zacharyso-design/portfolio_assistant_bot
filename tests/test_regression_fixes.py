@@ -14,14 +14,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from portfolio_assistant.config import LlmSettings
 from portfolio_assistant.credentials import (
-    InvalidApiKeyError, WindowsDpapiCredentialStore, normalize_api_key,
+    CredentialError, InvalidApiKeyError, WindowsDpapiCredentialStore, normalize_api_key,
 )
 from portfolio_assistant.db import Database
 from portfolio_assistant.extraction import (
     ExtractionFailure, decode_text_bytes, safe_filename,
 )
-from portfolio_assistant.services import daily_window
+from portfolio_assistant.llm import InternalHttpLlmAdapter, LlmUnavailable
+from portfolio_assistant.services import ValidationError, daily_window
 
 
 def upload(client: TestClient, project_id: str, name: str, data: bytes, **fields):
@@ -2377,25 +2379,28 @@ class TestEmptyPortfolioMetrics:
 GOOD_KEY = "sk-genai-AbC123_xyz-456"
 KEY_HEAD, KEY_TAIL = "sk-genai-AbC123_xyz", "-456"
 
-# Paste damage that is repairable: the key underneath is intact.
+# Paste damage that is repairable: the key underneath is intact. Invisible
+# characters are written as escapes so each case tests the character it names.
 REPAIRABLE_KEYS = [
     ("curly-quotes", "“" + GOOD_KEY + "”"),
     ("straight-quotes", '"' + GOOD_KEY + '"'),
     ("single-curly-quotes", "‘" + GOOD_KEY + "’"),
     ("guillemets", "«" + GOOD_KEY + "»"),
+    ("acute-accents", "´" + GOOD_KEY + "´"),
+    ("fullwidth-quotes", "＂" + GOOD_KEY + "＂"),
     ("trailing-nbsp", GOOD_KEY + " "),
-    ("interior-nbsp", KEY_HEAD + " " + KEY_TAIL),
+    ("trailing-carriage-return", GOOD_KEY + "\r"),
+    ("trailing-crlf", GOOD_KEY + "\r\n"),
     ("zero-width-space", KEY_HEAD + "​" + KEY_TAIL),
     ("zero-width-joiner", KEY_HEAD + "‍" + KEY_TAIL),
     ("word-joiner", KEY_HEAD + "⁠" + KEY_TAIL),
     ("soft-hyphen", KEY_HEAD + "­" + KEY_TAIL),
     ("utf8-bom", "﻿" + GOOD_KEY),
-    ("interior-tab", KEY_HEAD + "\t" + KEY_TAIL),
     ("surrounding-whitespace", "   " + GOOD_KEY + "\t "),
     ("quotes-and-padding", " “ " + GOOD_KEY + " ” "),
 ]
 
-# Damage that cannot be repaired into a header-safe key.
+# Damage that cannot be repaired into an unambiguous header-safe key.
 UNUSABLE_KEYS = [
     ("empty", ""),
     ("whitespace-only", "     "),
@@ -2404,11 +2409,57 @@ UNUSABLE_KEYS = [
     ("accented-text", "sk-genai-café-456"),
     ("cyrillic-homoglyph", "sk-genai-АbC123"),
     ("emoji", GOOD_KEY + "\U0001f511"),
-    ("carriage-return", GOOD_KEY + "\r"),
     ("newline-injection", GOOD_KEY + "\nX-Injected: 1"),
     ("crlf-injection", GOOD_KEY + "\r\nX-Injected: 1"),
     ("null-byte", GOOD_KEY + "\x00"),
+    ("interior-space", "sk-genai-AB CD"),
+    ("interior-nbsp", KEY_HEAD + " " + KEY_TAIL),
+    ("interior-tab", KEY_HEAD + "\t" + KEY_TAIL),
+    ("vertical-tab-join", KEY_HEAD + "\x0b" + KEY_TAIL),
+    ("line-separator-join", KEY_HEAD + " " + KEY_TAIL),
+    ("lone-surrogate", KEY_HEAD + "\ud800" + KEY_TAIL),
 ]
+
+
+class _MemoryStore:
+    """Minimal CredentialStore double; stores verbatim per the Protocol contract."""
+
+    def __init__(self, value: str | None = None, get_error: Exception | None = None):
+        self.value = value
+        self.get_error = get_error
+        self.set_calls: list[str] = []
+
+    def get(self) -> str | None:
+        if self.get_error is not None:
+            raise self.get_error
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.set_calls.append(value)
+        self.value = value
+
+    def delete(self) -> bool:
+        existed = self.value is not None
+        self.value = None
+        return existed
+
+
+def _internal_adapter(store: _MemoryStore) -> "InternalHttpLlmAdapter":
+    class _Models:
+        def load(self):
+            return None
+
+        def save(self, routine_model: str, judgment_model: str) -> None:
+            return None
+
+    settings = LlmSettings(
+        adapter="internal", base_url="https://api.genai.example",
+        model="fictional-routine", judgment_model="fictional-judgment",
+        api_key_env="REGRESSION_GENAI_KEY",
+    )
+    return InternalHttpLlmAdapter(
+        settings, credential_store=store, model_preference_store=_Models()
+    )
 
 
 class TestPastedApiKeyNormalization:
@@ -2450,11 +2501,10 @@ class TestPastedApiKeyNormalization:
         for _, raw in REPAIRABLE_KEYS:
             ("Bearer " + normalize_api_key(raw)).encode("latin-1")
 
-    def test_store_writes_nothing_when_the_key_is_unusable(self, tmp_path):
+    def test_store_rejects_an_empty_key_without_writing(self, tmp_path):
         store = WindowsDpapiCredentialStore(path=tmp_path / "creds" / "genai-api-key.bin")
-        with pytest.raises(InvalidApiKeyError):
-            store.set("sk-genai-café-456")
-        assert not store.path.exists()
+        with pytest.raises(CredentialError):
+            store.set("   ")
         assert not store.path.parent.exists()
 
     def test_store_repairs_a_damaged_key_already_on_disk(self, tmp_path, monkeypatch):
@@ -2474,8 +2524,137 @@ class TestPastedApiKeyNormalization:
             WindowsDpapiCredentialStore, "_unprotect",
             classmethod(lambda cls, blob: "sk-genai-café".encode("utf-8")),
         )
-        with pytest.raises(InvalidApiKeyError):
+        with pytest.raises(InvalidApiKeyError, match="save it again in Settings"):
             store.get()
+
+
+class TestMatchedQuoteUnwrapping:
+    """The quote loop stripped any first/last quote pair, corrupting mismatched or genuine quotes."""
+
+    def test_mismatched_quotes_are_preserved_verbatim(self):
+        mixed = '"' + GOOD_KEY + "'"
+        assert normalize_api_key(mixed) == mixed
+
+    def test_one_sided_quote_is_preserved_verbatim(self):
+        assert normalize_api_key("'" + GOOD_KEY) == "'" + GOOD_KEY
+        assert normalize_api_key(GOOD_KEY + "'") == GOOD_KEY + "'"
+
+    def test_layered_matched_quotes_are_fully_unwrapped(self):
+        assert normalize_api_key("''" + GOOD_KEY + "''") == GOOD_KEY
+
+    def test_acute_accent_wrap_is_repaired_despite_nfkc(self):
+        # NFKC decomposes U+00B4 into space + combining accent, so the pair
+        # must be matched before normalization runs.
+        assert normalize_api_key("´" + GOOD_KEY + "´") == GOOD_KEY
+
+    def test_invisible_characters_around_quotes_still_unwrap(self):
+        assert normalize_api_key("‌'" + GOOD_KEY + "'‌") == GOOD_KEY
+
+
+class TestLineSeparatorKeys:
+    """Only CR, LF and NUL counted as line breaks, so exotic separators were joined into a wrong key."""
+
+    @pytest.mark.parametrize(
+        "separator", ["\x0b", "\x0c", "\x85", " ", " "],
+        ids=["vertical-tab", "form-feed", "next-line", "line-separator", "paragraph-separator"],
+    )
+    def test_interior_separators_are_rejected_not_joined(self, separator):
+        with pytest.raises(InvalidApiKeyError, match="single line"):
+            normalize_api_key(KEY_HEAD + separator + KEY_TAIL)
+
+    def test_trailing_line_breaks_are_treated_as_padding(self):
+        # A terminal or editor line copy appends exactly one line ending; the
+        # pre-validation store accepted these and so must the validator.
+        for padding in ("\n", "\r", "\r\n", "\x0b"):
+            assert normalize_api_key(GOOD_KEY + padding) == GOOD_KEY
+
+
+class TestUnpasteableGarbageKeys:
+    """Surrogates and private-use characters were deleted, fabricating a different key from garbage."""
+
+    @pytest.mark.parametrize(
+        "garbage", ["\ud800", "\ud83d", "", "͸"],
+        ids=["low-surrogate", "high-surrogate", "private-use", "unassigned"],
+    )
+    def test_garbage_characters_are_rejected_not_deleted(self, garbage):
+        with pytest.raises(InvalidApiKeyError):
+            normalize_api_key("sk-genai-Ab" + garbage + "C123")
+
+
+class TestLegacyStoredKeys:
+    """get() rewrote legacy stored keys, silently authenticating with a different key."""
+
+    def test_interior_space_key_is_returned_verbatim(self, tmp_path, monkeypatch):
+        # 'sk-genai-AB CD' was accepted by the pre-validation store and sent
+        # unchanged in the auth header; rewriting it would break a working key.
+        store = WindowsDpapiCredentialStore(path=tmp_path / "genai-api-key.bin")
+        store.path.write_bytes(b"ciphertext")
+        monkeypatch.setattr(
+            WindowsDpapiCredentialStore, "_unprotect",
+            classmethod(lambda cls, blob: b"sk-genai-AB CD"),
+        )
+        assert store.get() == "sk-genai-AB CD"
+
+
+class TestUnusableStoredKeyFallback:
+    """An unusable stored key returned 503 without trying the environment key the status page called active."""
+
+    def test_environment_key_is_used_when_the_stored_key_is_damaged(self, monkeypatch):
+        monkeypatch.setenv("REGRESSION_GENAI_KEY", "fictional-env-key-123")
+        adapter = _internal_adapter(
+            _MemoryStore(get_error=InvalidApiKeyError("stored key unusable"))
+        )
+        assert adapter._active_api_key() == ("fictional-env-key-123", "environment")
+
+    def test_damaged_stored_key_without_fallback_names_the_fix(self, monkeypatch):
+        monkeypatch.delenv("REGRESSION_GENAI_KEY", raising=False)
+        adapter = _internal_adapter(_MemoryStore(get_error=InvalidApiKeyError(
+            "The saved GenAI.mil API key cannot be used. Remove it and save it again in Settings."
+        )))
+        with pytest.raises(LlmUnavailable, match="save it again in Settings"):
+            adapter._active_api_key()
+
+    def test_status_and_request_path_agree_about_an_unusable_environment_key(self, monkeypatch):
+        monkeypatch.setenv("REGRESSION_GENAI_KEY", "sk-genai-café")
+        adapter = _internal_adapter(_MemoryStore())
+        assert adapter.credential_status()["configured"] is False
+        with pytest.raises(LlmUnavailable, match="not a usable API key"):
+            adapter._active_api_key()
+
+    def test_environment_keys_are_sent_verbatim(self, monkeypatch):
+        # Environment values are administrator-set; a legacy value with an
+        # interior space worked before validation existed and must keep working.
+        monkeypatch.setenv("REGRESSION_GENAI_KEY", "legacy env AB CD")
+        adapter = _internal_adapter(_MemoryStore())
+        assert adapter._active_api_key() == ("legacy env AB CD", "environment")
+
+
+class TestSaveApiKeyCommittedState:
+    """save_api_key re-read the store for its response, so a transient read failure made a committed save look failed."""
+
+    def test_success_is_reported_from_the_committed_write(self):
+        store = _MemoryStore()
+        store.get = lambda: (_ for _ in ()).throw(CredentialError("transient read failure"))
+        adapter = _internal_adapter(store)
+        result = adapter.save_api_key("sk-genai-Fictional123")
+        assert result["configured"] is True
+        assert result["source"] == "encrypted_local"
+        assert store.value == "sk-genai-Fictional123"
+
+    def test_every_store_receives_the_normalized_key(self):
+        # The adapter is the one normalization choke point, so protocol
+        # implementations other than the Windows store stay header-safe too.
+        store = _MemoryStore()
+        adapter = _internal_adapter(store)
+        adapter.save_api_key("“sk-genai-Fictional123”")
+        assert store.set_calls == ["sk-genai-Fictional123"]
+
+    def test_rejected_key_never_reaches_the_store(self):
+        store = _MemoryStore()
+        adapter = _internal_adapter(store)
+        with pytest.raises(InvalidApiKeyError):
+            adapter.save_api_key("sk-genai-café")
+        assert store.set_calls == []
 
 
 class TestRejectedApiKeyEcho:
@@ -2491,10 +2670,91 @@ class TestRejectedApiKeyEcho:
     def test_empty_key_is_rejected(self, client: TestClient):
         assert client.put("/api/llm/credential", json={"api_key": ""}).status_code == 422
 
-    def test_validation_errors_keep_their_shape(self, client: TestClient):
+    def test_detail_is_a_string_the_frontend_can_render(self, client: TestClient):
+        # The frontend error extractor types detail as a string; a list would
+        # surface as "[object Object]" in the Settings error area.
         response = client.put("/api/llm/credential", json={"api_key": "x" * 20_001})
         detail = response.json()["detail"]
-        assert isinstance(detail, list) and detail
-        assert {"type", "loc", "msg"} <= set(detail[0])
-        assert "input" not in detail[0]
-        assert "ctx" not in detail[0]
+        assert isinstance(detail, str)
+        assert "api_key" in detail
+        assert "x" * 50 not in detail
+
+
+class TestInvalidKeyRejectionEndToEnd:
+    """The InvalidApiKeyError-to-422 route had no end-to-end coverage, so removing the handler kept the suite green."""
+
+    def test_service_level_rejection_returns_422_without_echo(self, client: TestClient, monkeypatch):
+        def reject(api_key: str):
+            raise InvalidApiKeyError(
+                "The API key contains spaces. Paste only the key itself, with nothing around it."
+            )
+
+        monkeypatch.setattr(client.app.state.service.llm, "save_api_key", reject)
+        response = client.put("/api/llm/credential", json={"api_key": "sk-fictional key"})
+        assert response.status_code == 422
+        assert "spaces" in response.json()["detail"]
+        assert "sk-fictional" not in response.text
+
+
+class TestReloadConfigErrorHandling:
+    """serve --reload deferred app construction to the reload child, hiding configuration errors from cli.main."""
+
+    def test_reload_reports_app_construction_errors_in_the_parent(self, settings, monkeypatch, capsys):
+        from portfolio_assistant import cli
+        from portfolio_assistant.llm import LlmContractError
+
+        def broken_create_app(_settings):
+            raise LlmContractError("LLM chat URL must remain on the configured HTTPS host")
+
+        def unexpected_run(*args, **kwargs):
+            raise AssertionError("the reloader must not start when the app cannot be built")
+
+        monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+        monkeypatch.setattr(cli, "create_app", broken_create_app)
+        monkeypatch.setattr(cli.uvicorn, "run", unexpected_run)
+        assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 2
+        assert capsys.readouterr().out.startswith("Error:")
+
+
+class TestDailyWindowSupportedRange:
+    """daily_window crashed with OSError on Windows for dates the CRT cannot resolve."""
+
+    @pytest.mark.parametrize(
+        "bad", [date(1950, 1, 1), date(1969, 12, 31), date(3001, 1, 2)],
+        ids=["pre-epoch", "epoch-eve", "post-3000"],
+    )
+    def test_out_of_range_dates_raise_a_validation_error(self, bad):
+        with pytest.raises(ValidationError, match="outside the supported range"):
+            daily_window(bad)
+
+    def test_supported_dates_still_convert(self):
+        start, end = daily_window(date(2026, 8, 15))
+        assert start < end
+
+
+class TestBooleanAndNonFiniteConfigScalars:
+    """int()/float() silently accepted TOML booleans and non-finite floats as numeric settings."""
+
+    def _config(self, tmp_path, **kwargs):
+        return TestMalformedConfigScalars()._write_config(tmp_path, **kwargs)
+
+    def test_boolean_port_is_rejected(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._config(tmp_path, app_lines="bind_port = true\n")
+        with pytest.raises(ConfigurationError, match="bind_port"):
+            load_settings(config)
+
+    def test_nan_poll_interval_is_rejected(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._config(tmp_path, app_lines='worker_poll_seconds = "nan"\n')
+        with pytest.raises(ConfigurationError, match="worker_poll_seconds"):
+            load_settings(config)
+
+    def test_infinite_timeout_is_rejected(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._config(tmp_path, llm_lines='timeout_seconds = "inf"\n')
+        with pytest.raises(ConfigurationError, match="timeout_seconds"):
+            load_settings(config)

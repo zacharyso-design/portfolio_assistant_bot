@@ -272,14 +272,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def request_invalid(_: Request, exc: RequestValidationError) -> JSONResponse:
-        # Pydantic reports the rejected value in "input", and SecretStr does not
-        # redact it. FastAPI's default handler would therefore echo a rejected
-        # API key straight back to the caller and into the access log.
-        safe = [
-            {key: value for key, value in error.items() if key not in {"input", "ctx", "url"}}
-            for error in exc.errors()
-        ]
-        return JSONResponse({"detail": safe}, status_code=422)
+        # Two constraints. Pydantic reports the rejected value in "input" and
+        # SecretStr does not redact it, so only loc and msg may be echoed.
+        # And detail must be a string: every other handler here returns
+        # {"detail": str} and the frontend renders detail verbatim — a list
+        # would surface as "[object Object]" in the UI.
+        parts = []
+        for error in exc.errors():
+            location = ".".join(
+                str(piece) for piece in error.get("loc", ()) if piece != "body"
+            )
+            message = str(error.get("msg", "Invalid value"))
+            parts.append(f"{location}: {message}" if location else message)
+        return JSONResponse({"detail": "; ".join(parts)[:2000]}, status_code=422)
 
     @app.exception_handler(LlmUnavailable)
     async def unavailable(_: Request, exc: LlmUnavailable) -> JSONResponse:

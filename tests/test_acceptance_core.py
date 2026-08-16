@@ -25,6 +25,7 @@ import pytest
 from portfolio_assistant import APPLICATION_ID
 from portfolio_assistant.api import create_app
 from portfolio_assistant.llm import LlmContractError
+from portfolio_assistant.services import daily_window
 
 
 def upload(client: TestClient, project_id: str, name: str, data: bytes, **fields):
@@ -503,10 +504,11 @@ def test_action_progress_close_protection_and_daily_window(client: TestClient, p
     client.post(f"/api/reviews/{review['id']}/resolve", json={"action": "apply", "action_item_id": action["id"]})
     assert client.get(f"/api/projects/{project['id']}").json()["action_items"][0]["state"] == "complete"
     assert client.get(f"/api/projects/{project['id']}").json()["status"] == "Green"
-    local_now = datetime.now().astimezone()
-    start_local = datetime.combine(local_now.date() - timedelta(days=1), datetime.min.time(), tzinfo=local_now.tzinfo)
-    inside = (start_local + timedelta(hours=12)).astimezone(timezone.utc).isoformat()
-    outside = (start_local - timedelta(seconds=1)).astimezone(timezone.utc).isoformat()
+    # Derive the window from the same helper run_daily uses; recomputing it
+    # with a fixed offset captured from now() diverges on DST-transition days.
+    window_start, _ = daily_window(datetime.now().astimezone().date())
+    inside = (datetime.fromisoformat(window_start) + timedelta(hours=12)).isoformat()
+    outside = (datetime.fromisoformat(window_start) - timedelta(seconds=1)).isoformat()
     with client.app.state.db.transaction() as connection:
         inside_id = connection.execute(
             "INSERT INTO project_updates(project_id, source_id, update_type, text, citations_json, created_at) VALUES (?, NULL, 'manual_field', 'Inside prior-day window.', '[]', ?)",

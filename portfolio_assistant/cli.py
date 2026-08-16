@@ -166,11 +166,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 opener.start()
             try:
+                server_options = {
+                    "host": settings.app.bind_host, "port": settings.app.bind_port,
+                    "log_config": None,
+                }
                 if args.command == "launch":
-                    config = uvicorn.Config(
-                        create_app(settings), host=settings.app.bind_host,
-                        port=settings.app.bind_port, reload=False, log_config=None,
-                    )
+                    config = uvicorn.Config(create_app(settings), reload=False, **server_options)
                     exit_code = _run_server(uvicorn.Server(config))
                     if exit_code:
                         return exit_code
@@ -178,16 +179,16 @@ def main(argv: list[str] | None = None) -> int:
                     # The reloader re-imports the app in a child process, so it
                     # requires an import string; passing an instance exits 1.
                     # The child reads PORTFOLIO_ASSISTANT_CONFIG set above.
+                    # Build the app once here first: a broken configuration
+                    # must produce the Error: line and exit code 2 in this
+                    # parent, not an endlessly retried child traceback.
+                    create_app(settings)
                     uvicorn.run(
-                        "portfolio_assistant.api:create_app", factory=True,
-                        host=settings.app.bind_host, port=settings.app.bind_port,
-                        reload=True, log_config=None,
+                        "portfolio_assistant.api:create_app",
+                        factory=True, reload=True, **server_options,
                     )
                 else:
-                    uvicorn.run(
-                        create_app(settings), host=settings.app.bind_host,
-                        port=settings.app.bind_port, reload=False, log_config=None,
-                    )
+                    uvicorn.run(create_app(settings), reload=False, **server_options)
             finally:
                 stop.set()
                 if opener:

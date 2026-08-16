@@ -19,7 +19,7 @@ import httpx
 from .config import LlmSettings
 from .credentials import (
     CredentialError, CredentialStore, InvalidApiKeyError, WindowsDpapiCredentialStore,
-    normalize_api_key,
+    normalize_api_key, sendable_api_key,
 )
 from .preferences import (
     JsonModelPreferenceStore, ModelPreferenceError, ModelPreferenceStore, valid_model_id,
@@ -481,7 +481,9 @@ class InternalHttpLlmAdapter:
         return {"routine_model": routine, "judgment_model": judgment}
 
     def credential_status(self) -> dict[str, Any]:
-        environment_present = bool(os.environ.get(self.settings.api_key_env, "").strip())
+        # Same usability rule as _active_api_key's environment branch, so the
+        # status page never reports a key every request path would refuse.
+        environment_present = sendable_api_key(os.environ.get(self.settings.api_key_env, "").strip())
         try:
             stored = bool(self._credential_store.get())
         except CredentialError:
@@ -509,15 +511,19 @@ class InternalHttpLlmAdapter:
         }
 
     def save_api_key(self, api_key: str) -> dict[str, Any]:
-        # Normalize here so the caller can be told the pasted key was repaired.
+        # The adapter is the one normalization choke point for saves, so every
+        # CredentialStore implementation receives an already-validated key.
         cleaned = normalize_api_key(api_key)
         try:
             self._credential_store.set(cleaned)
-        except InvalidApiKeyError:
-            raise
         except CredentialError as exc:
             raise LlmUnavailable(str(exc)) from exc
-        return {**self.credential_status(), "normalized": cleaned != api_key.strip()}
+        # Report from what was just committed. A re-read could hit a transient
+        # failure and claim an absent key that is in fact saved and active.
+        return {
+            "configured": True, "source": "encrypted_local",
+            "environment_override": False, "local_key_present": True,
+        }
 
     def remove_api_key(self) -> dict[str, Any]:
         try:
@@ -527,21 +533,29 @@ class InternalHttpLlmAdapter:
         return {**self.credential_status(), "removed": removed}
 
     def _active_api_key(self) -> tuple[str, str]:
+        damaged_stored: InvalidApiKeyError | None = None
         try:
             stored = self._credential_store.get()
+        except InvalidApiKeyError as exc:
+            # The stored key is unusable; fall through to the environment
+            # fallback, which credential_status reports as active in this state.
+            stored = None
+            damaged_stored = exc
         except CredentialError as exc:
             raise LlmUnavailable(str(exc)) from exc
         if stored:
             return stored, "encrypted_local"
         environment_key = os.environ.get(self.settings.api_key_env, "").strip()
         if environment_key:
-            # The environment is a third entry point into the same auth header.
-            try:
-                return normalize_api_key(environment_key), "environment"
-            except InvalidApiKeyError as exc:
-                raise LlmUnavailable(
-                    f"The {self.settings.api_key_env} environment value is not a usable API key"
-                ) from exc
+            # Environment keys are administrator-set exact values: validate
+            # that they are sendable, but never rewrite them.
+            if sendable_api_key(environment_key):
+                return environment_key, "environment"
+            raise LlmUnavailable(
+                f"The {self.settings.api_key_env} environment value is not a usable API key"
+            )
+        if damaged_stored is not None:
+            raise LlmUnavailable(str(damaged_stored)) from damaged_stored
         raise LlmUnavailable("No GenAI.mil API key is configured; save one in Settings")
 
     def list_models(self) -> list[str]:

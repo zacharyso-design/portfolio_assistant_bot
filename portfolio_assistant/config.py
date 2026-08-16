@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from .archive import ensure_archive_roots
@@ -19,20 +21,43 @@ def _expanded_path(value: str) -> Path:
     return Path(expanded).expanduser().resolve()
 
 
-def _coerced(section: str, raw: dict, key: str, converter, default):
+def _coerced(section: str, key: str, value: Any, converter: type):
     """Convert one setting, turning a bad scalar into an actionable error.
 
     int("8765x") and float("fast") raise bare ValueError, which nothing in
     cli.main translates, so a config typo printed a traceback instead of the
-    "Error: ..." line naming the offending key.
+    "Error: ..." line naming the offending key. Booleans and non-finite
+    floats convert without raising (int(True) == 1, float("nan")) yet are
+    equally wrong, so they are rejected explicitly.
     """
-    value = raw.get(key, default)
+    invalid = ConfigurationError(
+        f"Invalid [{section}] value for {key}: {value!r} is not a valid {converter.__name__}"
+    )
+    if isinstance(value, bool) and converter in (int, float):
+        raise invalid
     try:
-        return converter(value)
+        result = converter(value)
     except (TypeError, ValueError) as exc:
-        raise ConfigurationError(
-            f"Invalid [{section}] value for {key}: {value!r} is not a {converter.__name__}"
-        ) from exc
+        raise invalid from exc
+    if converter is float and not math.isfinite(result):
+        raise invalid
+    return result
+
+
+# Defaults live on the dataclasses alone; only keys present in the TOML are
+# passed through, so a default can never drift between two statements.
+_APP_FIELDS: dict[str, type] = {
+    "bind_host": str, "bind_port": int, "max_file_mb": int, "max_attachments": int,
+    "max_extracted_text_mb": int, "daily_run_time": str, "worker_poll_seconds": float,
+    "automatic_ai_attempts": int,
+}
+_LLM_FIELDS: dict[str, type] = {
+    "adapter": str, "base_url": str, "chat_path": str, "model": str,
+    "judgment_model": str, "api_key_env": str, "auth_header": str, "auth_scheme": str,
+    "ca_bundle": str, "timeout_seconds": float, "max_tokens": int, "max_attempts": int,
+    "rate_limit_requests": int, "rate_limit_window_seconds": float,
+    "max_evidence_chars": int,
+}
 
 
 @dataclass(frozen=True)
@@ -92,39 +117,20 @@ def load_settings(path: str | Path | None = None, *, testing: bool = False) -> S
         raw = tomllib.load(handle)
     app_raw = raw.get("app", {})
     llm_raw = raw.get("llm", {})
+    app_values: dict[str, Any] = {"testing": testing}
     try:
-        app = AppSettings(
-            database_path=_expanded_path(str(app_raw["database_path"])),
-            one_drive_root=_expanded_path(str(app_raw["one_drive_root"])),
-            bind_host=str(app_raw.get("bind_host", "127.0.0.1")),
-            bind_port=_coerced("app", app_raw, "bind_port", int, 8765),
-            max_file_mb=_coerced("app", app_raw, "max_file_mb", int, 100),
-            max_attachments=_coerced("app", app_raw, "max_attachments", int, 25),
-            max_extracted_text_mb=_coerced("app", app_raw, "max_extracted_text_mb", int, 5),
-            daily_run_time=str(app_raw.get("daily_run_time", "06:00")),
-            worker_poll_seconds=_coerced("app", app_raw, "worker_poll_seconds", float, 2),
-            automatic_ai_attempts=_coerced("app", app_raw, "automatic_ai_attempts", int, 2),
-            testing=testing,
-        )
+        app_values["database_path"] = _expanded_path(str(app_raw["database_path"]))
+        app_values["one_drive_root"] = _expanded_path(str(app_raw["one_drive_root"]))
     except KeyError as exc:
         raise ConfigurationError(f"Missing required [app] key: {exc.args[0]}") from exc
-    llm = LlmSettings(
-        adapter=str(llm_raw.get("adapter", "internal")),
-        base_url=str(llm_raw.get("base_url", "https://api.genai.mil")),
-        chat_path=str(llm_raw.get("chat_path", "/v1/chat/completions")),
-        model=str(llm_raw.get("model", "gemini-3.7-flash")),
-        judgment_model=str(llm_raw.get("judgment_model", "gemini-3.7-flash")),
-        api_key_env=str(llm_raw.get("api_key_env", "GENAI_API_KEY")),
-        auth_header=str(llm_raw.get("auth_header", "Authorization")),
-        auth_scheme=str(llm_raw.get("auth_scheme", "Bearer")),
-        ca_bundle=str(llm_raw.get("ca_bundle", "")),
-        timeout_seconds=_coerced("llm", llm_raw, "timeout_seconds", float, 240),
-        max_tokens=_coerced("llm", llm_raw, "max_tokens", int, 32_000),
-        max_attempts=_coerced("llm", llm_raw, "max_attempts", int, 3),
-        rate_limit_requests=_coerced("llm", llm_raw, "rate_limit_requests", int, 120),
-        rate_limit_window_seconds=_coerced("llm", llm_raw, "rate_limit_window_seconds", float, 60),
-        max_evidence_chars=_coerced("llm", llm_raw, "max_evidence_chars", int, 30_000),
-    )
+    for key, converter in _APP_FIELDS.items():
+        if key in app_raw:
+            app_values[key] = _coerced("app", key, app_raw[key], converter)
+    app = AppSettings(**app_values)
+    llm = LlmSettings(**{
+        key: _coerced("llm", key, llm_raw[key], converter)
+        for key, converter in _LLM_FIELDS.items() if key in llm_raw
+    })
     _validate(app, llm)
     return Settings(app=app, llm=llm, config_path=selected.resolve())
 

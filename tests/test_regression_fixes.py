@@ -8,6 +8,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from portfolio_assistant.db import Database
 from portfolio_assistant.extraction import (
     ExtractionFailure, decode_text_bytes, safe_filename,
 )
+from portfolio_assistant.services import daily_window
 
 
 def upload(client: TestClient, project_id: str, name: str, data: bytes, **fields):
@@ -2234,3 +2236,136 @@ class TestEmbeddedMsgAttachments:
 
         with pytest.raises(ExtractionFailure, match="broken or unsupported attachment"):
             extraction_module._extract_msg(path, max_attachments=5)
+
+
+class _FakeEasternTime(tzinfo):
+    """US-Eastern-like zone with a fixed 2026 rulebook, no tzdata required."""
+
+    _SPRING = datetime(2026, 3, 8, 2, 0)   # EST -> EDT
+    _FALL = datetime(2026, 11, 1, 2, 0)    # EDT -> EST
+
+    def _is_dst(self, dt: datetime) -> bool:
+        naive = dt.replace(tzinfo=None)
+        return self._SPRING <= naive < self._FALL
+
+    def utcoffset(self, dt: datetime) -> timedelta:
+        return timedelta(hours=-4 if self._is_dst(dt) else -5)
+
+    def dst(self, dt: datetime) -> timedelta:
+        return timedelta(hours=1 if self._is_dst(dt) else 0)
+
+    def tzname(self, dt: datetime) -> str:
+        return "EDT" if self._is_dst(dt) else "EST"
+
+
+class TestDailyWindowAcrossDst:
+    """run_daily stamped both window endpoints with a single offset captured from now()."""
+
+    def test_spring_forward_window_is_23_hours(self):
+        start, end = daily_window(date(2026, 3, 9), tz=_FakeEasternTime())
+        # Midnight March 8 is still EST; midnight March 9 is EDT.
+        assert start == "2026-03-08T05:00:00+00:00"
+        assert end == "2026-03-09T04:00:00+00:00"
+        assert datetime.fromisoformat(end) - datetime.fromisoformat(start) == timedelta(hours=23)
+
+    def test_fall_back_window_is_25_hours(self):
+        start, end = daily_window(date(2026, 11, 2), tz=_FakeEasternTime())
+        assert start == "2026-11-01T04:00:00+00:00"
+        assert end == "2026-11-02T05:00:00+00:00"
+        assert datetime.fromisoformat(end) - datetime.fromisoformat(start) == timedelta(hours=25)
+
+    def test_windows_away_from_transitions_stay_24_hours(self):
+        start, end = daily_window(date(2026, 7, 15), tz=_FakeEasternTime())
+        assert datetime.fromisoformat(end) - datetime.fromisoformat(start) == timedelta(hours=24)
+
+    def test_system_zone_endpoints_are_utc_and_ordered(self):
+        start, end = daily_window(date(2026, 8, 15))
+        parsed_start, parsed_end = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        assert parsed_start.utcoffset() == timedelta(0)
+        assert parsed_end.utcoffset() == timedelta(0)
+        assert parsed_start < parsed_end
+
+    def test_run_daily_persists_the_per_date_window(self, service, monkeypatch):
+        import portfolio_assistant.services as services_module
+
+        recorded: list[date] = []
+
+        def fake_window(target: date, tz: tzinfo | None = None) -> tuple[str, str]:
+            recorded.append(target)
+            return ("2026-03-08T05:00:00+00:00", "2026-03-09T04:00:00+00:00")
+
+        monkeypatch.setattr(services_module, "daily_window", fake_window)
+        result = service.run_daily(date(2026, 3, 9))
+        assert recorded == [date(2026, 3, 9)]
+        assert result["window_start"] == "2026-03-08T05:00:00+00:00"
+        assert result["window_end"] == "2026-03-09T04:00:00+00:00"
+
+
+class TestMalformedConfigScalars:
+    """A config typo like bind_port = "8765x" escaped as a raw ValueError traceback."""
+
+    def _write_config(self, tmp_path: Path, *, app_lines: str = "", llm_lines: str = "") -> Path:
+        one_drive = tmp_path / "one-drive"
+        one_drive.mkdir(exist_ok=True)
+        config = tmp_path / "config.toml"
+        config.write_text(
+            "[app]\n"
+            f'database_path = "{(tmp_path / "portfolio.db").as_posix()}"\n'
+            f'one_drive_root = "{one_drive.as_posix()}"\n'
+            f"{app_lines}"
+            "[llm]\n"
+            f"{llm_lines}",
+            encoding="utf-8",
+        )
+        return config
+
+    def test_bad_app_integer_names_the_key(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._write_config(tmp_path, app_lines='bind_port = "8765x"\n')
+        with pytest.raises(ConfigurationError, match="bind_port"):
+            load_settings(config)
+
+    def test_bad_app_float_names_the_key(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._write_config(tmp_path, app_lines='worker_poll_seconds = "fast"\n')
+        with pytest.raises(ConfigurationError, match="worker_poll_seconds"):
+            load_settings(config)
+
+    def test_bad_llm_float_names_the_key(self, tmp_path):
+        from portfolio_assistant.config import ConfigurationError, load_settings
+
+        config = self._write_config(tmp_path, llm_lines='timeout_seconds = "slow"\n')
+        with pytest.raises(ConfigurationError, match="timeout_seconds"):
+            load_settings(config)
+
+    def test_cli_prints_an_error_line_instead_of_a_traceback(self, tmp_path, capsys):
+        from portfolio_assistant import cli
+
+        config = self._write_config(tmp_path, app_lines='bind_port = "8765x"\n')
+        assert cli.main(["--config", str(config), "migrate"]) == 2
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "bind_port" in out
+
+    def test_cli_reports_an_off_host_chat_path_as_an_error_line(self, tmp_path, capsys):
+        # InternalHttpLlmAdapter.__init__ raises LlmContractError for a chat
+        # URL that leaves the configured host; cli.main did not catch it.
+        from portfolio_assistant import cli
+
+        config = self._write_config(
+            tmp_path, llm_lines='chat_path = "https://other.example.invalid/v1/chat"\n'
+        )
+        assert cli.main(["--config", str(config), "migrate"]) == 2
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "host" in out.lower()
+
+
+class TestEmptyPortfolioMetrics:
+    """sum() over zero projects returned NULL, so the dashboard rendered em dashes."""
+
+    def test_metrics_are_zero_not_null_on_an_empty_portfolio(self, client: TestClient):
+        payload = client.get("/api/projects").json()
+        assert payload["metrics"] == {"total": 0, "active": 0, "red": 0}

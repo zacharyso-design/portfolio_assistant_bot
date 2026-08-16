@@ -15,8 +15,10 @@ automatic_ai_attempts = 2
 adapter = "internal"
 base_url = "https://api.genai.mil"
 chat_path = "/v1/chat/completions"
-model = "gemini-3.5-flash"
-judgment_model = "gemini-3.1-pro-preview"
+# Confirm against the live catalog in Settings; the values below are the
+# models GenAI.mil actually served as of August 2026.
+model = "gemini-3.7-flash"
+judgment_model = "gemini-3.7-flash"
 api_key_env = "GENAI_API_KEY"
 auth_header = "Authorization"
 auth_scheme = "Bearer"

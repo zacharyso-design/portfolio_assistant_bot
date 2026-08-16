@@ -118,27 +118,61 @@ def test_run_server_treats_keyboard_interrupt_as_normal_non_windows_shutdown(mon
     assert cli._run_server(InterruptingServer()) == 0
 
 
-def test_serve_reload_preserves_uvicorn_runner(settings, monkeypatch):
-    app = object()
+def test_serve_reload_passes_an_import_string(settings, monkeypatch):
+    # uvicorn's reloader re-imports the app in a child process and rejects an
+    # app instance with exit code 1, so --reload must get an import string.
+    # The previous version of this test asserted the instance was passed,
+    # which kept the suite green while the command always failed.
     calls: list[tuple[object, dict[str, object]]] = []
 
     def record_run(selected_app, **kwargs) -> None:
         calls.append((selected_app, kwargs))
 
-    class UnexpectedServer:
-        def __init__(self, config) -> None:
-            raise AssertionError("serve --reload must retain uvicorn.run")
+    def unexpected_create_app(_settings) -> object:
+        raise AssertionError("--reload must defer app construction to the reload child")
 
     monkeypatch.setattr(cli, "load_settings", lambda _: settings)
-    monkeypatch.setattr(cli, "create_app", lambda _: app)
+    monkeypatch.setattr(cli, "create_app", unexpected_create_app)
     monkeypatch.setattr(cli.uvicorn, "run", record_run)
-    monkeypatch.setattr(cli.uvicorn, "Server", UnexpectedServer)
 
     assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
-    assert calls == [(app, {
+    assert calls == [("portfolio_assistant.api:create_app", {
+        "factory": True,
         "host": "127.0.0.1",
         "port": 8765,
         "reload": True,
+        "log_config": None,
+    })]
+
+
+def test_serve_reload_import_string_resolves_to_the_app_factory(settings, monkeypatch):
+    import importlib
+
+    recorded: list[str] = []
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    monkeypatch.setattr(
+        cli.uvicorn, "run",
+        lambda target, **kwargs: recorded.append(target),
+    )
+    assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
+    module_name, _, attribute = recorded[0].partition(":")
+    factory = getattr(importlib.import_module(module_name), attribute)
+    assert callable(factory)
+
+
+def test_serve_without_reload_keeps_the_app_instance(settings, monkeypatch):
+    app = object()
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "create_app", lambda _: app)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda a, **kw: calls.append((a, kw)))
+
+    assert cli.main(["--config", "unused.toml", "serve"]) == 0
+    assert calls == [(app, {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "reload": False,
         "log_config": None,
     })]
 

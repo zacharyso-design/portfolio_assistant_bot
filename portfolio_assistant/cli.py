@@ -17,7 +17,7 @@ from . import APPLICATION_ID
 from .api import create_app
 from .config import ConfigurationError, Settings, ensure_runtime_paths, load_settings
 from .db import Database
-from .llm import LlmUnavailable, build_adapter
+from .llm import LlmContractError, LlmUnavailable, build_adapter
 from .services import PortfolioService, ValidationError
 
 
@@ -166,19 +166,27 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 opener.start()
             try:
-                app = create_app(settings)
                 if args.command == "launch":
                     config = uvicorn.Config(
-                        app, host=settings.app.bind_host, port=settings.app.bind_port,
-                        reload=False, log_config=None,
+                        create_app(settings), host=settings.app.bind_host,
+                        port=settings.app.bind_port, reload=False, log_config=None,
                     )
                     exit_code = _run_server(uvicorn.Server(config))
                     if exit_code:
                         return exit_code
+                elif args.reload:
+                    # The reloader re-imports the app in a child process, so it
+                    # requires an import string; passing an instance exits 1.
+                    # The child reads PORTFOLIO_ASSISTANT_CONFIG set above.
+                    uvicorn.run(
+                        "portfolio_assistant.api:create_app", factory=True,
+                        host=settings.app.bind_host, port=settings.app.bind_port,
+                        reload=True, log_config=None,
+                    )
                 else:
                     uvicorn.run(
-                        app, host=settings.app.bind_host, port=settings.app.bind_port,
-                        reload=args.reload, log_config=None,
+                        create_app(settings), host=settings.app.bind_host,
+                        port=settings.app.bind_port, reload=False, log_config=None,
                     )
             finally:
                 stop.set()
@@ -202,7 +210,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
-    except (ConfigurationError, ValidationError, LlmUnavailable) as exc:
+    except (ConfigurationError, ValidationError, LlmContractError, LlmUnavailable) as exc:
+        # LlmContractError covers InternalHttpLlmAdapter.__init__ rejecting a
+        # config whose chat URL leaves the configured HTTPS host.
         print(f"Error: {exc}")
         return 2
 

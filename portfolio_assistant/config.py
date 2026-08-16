@@ -19,6 +19,22 @@ def _expanded_path(value: str) -> Path:
     return Path(expanded).expanduser().resolve()
 
 
+def _coerced(section: str, raw: dict, key: str, converter, default):
+    """Convert one setting, turning a bad scalar into an actionable error.
+
+    int("8765x") and float("fast") raise bare ValueError, which nothing in
+    cli.main translates, so a config typo printed a traceback instead of the
+    "Error: ..." line naming the offending key.
+    """
+    value = raw.get(key, default)
+    try:
+        return converter(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Invalid [{section}] value for {key}: {value!r} is not a {converter.__name__}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class AppSettings:
     database_path: Path
@@ -39,8 +55,8 @@ class LlmSettings:
     adapter: str = "internal"
     base_url: str = "https://api.genai.mil"
     chat_path: str = "/v1/chat/completions"
-    model: str = "gemini-3.5-flash"
-    judgment_model: str = "gemini-3.1-pro-preview"
+    model: str = "gemini-3.7-flash"
+    judgment_model: str = "gemini-3.7-flash"
     api_key_env: str = "GENAI_API_KEY"
     auth_header: str = "Authorization"
     auth_scheme: str = "Bearer"
@@ -81,13 +97,13 @@ def load_settings(path: str | Path | None = None, *, testing: bool = False) -> S
             database_path=_expanded_path(str(app_raw["database_path"])),
             one_drive_root=_expanded_path(str(app_raw["one_drive_root"])),
             bind_host=str(app_raw.get("bind_host", "127.0.0.1")),
-            bind_port=int(app_raw.get("bind_port", 8765)),
-            max_file_mb=int(app_raw.get("max_file_mb", 100)),
-            max_attachments=int(app_raw.get("max_attachments", 25)),
-            max_extracted_text_mb=int(app_raw.get("max_extracted_text_mb", 5)),
+            bind_port=_coerced("app", app_raw, "bind_port", int, 8765),
+            max_file_mb=_coerced("app", app_raw, "max_file_mb", int, 100),
+            max_attachments=_coerced("app", app_raw, "max_attachments", int, 25),
+            max_extracted_text_mb=_coerced("app", app_raw, "max_extracted_text_mb", int, 5),
             daily_run_time=str(app_raw.get("daily_run_time", "06:00")),
-            worker_poll_seconds=float(app_raw.get("worker_poll_seconds", 2)),
-            automatic_ai_attempts=int(app_raw.get("automatic_ai_attempts", 2)),
+            worker_poll_seconds=_coerced("app", app_raw, "worker_poll_seconds", float, 2),
+            automatic_ai_attempts=_coerced("app", app_raw, "automatic_ai_attempts", int, 2),
             testing=testing,
         )
     except KeyError as exc:
@@ -96,18 +112,18 @@ def load_settings(path: str | Path | None = None, *, testing: bool = False) -> S
         adapter=str(llm_raw.get("adapter", "internal")),
         base_url=str(llm_raw.get("base_url", "https://api.genai.mil")),
         chat_path=str(llm_raw.get("chat_path", "/v1/chat/completions")),
-        model=str(llm_raw.get("model", "gemini-3.5-flash")),
-        judgment_model=str(llm_raw.get("judgment_model", "gemini-3.1-pro-preview")),
+        model=str(llm_raw.get("model", "gemini-3.7-flash")),
+        judgment_model=str(llm_raw.get("judgment_model", "gemini-3.7-flash")),
         api_key_env=str(llm_raw.get("api_key_env", "GENAI_API_KEY")),
         auth_header=str(llm_raw.get("auth_header", "Authorization")),
         auth_scheme=str(llm_raw.get("auth_scheme", "Bearer")),
         ca_bundle=str(llm_raw.get("ca_bundle", "")),
-        timeout_seconds=float(llm_raw.get("timeout_seconds", 240)),
-        max_tokens=int(llm_raw.get("max_tokens", 32_000)),
-        max_attempts=int(llm_raw.get("max_attempts", 3)),
-        rate_limit_requests=int(llm_raw.get("rate_limit_requests", 120)),
-        rate_limit_window_seconds=float(llm_raw.get("rate_limit_window_seconds", 60)),
-        max_evidence_chars=int(llm_raw.get("max_evidence_chars", 30_000)),
+        timeout_seconds=_coerced("llm", llm_raw, "timeout_seconds", float, 240),
+        max_tokens=_coerced("llm", llm_raw, "max_tokens", int, 32_000),
+        max_attempts=_coerced("llm", llm_raw, "max_attempts", int, 3),
+        rate_limit_requests=_coerced("llm", llm_raw, "rate_limit_requests", int, 120),
+        rate_limit_window_seconds=_coerced("llm", llm_raw, "rate_limit_window_seconds", float, 60),
+        max_evidence_chars=_coerced("llm", llm_raw, "max_evidence_chars", int, 30_000),
     )
     _validate(app, llm)
     return Settings(app=app, llm=llm, config_path=selected.resolve())

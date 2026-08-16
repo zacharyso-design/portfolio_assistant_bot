@@ -4,7 +4,7 @@
 
 Outside the automated test harness, selecting the fake adapter also requires the explicit process-level opt-in `PORTFOLIO_ASSISTANT_ALLOW_FAKE_LLM=1`. Production configuration should always use `adapter = "internal"`.
 
-`InternalHttpLlmAdapter` is the only production adapter. Its production defaults target `https://api.genai.mil/v1/chat/completions`, use `gemini-3.5-flash` for routine extraction/rewriting, and use `gemini-3.1-pro-preview` for multi-project routing and project-fit judgment. Configuration still controls the endpoint, models, authentication header/scheme, CA bundle, timeout, token limit, retry count, process-wide sliding-window rate limit, and evidence bound. It sends OpenAI-compatible JSON messages directly with `httpx` and contains no commercial provider SDK.
+`InternalHttpLlmAdapter` is the only production adapter. Its production defaults target `https://api.genai.mil/v1/chat/completions` and use `gemini-3.7-flash` for both routine extraction/rewriting and the multi-project routing / project-fit judgment purposes; pick a stronger judgment model in Settings when the catalog offers one. Configuration still controls the endpoint, models, authentication header/scheme, CA bundle, timeout, token limit, retry count, process-wide sliding-window rate limit, and evidence bound. It sends OpenAI-compatible JSON messages directly with `httpx` and contains no commercial provider SDK.
 
 Controls:
 

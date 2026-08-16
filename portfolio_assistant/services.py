@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
@@ -114,6 +114,27 @@ def _safe_error(exc: Exception) -> str:
     if isinstance(exc, (UnsupportedSource, ExtractionFailure, ValidationError, LlmContractError, LlmUnavailable)):
         return str(exc)[:400]
     return "The operation failed. See application diagnostics for the safe error code."
+
+
+def daily_window(target: date, tz: tzinfo | None = None) -> tuple[str, str]:
+    """UTC bounds of the local calendar day preceding ``target``.
+
+    Each midnight is converted separately so it carries the UTC offset in
+    effect on that date. A single offset captured from ``datetime.now()``
+    is wrong for one endpoint whenever the window crosses a DST change,
+    which shifted the whole window by an hour. Naive datetimes get the
+    platform's rules for their own date from ``astimezone()``; ``tz`` exists
+    so tests can supply a DST-observing zone deterministically.
+    """
+    start = datetime.combine(target - timedelta(days=1), time.min)
+    end = datetime.combine(target, time.min)
+    if tz is not None:
+        start = start.replace(tzinfo=tz)
+        end = end.replace(tzinfo=tz)
+    return (
+        start.astimezone(timezone.utc).isoformat(),
+        end.astimezone(timezone.utc).isoformat(),
+    )
 
 
 class PortfolioService:
@@ -1359,8 +1380,8 @@ class PortfolioService:
             ).fetchall()]
             metrics = dict(connection.execute(
                 """SELECT count(*) AS total,
-                   sum(CASE WHEN status <> 'Complete' THEN 1 ELSE 0 END) AS active,
-                   sum(CASE WHEN status = 'Red' THEN 1 ELSE 0 END) AS red
+                   coalesce(sum(CASE WHEN status <> 'Complete' THEN 1 ELSE 0 END), 0) AS active,
+                   coalesce(sum(CASE WHEN status = 'Red' THEN 1 ELSE 0 END), 0) AS red
                    FROM projects"""
             ).fetchone())
         return {
@@ -5126,19 +5147,14 @@ class PortfolioService:
         return path, safe_filename(row["display_name"], row["original_filename"])
 
     def run_daily(self, run_date: date | None = None) -> dict[str, Any]:
-        local_now = datetime.now().astimezone()
-        target = run_date or local_now.date()
+        target = run_date or datetime.now().astimezone().date()
         with self.db.connect() as connection:
             existing = connection.execute(
                 "SELECT * FROM daily_runs WHERE run_date = ?", (target.isoformat(),)
             ).fetchone()
         if existing:
             return self._decode_daily(existing)
-        local_tz = local_now.tzinfo
-        window_start_local = datetime.combine(target - timedelta(days=1), time.min, tzinfo=local_tz)
-        window_end_local = datetime.combine(target, time.min, tzinfo=local_tz)
-        window_start = window_start_local.astimezone(timezone.utc).isoformat()
-        window_end = window_end_local.astimezone(timezone.utc).isoformat()
+        window_start, window_end = daily_window(target)
         with self.db.connect() as connection:
             rows = connection.execute(
                 """

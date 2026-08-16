@@ -102,6 +102,28 @@ For a project-fit review, choose **Keep in this project**, select a different pr
 Push-Location frontend; npm ci; npm run build; Pop-Location
 ```
 
+## Remote diagnostics (GFE)
+
+The app writes a rotating diagnostic log beside its database
+(`<database dir>\logs\assistant.log`). To debug an instance on a machine you
+cannot reach (a GFE workstation), mirror the log to a **private** GitHub
+repository — the app pushes it itself over the GitHub API; no git install
+needed:
+
+1. On GitHub, create a fine-grained personal access token: *Only select
+   repositories* → the private diagnostics repository, *Repository
+   permissions* → **Contents: Read and write**. Use an expiry your policy
+   allows.
+2. On the machine running the app:
+   `setx PORTFOLIO_ASSISTANT_DIAGNOSTICS_TOKEN "<token>"` — then open a new
+   terminal so the variable is visible.
+3. Uncomment the `[diagnostics]` section in `config.toml` and set `repo`.
+
+While the app runs, the log tail appears at `logs/<hostname>/assistant.log`
+in the private repository within the publish interval (default 5 minutes)
+whenever it changes. Never point `repo` at a public repository: the log
+contains project names and work data.
+
 ## Backup and recovery
 
 The OneDrive package archive is the durable record. The active SQLite database remains outside OneDrive to avoid sync conflicts and can be rebuilt from the archive. For a complete point-in-time backup of UI/cache state as well, stop the application, then copy the configured `database_path` and `one_drive_root`; SQLite WAL/SHM files can exist while the app is running. Originals, source records, updates, review history, and source lifecycle events are append-oriented, and the application has no broad cleanup command. A source removed through the UI is recoverably archived rather than deleted from disk.

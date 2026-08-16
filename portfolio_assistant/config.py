@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -68,6 +69,10 @@ _LLM_FIELDS: dict[str, type] = {
     "rate_limit_requests": int, "rate_limit_window_seconds": float,
     "max_evidence_chars": int,
 }
+_DIAGNOSTICS_FIELDS: dict[str, type] = {
+    "repo": str, "token_env": str, "publish_interval_seconds": float,
+}
+_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -105,9 +110,24 @@ class LlmSettings:
 
 
 @dataclass(frozen=True)
+class DiagnosticsSettings:
+    """Optional mirroring of the diagnostic log to a PRIVATE GitHub repo.
+
+    Exists because the app runs on a GFE workstation the person debugging it
+    cannot reach; publishing replaces relaying log fragments by email. Off
+    unless repo is set AND the token environment variable is present.
+    """
+
+    repo: str = ""
+    token_env: str = "PORTFOLIO_ASSISTANT_DIAGNOSTICS_TOKEN"
+    publish_interval_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
 class Settings:
     app: AppSettings
     llm: LlmSettings
+    diagnostics: DiagnosticsSettings = field(default_factory=DiagnosticsSettings)
     config_path: Path | None = None
 
     @property
@@ -141,11 +161,25 @@ def load_settings(path: str | Path | None = None, *, testing: bool = False) -> S
         key: _coerced("llm", key, llm_raw[key], converter)
         for key, converter in _LLM_FIELDS.items() if key in llm_raw
     })
-    _validate(app, llm)
-    return Settings(app=app, llm=llm, config_path=selected.resolve())
+    diagnostics_raw = raw.get("diagnostics", {})
+    diagnostics = DiagnosticsSettings(**{
+        key: _coerced("diagnostics", key, diagnostics_raw[key], converter)
+        for key, converter in _DIAGNOSTICS_FIELDS.items() if key in diagnostics_raw
+    })
+    _validate(app, llm, diagnostics)
+    return Settings(app=app, llm=llm, diagnostics=diagnostics, config_path=selected.resolve())
 
 
-def _validate(app: AppSettings, llm: LlmSettings) -> None:
+def _validate(
+    app: AppSettings, llm: LlmSettings,
+    diagnostics: DiagnosticsSettings | None = None,
+) -> None:
+    diagnostics = diagnostics or DiagnosticsSettings()
+    if diagnostics.repo:
+        if not _REPO_PATTERN.fullmatch(diagnostics.repo):
+            raise ConfigurationError("diagnostics.repo must look like owner/name")
+        if diagnostics.publish_interval_seconds < 60:
+            raise ConfigurationError("diagnostics.publish_interval_seconds must be at least 60")
     if app.bind_host != "127.0.0.1":
         raise ConfigurationError("bind_host must be exactly 127.0.0.1")
     if not 1 <= app.bind_port <= 65_535:

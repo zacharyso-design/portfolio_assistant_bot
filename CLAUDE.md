@@ -28,6 +28,10 @@
 ## Diagnostics
 
 - The app writes a rotating local log to `<database dir>/logs/assistant.log`
-  (review creation, source state transitions, imports, bulk dismissals). It is
-  deliberately local-only; never commit or publish it — the repository is
-  public and the log can contain project names and work data.
+  (review creation, source state transitions, imports, bulk dismissals).
+- When `[diagnostics] repo` is configured, the log tail is mirrored to that
+  PRIVATE repository (`portfolio-assistant-diagnostics`) via the GitHub
+  Contents API — pure httpx, no git needed on the machine. To debug a remote
+  instance, read `logs/<hostname>/assistant.log` there.
+- Never commit or publish the log to THIS repository — it is public and the
+  log can contain project names and work data.

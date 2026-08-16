@@ -31,3 +31,15 @@ max_attempts = 3
 rate_limit_requests = 120
 rate_limit_window_seconds = 60
 max_evidence_chars = 30000
+
+# Optional: mirror the diagnostic log to a PRIVATE GitHub repository so it
+# can be reviewed without copying files off this machine. Leave repo empty to
+# disable. Create a fine-grained personal access token restricted to ONLY the
+# private diagnostics repository with Contents read/write, and store it in
+# the environment variable named by token_env (setx, then open a new
+# terminal). The log tail is pushed to logs/<hostname>/assistant.log whenever
+# it changes, at most once per publish interval.
+# [diagnostics]
+# repo = "zacharyso-design/portfolio-assistant-diagnostics"
+# token_env = "PORTFOLIO_ASSISTANT_DIAGNOSTICS_TOKEN"
+# publish_interval_seconds = 300

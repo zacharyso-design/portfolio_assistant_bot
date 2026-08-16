@@ -106,6 +106,7 @@ export const backend = {
     list: () => apiClient.get<Review[]>("/api/reviews?status=open"),
     upload: (file: File, fields: TranscriptFields) => apiClient.upload<void>("/api/intake/multi-project", file, fields),
     resolve: (reviewId: number, body: unknown) => apiClient.post<void>(`/api/reviews/${reviewId}/resolve`, body),
+    dismissAll: (kind: string) => apiClient.post<{ dismissed: number; kind: string }>("/api/reviews/dismiss-all", { kind }),
   },
   snow: {
     import: (file: File) => apiClient.upload<SnowImportResult>("/api/import/servicenow", file),

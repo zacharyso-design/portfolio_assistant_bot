@@ -7,6 +7,8 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import date
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -29,6 +31,40 @@ from .services import (
 LOGGER = logging.getLogger(__name__)
 WORKER_MAX_BACKOFF_MULTIPLIER = 30
 SHUTDOWN_GRACE_SECONDS = 10.0
+
+
+def diagnostic_log_path(settings: Settings) -> Path:
+    return settings.app.database_path.parent / "logs" / "assistant.log"
+
+
+def _configure_diagnostic_log(settings: Settings) -> Path | None:
+    """Attach a rotating file log so failures are reviewable after the fact.
+
+    Review floods, LLM contract errors, and import outcomes previously lived
+    only in the terminal (or nowhere); this records them beside the local
+    database - never inside OneDrive, never in the repository.
+    """
+    log_path = diagnostic_log_path(settings)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    logger = logging.getLogger("portfolio_assistant")
+    logger.setLevel(logging.INFO)
+    target = str(log_path)
+    if not any(
+        isinstance(handler, RotatingFileHandler) and handler.baseFilename == target
+        for handler in logger.handlers
+    ):
+        # Tests build many apps against different databases; keep exactly one
+        # file handler, pointed at the most recent settings.
+        for handler in [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]:
+            logger.removeHandler(handler)
+            handler.close()
+        handler = RotatingFileHandler(target, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+    return log_path
 
 
 class _HashedAssetFiles(StaticFiles):
@@ -103,6 +139,10 @@ class SourceRemoval(StrictModel):
 
 class ApiKeyUpdate(StrictModel):
     api_key: SecretStr = Field(min_length=1, max_length=20_000)
+
+
+class ReviewBulkDismiss(StrictModel):
+    kind: str = Field(min_length=1, max_length=80)
 
 
 class ModelSelection(StrictModel):
@@ -208,6 +248,7 @@ class LoopbackGuard:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     ensure_runtime_paths(settings)
+    _configure_diagnostic_log(settings)
     db = Database(settings.app.database_path)
     db.migrate()
     llm = build_adapter(settings.llm)
@@ -518,6 +559,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/reviews/{review_id}/resolve")
     def resolve(review_id: int, body: ReviewResolution) -> dict[str, Any]:
         return service.resolve_review(review_id, body.model_dump(exclude_unset=True))
+
+    @app.post("/api/reviews/dismiss-all")
+    def dismiss_reviews(body: ReviewBulkDismiss) -> dict[str, Any]:
+        return service.dismiss_reviews(body.kind)
 
     @app.get("/api/routing-rules")
     def rules() -> list[dict[str, Any]]:

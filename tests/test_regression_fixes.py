@@ -2779,3 +2779,149 @@ class TestFrontendCacheHeaders:
         response = client.get(f"/assets/{assets[0].name}")
         assert response.status_code == 200
         assert response.headers.get("cache-control") == "public, max-age=31536000, immutable"
+
+
+def _seed_source_with_chunk(service, project_id: str, text: str) -> int:
+    from portfolio_assistant.db import utc_now
+
+    now = utc_now()
+    with service.db.transaction() as connection:
+        cursor = connection.execute(
+            """INSERT INTO sources(
+               project_id, source_type, sha256, original_filename, original_path,
+               metadata_json, processing_state, created_at, ingestion_id, ingestion_path,
+               capture_method, canonical_source, memory_state, project_fit_confirmed,
+               memory_state_changed_at
+               ) VALUES (?, 'snow_comments', ?, 'fictional-blank.txt', 'fictional-blank.txt',
+               '{}', 'captured', ?, ?, '', 'snow_import', 1, 'active', 1, ?)""",
+            (project_id, f"sha-{text!r}-{now}", now, f"I-{now}", now),
+        )
+        source_id = int(cursor.lastrowid)
+        connection.execute(
+            """INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state)
+               VALUES (?, ?, 0, ?, 'fictional row', 'pending')""",
+            (source_id, project_id, text),
+        )
+    return source_id
+
+
+class TestBlankEvidenceSources:
+    """A source whose chunks held only whitespace sent blank evidence to the LLM and spawned a malformed_llm review."""
+
+    def test_blank_evidence_completes_without_an_ai_call(self, client: TestClient, project, service, monkeypatch):
+        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
+        calls: list[object] = []
+        monkeypatch.setattr(
+            service.llm, "knowledge_update",
+            lambda summary, evidence: calls.append(evidence) or (_ for _ in ()).throw(AssertionError("must not be called")),
+        )
+        source_id = _seed_source_with_chunk(service, project["id"], "      ")
+        assert service.process_source(source_id) == "complete"
+        assert calls == []
+        with service.db.connect() as connection:
+            row = connection.execute("SELECT processing_state FROM sources WHERE id = ?", (source_id,)).fetchone()
+            reviews = connection.execute(
+                "SELECT count(*) FROM review_items WHERE source_id = ?", (source_id,)
+            ).fetchone()[0]
+        assert row["processing_state"] == "complete"
+        assert reviews == 0
+
+    def test_real_evidence_still_reaches_the_llm(self, client: TestClient, project, service, monkeypatch):
+        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
+        source_id = _seed_source_with_chunk(service, project["id"], "Fictional real update text.")
+        assert service.process_source(source_id) == "complete"
+        with service.db.connect() as connection:
+            reviews = connection.execute(
+                "SELECT count(*) FROM review_items WHERE source_id = ?", (source_id,)
+            ).fetchone()[0]
+        assert reviews == 0
+
+
+class TestMalformedLlmReviewDedupe:
+    """Every failed retry of the same source appended another identical malformed_llm review."""
+
+    def test_only_one_open_review_per_source(self, client: TestClient, project, service, monkeypatch):
+        from portfolio_assistant.llm import LlmContractError
+
+        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
+
+        def broken(summary, evidence):
+            raise LlmContractError("Knowledge update is missing a summary or cited updates")
+
+        monkeypatch.setattr(service.llm, "knowledge_update", broken)
+        source_id = _seed_source_with_chunk(service, project["id"], "Fictional ticket comment.")
+        for _ in range(3):
+            with service.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE sources SET processing_state = 'captured' WHERE id = ?", (source_id,)
+                )
+            assert service.process_source(source_id) == "needs_review"
+        with service.db.connect() as connection:
+            open_reviews = connection.execute(
+                "SELECT count(*) FROM review_items WHERE source_id = ? AND kind = 'malformed_llm' AND status = 'open'",
+                (source_id,),
+            ).fetchone()[0]
+        assert open_reviews == 1
+
+
+class TestBulkReviewDismissal:
+    """Clearing a flood of identical review items required one click per item."""
+
+    def _seed_reviews(self, service, project_id: str, kind: str, count: int) -> None:
+        for index in range(count):
+            service._create_review(
+                kind=kind, source_id=None, project_id=project_id,
+                question=f"Fictional question {index}?", reason="Fictional reason.",
+                evidence=[], options=[], memory_preview="No routing rule will be created.",
+            )
+
+    def test_dismiss_all_clears_one_kind_and_keeps_the_rest(self, client: TestClient, project, service):
+        self._seed_reviews(service, project["id"], "malformed_llm", 4)
+        self._seed_reviews(service, project["id"], "snow_invalid_row", 2)
+        response = client.post("/api/reviews/dismiss-all", json={"kind": "malformed_llm"})
+        assert response.status_code == 200
+        assert response.json() == {"dismissed": 4, "kind": "malformed_llm"}
+        remaining = client.get("/api/reviews?status=open").json()
+        assert {item["kind"] for item in remaining} == {"snow_invalid_row"}
+
+    def test_blank_kind_is_rejected(self, client: TestClient):
+        response = client.post("/api/reviews/dismiss-all", json={"kind": "   "})
+        assert response.status_code == 422
+
+    def test_unknown_kind_dismisses_nothing(self, client: TestClient):
+        response = client.post("/api/reviews/dismiss-all", json={"kind": "no_such_kind"})
+        assert response.status_code == 200
+        assert response.json()["dismissed"] == 0
+
+
+class TestDiagnosticLog:
+    """Failures lived only in the terminal, so debugging required the user to relay symptoms by hand."""
+
+    def test_review_creation_is_recorded_in_the_log_file(self, client: TestClient, project, service, settings):
+        log_path = settings.app.database_path.parent / "logs" / "assistant.log"
+        assert log_path.is_file()
+        service._create_review(
+            kind="malformed_llm", source_id=None, project_id=project["id"],
+            question="Fictional logged question?", reason="Fictional logged reason.",
+            evidence=[], options=[], memory_preview="No routing rule will be created.",
+        )
+        content = log_path.read_text(encoding="utf-8")
+        assert "review created: kind=malformed_llm" in content
+        assert "Fictional logged reason." in content
+
+    def test_configuration_status_names_the_log_file(self, client: TestClient):
+        status = client.get("/api/configuration").json()
+        assert status["log_file"].endswith("assistant.log")
+
+    def test_rebuilding_the_app_does_not_duplicate_handlers(self, settings):
+        import logging
+
+        from logging.handlers import RotatingFileHandler
+
+        from portfolio_assistant.api import create_app
+
+        create_app(settings)
+        create_app(settings)
+        logger = logging.getLogger("portfolio_assistant")
+        file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+        assert len(file_handlers) == 1

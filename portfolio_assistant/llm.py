@@ -94,6 +94,10 @@ class FakeLlmAdapter:
         combined = " ".join(item["text"].strip() for item in evidence if item.get("text")).strip()
         material = combined[:900]
         updated = material if not summary else f"{summary.rstrip()} {material}"[-1800:]
+        if not updated.strip():
+            # Blank evidence must not make the deterministic adapter emit an
+            # empty summary that fails the knowledge contract downstream.
+            updated = "New source evidence was added."
         operations: list[dict[str, Any]] = []
         for match in re.finditer(
             r"ACTION:\s*(?P<description>[^|\n]+)\s*\|\s*OWNER:\s*(?P<owner>[^|\n]+)\s*\|\s*DUE:\s*(?P<due>\d{4}-\d{2}-\d{2})",

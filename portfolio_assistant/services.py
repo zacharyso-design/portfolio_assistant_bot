@@ -2026,6 +2026,12 @@ class PortfolioService:
             self._record_evidence_window(source_id, dropped)
             if not bounded:
                 raise LlmContractError("No complete evidence chunk fits the configured evidence limit")
+            if not any(normalize_text(str(item.get("text") or "")) for item in bounded):
+                # Blank-bodied ticket comments and empty documents give the
+                # model nothing to summarize; asking anyway spawned one
+                # malformed_llm review per imported row.
+                self._complete_without_knowledge(source_id)
+                return "complete"
             if not bool(source["project_fit_confirmed"]) and self._require_project_fit_review(
                 source_id, project, bounded
             ):
@@ -2040,11 +2046,7 @@ class PortfolioService:
             self._set_source_state(source_id, "pending_ai", "llm_unavailable", exc, increment_retry=True)
             return "pending_ai"
         except (LlmContractError, ValidationError) as exc:
-            self._create_review(
-                kind="malformed_llm", source_id=source_id, project_id=self._source_project_id(source_id),
-                question="How should this source update the project?", reason=_safe_error(exc),
-                evidence=[], options=[], memory_preview="No routing rule will be created.",
-            )
+            self._create_malformed_llm_review(source_id, exc)
             self._set_source_state(source_id, "needs_review", "llm_contract", exc)
             return "needs_review"
         except ExtractionFailure as exc:
@@ -2152,6 +2154,9 @@ class PortfolioService:
     def _set_source_state(
         self, source_id: int, state: str, code: str, error: Exception, *, increment_retry: bool = False
     ) -> None:
+        LOGGER.info(
+            "source %s -> %s (%s): %s", source_id, state, code, _safe_error(error)[:200]
+        )
         with self.db.transaction() as connection:
             connection.execute(
                 """UPDATE sources SET processing_state = ?, error_code = ?, error_message = ?,
@@ -2163,6 +2168,62 @@ class PortfolioService:
             ).fetchone()
         if row:
             self._refresh_source_archive(int(row["parent_source_id"] or row["id"]), processing_status=state)
+
+    def _complete_without_knowledge(self, source_id: int) -> None:
+        """Close out a source whose extracted chunks hold no usable text."""
+        now = utc_now()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """WITH RECURSIVE source_tree(id) AS (
+                     SELECT ? UNION ALL
+                     SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                   )
+                   UPDATE source_chunks SET processing_state = 'complete', processed_at = ?
+                   WHERE source_id IN (SELECT id FROM source_tree)""",
+                (source_id, now),
+            )
+            connection.execute(
+                """UPDATE sources SET processing_state = 'complete', processed_at = ?,
+                   error_code = NULL, error_message = NULL, retry_count = 0,
+                   metadata_json = json_set(coalesce(metadata_json, '{}'), '$.no_extractable_update_text', 1)
+                   WHERE id = ?""",
+                (now, source_id),
+            )
+        self._refresh_source_archive(source_id, processing_status="complete")
+        LOGGER.info("source %s completed without a knowledge update: evidence text was blank", source_id)
+
+    def _create_malformed_llm_review(self, source_id: int, exc: Exception) -> None:
+        project_id = self._source_project_id(source_id)
+        with self.db.transaction() as connection:
+            existing = connection.execute(
+                "SELECT id FROM review_items WHERE source_id = ? AND kind = 'malformed_llm' AND status = 'open'",
+                (source_id,),
+            ).fetchone()
+            if existing:
+                # One open question per source; a retry that fails the same way
+                # must not grow the queue.
+                LOGGER.info("skipped duplicate malformed_llm review for source %s", source_id)
+                return
+            self._insert_review(
+                connection, "malformed_llm", source_id, project_id,
+                "How should this source update the project?", _safe_error(exc),
+                [], [], "No routing rule will be created.", utc_now(),
+            )
+
+    def dismiss_reviews(self, kind: str) -> dict[str, Any]:
+        cleaned = (kind or "").strip()
+        if not cleaned:
+            raise ValidationError("A review kind is required")
+        now = utc_now()
+        with self.db.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ?
+                   WHERE status = 'open' AND kind = ?""",
+                (_json({"action": "dismiss", "bulk": True}), now, cleaned),
+            )
+            dismissed = int(cursor.rowcount)
+        LOGGER.info("bulk-dismissed %s open %s review(s)", dismissed, cleaned)
+        return {"dismissed": dismissed, "kind": cleaned}
 
     def _ensure_extracted(self, source_id: int) -> None:
         with self.db.connect() as connection:
@@ -3879,6 +3940,10 @@ class PortfolioService:
         self, connection: sqlite3.Connection, kind: str, source_id: int | None, project_id: str | None,
         question: str, reason: str, evidence: Any, options: Any, memory_preview: str, now: str,
     ) -> int:
+        LOGGER.info(
+            "review created: kind=%s source_id=%s project_id=%s reason=%s",
+            kind, source_id, project_id, reason[:200],
+        )
         cursor = connection.execute(
             """
             INSERT INTO review_items(kind, source_id, project_id, status, question, reason,
@@ -3958,6 +4023,11 @@ class PortfolioService:
                     )
                     result["review_or_error_count"] += 1
                     result["review_item_ids"].append(review_id)
+            LOGGER.info(
+                "snow import %s: %s tickets, %s new comments, %s unchanged, %s review/error",
+                clean_name, result["tickets_read"], result["new_comments_applied"],
+                result["tickets_unchanged"], result["review_or_error_count"],
+            )
             return result
         finally:
             temp_path.unlink(missing_ok=True)
@@ -5276,6 +5346,7 @@ class PortfolioService:
         status = {
             "database_path": str(self.settings.app.database_path),
             "one_drive_root": str(self.settings.app.one_drive_root),
+            "log_file": str(self.settings.app.database_path.parent / "logs" / "assistant.log"),
             "bind": f"{self.settings.app.bind_host}:{self.settings.app.bind_port}",
             "retrieval_mode": self.db.fts_mode,
             "llm_adapter": self.settings.llm.adapter,

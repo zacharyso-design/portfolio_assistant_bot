@@ -1255,7 +1255,9 @@ class PortfolioService:
     ) -> sqlite3.Row | None:
         if multi_project:
             return connection.execute(
-                "SELECT * FROM sources WHERE project_id IS NULL AND sha256 = ?", (digest,)
+                """SELECT * FROM sources WHERE project_id IS NULL AND sha256 = ?
+                   AND parent_source_id IS NULL""",
+                (digest,),
             ).fetchone()
         if native_id:
             return connection.execute(
@@ -1869,8 +1871,9 @@ class PortfolioService:
             native_id = f"attachment:{source_id}:{sequence}"
             with self.db.connect() as connection:
                 existing_child = connection.execute(
-                    "SELECT id, processing_state FROM sources WHERE project_id = ? AND native_id = ?",
-                    (source["project_id"], native_id),
+                    """SELECT id, processing_state FROM sources
+                       WHERE project_id IS ? AND parent_source_id = ? AND native_id = ?""",
+                    (source["project_id"], source_id, native_id),
                 ).fetchone()
             if existing_child:
                 if existing_child["processing_state"] != "complete":
@@ -1878,16 +1881,29 @@ class PortfolioService:
                 continue
             filename = safe_filename(attachment.filename, f"attachment-{sequence + 1}")
             final_path = self._under_root(directory / filename)
+            digest = hashlib.sha256(attachment.data).hexdigest()
             collision = 2
             while final_path.exists():
+                relative_path = relative_to_root(final_path, package)
+                with self.db.connect() as connection:
+                    claimed = connection.execute(
+                        """SELECT 1 FROM original_files
+                           WHERE source_id = ? AND relative_path = ?""",
+                        (root_source["id"], relative_path),
+                    ).fetchone()
+                if not claimed and sha256_file(final_path) == digest:
+                    # A prior attempt can rename the attachment before its source
+                    # transaction begins. Reclaim that exact unindexed file rather
+                    # than leaving it orphaned and creating a suffixed duplicate.
+                    break
                 final_path = self._under_root(
                     directory / f"{Path(filename).stem}-{collision}{Path(filename).suffix}"
                 )
                 collision += 1
-            temp_path = self._under_root(directory / f".{uuid.uuid4().hex}.tmp")
-            temp_path.write_bytes(attachment.data)
-            digest = sha256_file(temp_path)
-            os.replace(temp_path, final_path)
+            if not final_path.exists():
+                temp_path = self._under_root(directory / f".{uuid.uuid4().hex}.tmp")
+                temp_path.write_bytes(attachment.data)
+                os.replace(temp_path, final_path)
             now = utc_now()
             with self.db.transaction() as connection:
                 cursor = connection.execute(
@@ -1905,8 +1921,9 @@ class PortfolioService:
                     child_id = int(cursor.lastrowid)
                 else:
                     existing_child = connection.execute(
-                        "SELECT id, processing_state FROM sources WHERE project_id = ? AND native_id = ?",
-                        (source["project_id"], native_id),
+                        """SELECT id, processing_state FROM sources
+                           WHERE project_id IS ? AND parent_source_id = ? AND native_id = ?""",
+                        (source["project_id"], source_id, native_id),
                     ).fetchone()
                     if not existing_child or existing_child["processing_state"] == "complete":
                         continue

@@ -76,7 +76,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_sources_project_native
 CREATE UNIQUE INDEX IF NOT EXISTS ux_sources_project_sha
   ON sources(project_id, sha256) WHERE project_id IS NOT NULL AND native_id IS NULL AND parent_source_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_sources_intake_sha
-  ON sources(sha256) WHERE project_id IS NULL;
+  ON sources(sha256) WHERE project_id IS NULL AND parent_source_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sources_intake_child_native
+  ON sources(parent_source_id, native_id)
+  WHERE project_id IS NULL AND parent_source_id IS NOT NULL AND native_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_sources_project ON sources(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_sources_state ON sources(processing_state, created_at);
 

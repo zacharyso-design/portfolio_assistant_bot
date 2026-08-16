@@ -969,3 +969,236 @@ class TestMultiProjectUnexpectedFailureContainment:
         assert source["processing_state"] == "error"
         assert source["error_code"] == "multi_project_processing_failed"
         assert "fictional unexpected implementation failure" not in source["error_message"]
+
+
+class TestSharedIntakeDuplicateAttachments:
+    """A duplicate-byte attachment in shared intake was written to disk but omitted from the index."""
+
+    def test_both_identical_attachments_are_indexed_and_manifested(
+        self, client: TestClient, service,
+    ):
+        from email.message import EmailMessage
+
+        client.post("/api/projects", json={"name": "Fictional Intake Destination"})
+        message = EmailMessage()
+        message["Subject"] = "Fictional shared-intake duplicate attachments"
+        message["From"] = "sender@example.test"
+        message["To"] = "team@example.test"
+        message.set_content("Two separately named attachments intentionally contain identical text.")
+        duplicate_bytes = b"Fictional identical attachment evidence."
+        message.add_attachment(
+            duplicate_bytes, maintype="text", subtype="plain", filename="first-evidence.txt",
+        )
+        message.add_attachment(
+            duplicate_bytes, maintype="text", subtype="plain", filename="second-evidence.txt",
+        )
+        captured = client.post(
+            "/api/intake/multi-project",
+            files={"file": ("duplicate-attachments.eml", message.as_bytes(), "message/rfc822")},
+        ).json()["source"]
+
+        processed = client.post(f"/api/sources/{captured['id']}/retry")
+        assert processed.status_code == 200, processed.text
+
+        with service.db.connect() as connection:
+            children = connection.execute(
+                """SELECT id, original_filename, sha256 FROM sources
+                   WHERE parent_source_id = ? ORDER BY id""",
+                (captured["id"],),
+            ).fetchall()
+            originals = connection.execute(
+                """SELECT original_name, relative_path, sha256 FROM original_files
+                   WHERE source_id = ? AND is_attachment = 1 ORDER BY id""",
+                (captured["id"],),
+            ).fetchall()
+            chunks = connection.execute(
+                """SELECT source_id, text FROM source_chunks
+                   WHERE source_id IN (SELECT id FROM sources WHERE parent_source_id = ?)
+                   ORDER BY source_id""",
+                (captured["id"],),
+            ).fetchall()
+        manifest = json.loads(
+            (Path(captured["ingestion_path"]) / "manifest.json").read_text(encoding="utf-8")
+        )
+        manifested_attachments = [
+            item for item in manifest["original_files"] if item.get("is_attachment")
+        ]
+
+        assert [row["original_filename"] for row in children] == [
+            "first-evidence.txt", "second-evidence.txt",
+        ]
+        assert len({row["sha256"] for row in children}) == 1
+        assert len(originals) == 2
+        assert len(manifested_attachments) == 2
+        assert len(chunks) == 2
+        assert all("Fictional identical attachment evidence" in row["text"] for row in chunks)
+
+    def test_attachment_bytes_do_not_deduplicate_a_later_root_upload(
+        self, client: TestClient, service,
+    ):
+        from email.message import EmailMessage
+
+        client.post("/api/projects", json={"name": "Fictional Root Dedupe Destination"})
+        attachment_bytes = b"Fictional bytes shared by an attachment and later root."
+        message = EmailMessage()
+        message["Subject"] = "Fictional attachment before standalone upload"
+        message.set_content("The attachment is archived before the standalone root arrives.")
+        message.add_attachment(
+            attachment_bytes, maintype="text", subtype="plain", filename="nested-first.txt",
+        )
+        email_source = client.post(
+            "/api/intake/multi-project",
+            files={"file": ("attachment-first.eml", message.as_bytes(), "message/rfc822")},
+        ).json()["source"]
+        assert client.post(f"/api/sources/{email_source['id']}/retry").status_code == 200
+        with service.db.connect() as connection:
+            child = connection.execute(
+                "SELECT id FROM sources WHERE parent_source_id = ?",
+                (email_source["id"],),
+            ).fetchone()
+
+        standalone = client.post(
+            "/api/intake/multi-project",
+            files={"file": ("standalone-later.txt", attachment_bytes, "text/plain")},
+        )
+
+        assert standalone.status_code == 202, standalone.text
+        payload = standalone.json()
+        assert payload["duplicate"] is False
+        assert payload["source"]["id"] != child["id"]
+        with service.db.connect() as connection:
+            root = connection.execute(
+                "SELECT parent_source_id FROM sources WHERE id = ?",
+                (payload["source"]["id"],),
+            ).fetchone()
+        assert root["parent_source_id"] is None
+
+        repeated = client.post(
+            "/api/intake/multi-project",
+            files={"file": ("standalone-repeated.txt", attachment_bytes, "text/plain")},
+        )
+        assert repeated.status_code == 202, repeated.text
+        assert repeated.json()["duplicate"] is True
+        assert repeated.json()["source"]["id"] == payload["source"]["id"]
+
+    def test_upgrade_installs_root_and_child_identity_constraints(self, tmp_path):
+        database = Database(tmp_path / "portfolio.db")
+        database.migrate()
+        with database.connect() as connection:
+            connection.execute("DROP INDEX ux_sources_intake_sha")
+            connection.execute("DROP INDEX IF EXISTS ux_sources_intake_child_native")
+            connection.execute(
+                "CREATE UNIQUE INDEX ux_sources_intake_sha"
+                " ON sources(sha256) WHERE project_id IS NULL"
+            )
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, source_type, sha256, original_filename, original_path,
+                   processing_state, created_at
+                   ) VALUES (1900, NULL, 'eml', 'legacy-root-sha', 'legacy.eml',
+                             'legacy.eml', 'captured', '2026-08-15')"""
+            )
+            for source_id, digest in ((1901, "legacy-child-a"), (1902, "legacy-child-b")):
+                connection.execute(
+                    """INSERT INTO sources(
+                       id, project_id, parent_source_id, source_type, native_id, sha256,
+                       original_filename, original_path, processing_state, created_at
+                       ) VALUES (?, NULL, 1900, 'txt', 'attachment:1900:0', ?,
+                                 'legacy.txt', 'legacy.txt', 'processing', '2026-08-15')""",
+                    (source_id, digest),
+                )
+            connection.execute(
+                "DELETE FROM schema_migrations"
+                " WHERE version = '005_shared_intake_attachment_identity'"
+            )
+            connection.commit()
+
+        database.migrate()
+
+        with database.connect() as connection:
+            indexes = {
+                row["name"]: row["sql"] for row in connection.execute(
+                    """SELECT name, sql FROM sqlite_master
+                       WHERE type = 'index' AND name IN (
+                         'ux_sources_intake_sha', 'ux_sources_intake_child_native'
+                       )"""
+                ).fetchall()
+            }
+            legacy_native_ids = [
+                row["native_id"] for row in connection.execute(
+                    "SELECT native_id FROM sources WHERE parent_source_id = 1900 ORDER BY id"
+                ).fetchall()
+            ]
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, source_type, sha256, original_filename, original_path,
+                   processing_state, created_at
+                   ) VALUES (2000, NULL, 'eml', 'root-sha', 'root.eml', 'root.eml',
+                             'captured', '2026-08-15')"""
+            )
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, parent_source_id, source_type, native_id, sha256,
+                   original_filename, original_path, processing_state, created_at
+                   ) VALUES (2001, NULL, 2000, 'txt', 'attachment:2000:0', 'same-bytes',
+                             'first.txt', 'first.txt', 'processing', '2026-08-15')"""
+            )
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, parent_source_id, source_type, native_id, sha256,
+                   original_filename, original_path, processing_state, created_at
+                   ) VALUES (2002, NULL, 2000, 'txt', 'attachment:2000:1', 'same-bytes',
+                             'second.txt', 'second.txt', 'processing', '2026-08-15')"""
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT INTO sources(
+                       id, project_id, parent_source_id, source_type, native_id, sha256,
+                       original_filename, original_path, processing_state, created_at
+                       ) VALUES (2003, NULL, 2000, 'txt', 'attachment:2000:1', 'changed-bytes',
+                                 'retry.txt', 'retry.txt', 'processing', '2026-08-15')"""
+                )
+
+        assert "parent_source_id IS NULL" in indexes["ux_sources_intake_sha"]
+        assert "parent_source_id" in indexes["ux_sources_intake_child_native"]
+        assert legacy_native_ids[0] == "attachment:1900:0"
+        assert legacy_native_ids[1] == "attachment:1900:0:legacy-duplicate:1902"
+
+    def test_retry_reclaims_an_attachment_file_left_before_database_insert(
+        self, client: TestClient, service,
+    ):
+        from portfolio_assistant.extraction import AttachmentData
+
+        captured = client.post(
+            "/api/intake/multi-project",
+            files={"file": (
+                "interrupted-parent.txt",
+                b"Fictional parent for an interrupted attachment write.",
+                "text/plain",
+            )},
+        ).json()["source"]
+        attachment_bytes = b"Fictional attachment left before its database insert."
+        attachment_dir = (
+            Path(captured["ingestion_path"]) / "Original" / "Attachments"
+        )
+        attachment_dir.mkdir(parents=True)
+        orphan = attachment_dir / "interrupted-child.txt"
+        orphan.write_bytes(attachment_bytes)
+
+        service._preserve_attachments(captured["id"], [
+            AttachmentData("interrupted-child.txt", attachment_bytes, "text/plain"),
+        ])
+
+        assert [path.name for path in attachment_dir.iterdir()] == ["interrupted-child.txt"]
+        with service.db.connect() as connection:
+            child_count = connection.execute(
+                "SELECT count(*) FROM sources WHERE parent_source_id = ?",
+                (captured["id"],),
+            ).fetchone()[0]
+            original = connection.execute(
+                """SELECT relative_path FROM original_files
+                   WHERE source_id = ? AND is_attachment = 1""",
+                (captured["id"],),
+            ).fetchone()
+        assert child_count == 1
+        assert original["relative_path"].endswith("/interrupted-child.txt")

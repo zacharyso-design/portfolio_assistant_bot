@@ -2216,7 +2216,10 @@ class PortfolioService:
                    WHERE source_id IN (SELECT id FROM source_tree)""",
                 (source_id, now),
             )
-            if bool(source["project_fit_confirmed"]):
+            if source["project_id"] and bool(source["project_fit_confirmed"]):
+                # Activation requires BOTH an assigned project and a confirmed
+                # fit; a shared-intake source (no project yet) has neither a
+                # home nor a decision, however its flags were seeded.
                 connection.execute(
                     """WITH RECURSIVE source_tree(id) AS (
                          SELECT ? UNION ALL
@@ -2236,13 +2239,23 @@ class PortfolioService:
             )
             metadata = _decode(source["metadata_json"], {})
             if source["source_type"] == "snow_comments" and metadata.get("cell_hash") and source["project_id"]:
-                connection.execute(
-                    "UPDATE projects SET snow_comments_cell_hash = ? WHERE id = ?",
-                    (metadata["cell_hash"], source["project_id"]),
-                )
+                newer = connection.execute(
+                    """SELECT 1 FROM sources
+                       WHERE project_id = ? AND source_type = 'snow_comments'
+                         AND id != ? AND created_at > ? LIMIT 1""",
+                    (source["project_id"], source_id, source["created_at"]),
+                ).fetchone()
+                # Dismissals can arrive out of order; an older source's hash
+                # must not overwrite the project's newer one, or the latest
+                # acknowledged export would re-process on the next import.
+                if not newer:
+                    connection.execute(
+                        "UPDATE projects SET snow_comments_cell_hash = ? WHERE id = ?",
+                        (metadata["cell_hash"], source["project_id"]),
+                    )
         try:
             self._refresh_source_archive(source_id, processing_status="complete")
-        except Exception:  # noqa: BLE001 - the DB transition above is committed truth
+        except (OSError, ValueError, KeyError, sqlite3.Error):  # matches rebuild_index's expected-failure tuple
             # The manifest self-heals on the next archive event or rescan;
             # raising here would misreport an already-completed source as
             # failed and skew released counts.

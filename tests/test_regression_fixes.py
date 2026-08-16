@@ -2781,10 +2781,13 @@ class TestFrontendCacheHeaders:
         assert response.headers.get("cache-control") == "public, max-age=31536000, immutable"
 
 
-def _seed_source_with_chunks(service, project_id: str, texts: list[str]) -> int:
+def _seed_source_with_chunks(
+    service, project_id: str, texts: list[str], *,
+    metadata_json: str = "{}", created_at: str | None = None,
+) -> int:
     from portfolio_assistant.db import utc_now
 
-    now = utc_now()
+    now = created_at or utc_now()
     with service.db.transaction() as connection:
         cursor = connection.execute(
             """INSERT INTO sources(
@@ -2793,8 +2796,8 @@ def _seed_source_with_chunks(service, project_id: str, texts: list[str]) -> int:
                capture_method, canonical_source, memory_state, project_fit_confirmed,
                memory_state_changed_at
                ) VALUES (?, 'snow_comments', ?, 'fictional-blank.txt', 'fictional-blank.txt',
-               '{}', 'captured', ?, ?, '', 'snow_import', 1, 'pending', 1, ?)""",
-            (project_id, f"sha-{texts!r}-{now}", now, f"I-{texts!r}-{now}", now),
+               ?, 'captured', ?, ?, '', 'snow_import', 1, 'pending', 1, ?)""",
+            (project_id, f"sha-{texts!r}-{now}", metadata_json, now, f"I-{texts!r}-{now}", now),
         )
         source_id = int(cursor.lastrowid)
         for sequence, text in enumerate(texts):
@@ -3144,6 +3147,68 @@ class TestBulkReviewDismissal:
     def test_unknown_kind_is_rejected(self, client: TestClient):
         response = client.post("/api/reviews/dismiss-all", json={"kind": "no_such_kind"})
         assert response.status_code == 422
+
+
+class TestSnowHashOrdering:
+    """An out-of-order dismissal let an older source's cell hash overwrite the project's newer one."""
+
+    def test_older_completion_does_not_regress_the_project_hash(self, client: TestClient, project, service):
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime.now(timezone.utc)
+        older = _seed_source_with_chunks(
+            service, project["id"], ["old cell"],
+            metadata_json='{"cell_hash": "fictional-hash-old"}',
+            created_at=(base - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        )
+        newer = _seed_source_with_chunks(
+            service, project["id"], ["new cell"],
+            metadata_json='{"cell_hash": "fictional-hash-new"}',
+            created_at=base.isoformat(timespec="seconds"),
+        )
+        service._complete_without_knowledge(newer, reason="reviews_dismissed")
+        service._complete_without_knowledge(older, reason="reviews_dismissed")
+        with service.db.connect() as connection:
+            recorded = connection.execute(
+                "SELECT snow_comments_cell_hash FROM projects WHERE id = ?", (project["id"],)
+            ).fetchone()["snow_comments_cell_hash"]
+        # Re-importing the latest acknowledged export must still short-circuit.
+        assert recorded == "fictional-hash-new"
+
+
+class TestSharedIntakeBlankSources:
+    """A blank shared-intake source with no assigned project was activated into memory."""
+
+    def test_blank_multi_source_completes_without_activating(self, client: TestClient, service):
+        from portfolio_assistant.db import utc_now
+
+        now = utc_now()
+        with service.db.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO sources(
+                   project_id, source_type, sha256, original_filename, original_path,
+                   metadata_json, processing_state, created_at, ingestion_id, ingestion_path,
+                   capture_method, canonical_source, memory_state, project_fit_confirmed,
+                   memory_state_changed_at
+                   ) VALUES (NULL, 'document', ?, 'fictional-shared.txt', 'fictional-shared.txt',
+                   '{"_extraction_complete": true}', 'captured', ?, ?, '', 'shared_intake', 1, 'pending', 1, ?)""",
+                (f"sha-shared-{now}", now, f"I-shared-{now}", now),
+            )
+            source_id = int(cursor.lastrowid)
+            connection.execute(
+                """INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state)
+                   VALUES (?, NULL, 0, '   ', 'fictional row', 'pending')""",
+                (source_id,),
+            )
+        assert service.process_multi_source(source_id) == "complete"
+        with service.db.connect() as connection:
+            row = connection.execute(
+                "SELECT memory_state, processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        assert row["processing_state"] == "complete"
+        # No project and no fit decision: activation would put unowned
+        # material into active memory on the strength of seeded flags.
+        assert row["memory_state"] == "pending"
 
 
 class TestDiagnosticLog:

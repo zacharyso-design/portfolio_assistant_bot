@@ -35,7 +35,7 @@ from .archive import (
     windows_path_units,
     write_project_files,
 )
-from .config import Settings
+from .config import Settings, diagnostic_log_path
 from .db import Database, utc_now
 from .extraction import (
     ExtractionFailure,
@@ -155,6 +155,7 @@ class PortfolioService:
         self.archive_paths = ensure_archive_roots(settings.app.one_drive_root)
         self.migrate_archive()
         self._recover_routing_publications()
+        self._release_stranded_sources()
 
     def _under_root(self, path: Path) -> Path:
         root = self.settings.app.one_drive_root.resolve()
@@ -2027,10 +2028,15 @@ class PortfolioService:
             if not bounded:
                 raise LlmContractError("No complete evidence chunk fits the configured evidence limit")
             if not any(normalize_text(str(item.get("text") or "")) for item in bounded):
+                if dropped:
+                    # Real text existed but every chunk of it exceeded the
+                    # evidence limit; completing here would silently discard it.
+                    raise LlmContractError("No complete evidence chunk fits the configured evidence limit")
                 # Blank-bodied ticket comments and empty documents give the
                 # model nothing to summarize; asking anyway spawned one
-                # malformed_llm review per imported row.
-                self._complete_without_knowledge(source_id)
+                # malformed_llm review per imported row. Memory activation is
+                # derived inside the helper: never for unconfirmed material.
+                self._complete_without_knowledge(source_id, reason="blank_evidence")
                 return "complete"
             if not bool(source["project_fit_confirmed"]) and self._require_project_fit_review(
                 source_id, project, bounded
@@ -2169,10 +2175,38 @@ class PortfolioService:
         if row:
             self._refresh_source_archive(int(row["parent_source_id"] or row["id"]), processing_status=state)
 
-    def _complete_without_knowledge(self, source_id: int) -> None:
-        """Close out a source whose extracted chunks hold no usable text."""
+    def _complete_without_knowledge(
+        self, source_id: int, *, reason: str, only_if_unreviewed: bool = False
+    ) -> bool:
+        """Close out a source that is kept without an AI knowledge pass.
+
+        Mirrors _commit_knowledge's terminal bookkeeping — chunks complete,
+        retry counters cleared, the SNOW cell hash recorded. Memory is derived
+        from the source itself: fit-confirmed material activates (matching
+        _commit_knowledge), while material whose project fit was never
+        confirmed stays memory-pending — activating it would bypass the fit
+        invariant, and marking it removed would bypass the archive-removal
+        lifecycle (package move, prior-state record) that restore depends on.
+        Descendants already removed from memory by the user keep that state.
+        With only_if_unreviewed, the absence of open reviews is re-verified
+        inside this transaction, so a review created concurrently can never be
+        left attached to a completed source. Returns True when the database
+        transition committed.
+        """
         now = utc_now()
         with self.db.transaction() as connection:
+            source = connection.execute(
+                "SELECT * FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+            if not source:
+                return False
+            if only_if_unreviewed:
+                open_count = connection.execute(
+                    "SELECT count(*) FROM review_items WHERE source_id = ? AND status = 'open'",
+                    (source_id,),
+                ).fetchone()[0]
+                if open_count:
+                    return False
             connection.execute(
                 """WITH RECURSIVE source_tree(id) AS (
                      SELECT ? UNION ALL
@@ -2182,15 +2216,42 @@ class PortfolioService:
                    WHERE source_id IN (SELECT id FROM source_tree)""",
                 (source_id, now),
             )
+            if bool(source["project_fit_confirmed"]):
+                connection.execute(
+                    """WITH RECURSIVE source_tree(id) AS (
+                         SELECT ? UNION ALL
+                         SELECT s.id FROM sources s JOIN source_tree t ON s.parent_source_id = t.id
+                       )
+                       UPDATE sources SET memory_state = 'active', memory_state_changed_at = ?
+                       WHERE id IN (SELECT id FROM source_tree)
+                         AND memory_state != 'removed'""",
+                    (source_id, now),
+                )
             connection.execute(
                 """UPDATE sources SET processing_state = 'complete', processed_at = ?,
                    error_code = NULL, error_message = NULL, retry_count = 0,
-                   metadata_json = json_set(coalesce(metadata_json, '{}'), '$.no_extractable_update_text', 1)
+                   metadata_json = json_set(coalesce(metadata_json, '{}'), '$.completed_without_knowledge', ?)
                    WHERE id = ?""",
-                (now, source_id),
+                (now, reason, source_id),
             )
-        self._refresh_source_archive(source_id, processing_status="complete")
-        LOGGER.info("source %s completed without a knowledge update: evidence text was blank", source_id)
+            metadata = _decode(source["metadata_json"], {})
+            if source["source_type"] == "snow_comments" and metadata.get("cell_hash") and source["project_id"]:
+                connection.execute(
+                    "UPDATE projects SET snow_comments_cell_hash = ? WHERE id = ?",
+                    (metadata["cell_hash"], source["project_id"]),
+                )
+        try:
+            self._refresh_source_archive(source_id, processing_status="complete")
+        except Exception:  # noqa: BLE001 - the DB transition above is committed truth
+            # The manifest self-heals on the next archive event or rescan;
+            # raising here would misreport an already-completed source as
+            # failed and skew released counts.
+            LOGGER.warning(
+                "archive refresh failed after completing source %s; the next rescan reconciles it",
+                source_id, exc_info=True,
+            )
+        LOGGER.info("source %s completed without a knowledge update (%s)", source_id, reason)
+        return True
 
     def _create_malformed_llm_review(self, source_id: int, exc: Exception) -> None:
         project_id = self._source_project_id(source_id)
@@ -2199,31 +2260,128 @@ class PortfolioService:
                 "SELECT id FROM review_items WHERE source_id = ? AND kind = 'malformed_llm' AND status = 'open'",
                 (source_id,),
             ).fetchone()
-            if existing:
-                # One open question per source; a retry that fails the same way
-                # must not grow the queue.
-                LOGGER.info("skipped duplicate malformed_llm review for source %s", source_id)
-                return
-            self._insert_review(
-                connection, "malformed_llm", source_id, project_id,
-                "How should this source update the project?", _safe_error(exc),
-                [], [], "No routing rule will be created.", utc_now(),
-            )
+            if not existing:
+                self._insert_review(
+                    connection, "malformed_llm", source_id, project_id,
+                    "How should this source update the project?", _safe_error(exc),
+                    [], [], "No routing rule will be created.", utc_now(),
+                )
+        if existing:
+            # One open question per source; a retry that fails the same way
+            # must not grow the queue.
+            LOGGER.info("skipped duplicate malformed_llm review for source %s", source_id)
+
+    # Kinds that are pure automatic-failure noise: dismissing them carries no
+    # decision, so they may be cleared in bulk. Kinds whose resolution has
+    # required side effects (project_fit, multi_project_route, action_*) must
+    # be resolved one at a time through resolve_review.
+    BULK_DISMISSABLE_REVIEW_KINDS = frozenset({
+        "malformed_llm", "snow_invalid_row", "snow_unparseable_comments",
+    })
 
     def dismiss_reviews(self, kind: str) -> dict[str, Any]:
         cleaned = (kind or "").strip()
-        if not cleaned:
-            raise ValidationError("A review kind is required")
+        if cleaned not in self.BULK_DISMISSABLE_REVIEW_KINDS:
+            raise ValidationError(
+                "Only repeated automatic-failure reviews can be dismissed in bulk; "
+                "resolve routing and project-fit items individually"
+            )
         now = utc_now()
         with self.db.transaction() as connection:
+            source_rows = connection.execute(
+                """SELECT DISTINCT source_id FROM review_items
+                   WHERE status = 'open' AND kind = ? AND source_id IS NOT NULL""",
+                (cleaned,),
+            ).fetchall()
             cursor = connection.execute(
                 """UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ?
                    WHERE status = 'open' AND kind = ?""",
                 (_json({"action": "dismiss", "bulk": True}), now, cleaned),
             )
             dismissed = int(cursor.rowcount)
-        LOGGER.info("bulk-dismissed %s open %s review(s)", dismissed, cleaned)
-        return {"dismissed": dismissed, "kind": cleaned}
+        released = 0
+        for row in source_rows:
+            try:
+                released += int(self._release_dismissed_source(int(row["source_id"])))
+            except Exception:  # noqa: BLE001 - one archive failure must not strand the rest
+                LOGGER.warning(
+                    "failed to release source %s after bulk dismissal; startup reconciliation will retry",
+                    row["source_id"], exc_info=True,
+                )
+        LOGGER.info(
+            "bulk-dismissed %s open %s review(s); released %s source(s)",
+            dismissed, cleaned, released,
+        )
+        return {"dismissed": dismissed, "kind": cleaned, "sources_released": released}
+
+    def _release_dismissed_source(self, source_id: int) -> bool:
+        """Un-strand a needs_review source once its last open review is gone.
+
+        Dismissing "how should this update the project?" means: keep the
+        source, create no knowledge from it. Without this, the source stayed
+        needs_review forever — retry_source requeues only while an open
+        malformed_llm review exists, and process_pending never selects
+        needs_review.
+        """
+        with self.db.connect() as connection:
+            source = connection.execute(
+                "SELECT id, processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        if not source or source["processing_state"] != "needs_review":
+            return False
+        # The open-review check happens atomically inside the completion
+        # transaction (only_if_unreviewed), so a review inserted between here
+        # and there aborts the release instead of being orphaned.
+        return self._complete_without_knowledge(
+            source_id, reason="reviews_dismissed", only_if_unreviewed=True
+        )
+
+    def _release_stranded_sources(self) -> None:
+        """Heal sources stuck in needs_review with no open review to resolve.
+
+        Pre-fix dismissals closed reviews without releasing their sources, and
+        a crash between dismissal and release can recreate that state. Nothing
+        else is processing at startup, so releasing here is safe and makes the
+        dismissal flow durably recoverable rather than atomic.
+        """
+        kinds = ", ".join(f"'{kind}'" for kind in sorted(self.BULK_DISMISSABLE_REVIEW_KINDS))
+        with self.db.connect() as connection:
+            # Only an EXPLICIT dismissal of an automatic-failure review proves
+            # completion was intended. The status column alone is overloaded:
+            # retry_source also marks old reviews dismissed but with
+            # resolution action "retry" - a request for another attempt, not
+            # for completion. And "no open review" alone also matches a source
+            # orphaned by a crash between its needs_review insert and its
+            # review creation - that one must WAIT for its review, not be
+            # silently completed (which would even record its SNOW cell hash
+            # and bury the ticket).
+            rows = connection.execute(
+                f"""SELECT id FROM sources
+                   WHERE processing_state = 'needs_review'
+                     AND EXISTS (
+                       SELECT 1 FROM review_items
+                       WHERE review_items.source_id = sources.id
+                         AND review_items.status = 'dismissed'
+                         AND review_items.kind IN ({kinds})
+                         AND json_extract(review_items.resolution_json, '$.action') = 'dismiss'
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM review_items
+                       WHERE review_items.source_id = sources.id
+                         AND review_items.status = 'open'
+                     )""",
+            ).fetchall()
+        released = 0
+        for row in rows:
+            try:
+                self._complete_without_knowledge(int(row["id"]), reason="reviews_dismissed")
+                released += 1
+            except Exception:  # noqa: BLE001 - keep healing the rest
+                LOGGER.warning(
+                    "startup release of stranded source %s failed", row["id"], exc_info=True
+                )
+        if released:
+            LOGGER.info("released %s stranded needs_review source(s) at startup", released)
 
     def _ensure_extracted(self, source_id: int) -> None:
         with self.db.connect() as connection:
@@ -3940,10 +4098,6 @@ class PortfolioService:
         self, connection: sqlite3.Connection, kind: str, source_id: int | None, project_id: str | None,
         question: str, reason: str, evidence: Any, options: Any, memory_preview: str, now: str,
     ) -> int:
-        LOGGER.info(
-            "review created: kind=%s source_id=%s project_id=%s reason=%s",
-            kind, source_id, project_id, reason[:200],
-        )
         cursor = connection.execute(
             """
             INSERT INTO review_items(kind, source_id, project_id, status, question, reason,
@@ -3952,7 +4106,19 @@ class PortfolioService:
             """,
             (kind, source_id, project_id, question, reason, _json(evidence), _json(options), memory_preview, now),
         )
-        return int(cursor.lastrowid)
+        # INFO from inside the caller's write transaction is deliberate:
+        # every review-creation path must leave a diagnostic record, and
+        # several call sites live inside larger transactions (the pathological
+        # blocking case was rotation contention, eliminated by delay=True and
+        # the reload-parent opt-out). Logged AFTER the insert succeeds; if the
+        # enclosing transaction later rolls back, the id below will have no
+        # matching row, which is itself the diagnostic.
+        review_id = int(cursor.lastrowid)
+        LOGGER.info(
+            "review recorded (pending commit): id=%s kind=%s source_id=%s project_id=%s reason=%s",
+            review_id, kind, source_id, project_id, reason[:200],
+        )
+        return review_id
 
     def _create_review(
         self, *, kind: str, source_id: int | None, project_id: str | None, question: str,
@@ -4183,16 +4349,27 @@ class PortfolioService:
                 state="needs_review",
             )
             with self.db.transaction() as connection:
-                connection.execute(
-                    "INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state) VALUES (?, ?, 0, ?, 'unparsed cumulative comments', 'needs_review')",
-                    (source_id, project_id, comments),
-                )
-                review_id = self._insert_review(
-                    connection, "snow_unparseable_comments", source_id, project_id,
-                    "Where are the entry boundaries in this cumulative SNOW comment cell?",
-                    str(exc), [{"source_id": source_id, "excerpt": comments[:1200]}], [],
-                    "No routing rule will be created.", utc_now(),
-                )
+                # Re-importing the same broken export re-enters this branch
+                # (the cell hash is recorded only on success); one open
+                # question per source, not one per import attempt.
+                existing_review = connection.execute(
+                    """SELECT id FROM review_items
+                       WHERE source_id = ? AND kind = 'snow_unparseable_comments' AND status = 'open'""",
+                    (source_id,),
+                ).fetchone()
+                if existing_review:
+                    review_id = int(existing_review["id"])
+                else:
+                    connection.execute(
+                        "INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state) VALUES (?, ?, 0, ?, 'unparsed cumulative comments', 'needs_review')",
+                        (source_id, project_id, comments),
+                    )
+                    review_id = self._insert_review(
+                        connection, "snow_unparseable_comments", source_id, project_id,
+                        "Where are the entry boundaries in this cumulative SNOW comment cell?",
+                        str(exc), [{"source_id": source_id, "excerpt": comments[:1200]}], [],
+                        "No routing rule will be created.", utc_now(),
+                    )
             return {"project_id": project_id, "new_comments_applied": 0, "unchanged": False, "pending_ai": False, "review_id": review_id}
         now = utc_now()
         with self.db.transaction() as connection:
@@ -4319,6 +4496,12 @@ class PortfolioService:
             evidence = self._source_evidence(source_id)
             if not evidence:
                 raise UnsupportedSource("No supported text could be extracted")
+            if not any(normalize_text(str(item.get("text") or "")) for item in evidence):
+                # Same rule as process_source: blank content routes nowhere and
+                # summarizes to nothing; asking the model burned a call and
+                # ended in error while the single-project path completed.
+                self._complete_without_knowledge(source_id, reason="blank_evidence")
+                return "complete"
             with self.db.connect() as connection:
                 source = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
                 projects = [dict(row) for row in connection.execute(
@@ -4456,6 +4639,18 @@ class PortfolioService:
         action = resolution.get("action", "apply")
         if action not in {"apply", "dismiss"}:
             raise ValidationError("Review action must be apply or dismiss")
+        if (
+            pending_review
+            and pending_review["kind"] in self.BULK_DISMISSABLE_REVIEW_KINDS
+            and action == "apply"
+        ):
+            # Automatic-failure reviews carry no applicable decision; the
+            # generic Apply used to mark them resolved while leaving the
+            # source in needs_review with no open review to advance it.
+            # Apply and Dismiss mean the same thing here: acknowledge and
+            # release the source.
+            action = "dismiss"
+            resolution = {**resolution, "action": "dismiss", "requested_action": "apply"}
         now = utc_now()
         routing_publication: dict[str, Any] = {}
         try:
@@ -4581,6 +4776,24 @@ class PortfolioService:
                     exc_info=True,
                 )
         decoded = self._decode_review(updated)
+        if (
+            action == "dismiss"
+            and review["kind"] in self.BULK_DISMISSABLE_REVIEW_KINDS
+            and review["source_id"]
+        ):
+            # Same un-stranding as the bulk path: a dismissed automatic-failure
+            # review must not leave its source in needs_review forever. The
+            # review row is already committed, so a release failure here must
+            # not surface as a resolve error - startup reconciliation retries
+            # it from the recorded dismissal.
+            try:
+                self._release_dismissed_source(int(review["source_id"]))
+            except Exception:  # noqa: BLE001
+                LOGGER.warning(
+                    "failed to release source %s after dismissing review %s; "
+                    "startup reconciliation will retry",
+                    review["source_id"], review_id, exc_info=True,
+                )
         # cross_project_evidence is retained here solely for pre-migration review compatibility.
         if action == "apply" and review["kind"] in {"multi_project_route", "cross_project_evidence"}:
             if review["source_id"]:
@@ -5346,7 +5559,7 @@ class PortfolioService:
         status = {
             "database_path": str(self.settings.app.database_path),
             "one_drive_root": str(self.settings.app.one_drive_root),
-            "log_file": str(self.settings.app.database_path.parent / "logs" / "assistant.log"),
+            "log_file": str(diagnostic_log_path(self.settings.app)),
             "bind": f"{self.settings.app.bind_host}:{self.settings.app.bind_port}",
             "retrieval_mode": self.db.fts_mode,
             "llm_adapter": self.settings.llm.adapter,

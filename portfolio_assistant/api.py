@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from . import APPLICATION_ID
-from .config import Settings, ensure_runtime_paths, load_settings
+from .config import Settings, diagnostic_log_path, ensure_runtime_paths, load_settings
 from .credentials import InvalidApiKeyError
 from .db import Database
 from .llm import LlmContractError, LlmUnavailable, build_adapter
@@ -33,38 +33,40 @@ WORKER_MAX_BACKOFF_MULTIPLIER = 30
 SHUTDOWN_GRACE_SECONDS = 10.0
 
 
-def diagnostic_log_path(settings: Settings) -> Path:
-    return settings.app.database_path.parent / "logs" / "assistant.log"
-
-
 def _configure_diagnostic_log(settings: Settings) -> Path | None:
     """Attach a rotating file log so failures are reviewable after the fact.
 
     Review floods, LLM contract errors, and import outcomes previously lived
     only in the terminal (or nowhere); this records them beside the local
-    database - never inside OneDrive, never in the repository.
+    database - never inside OneDrive, never in the public repository.
+
+    Every failure degrades to "no diagnostic log" rather than a startup
+    crash, and the handler opens its file lazily (delay=True) so a process
+    that merely builds the app for validation never holds the log open.
     """
-    log_path = diagnostic_log_path(settings)
+    log_path = diagnostic_log_path(settings.app)
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("portfolio_assistant")
+        logger.setLevel(logging.INFO)
+        target = str(log_path)
+        if not any(
+            isinstance(handler, RotatingFileHandler) and handler.baseFilename == target
+            for handler in logger.handlers
+        ):
+            # Tests build many apps against different databases; keep exactly
+            # one file handler, pointed at the most recent settings.
+            for handler in [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]:
+                logger.removeHandler(handler)
+                handler.close()
+            handler = RotatingFileHandler(
+                target, maxBytes=2_000_000, backupCount=3, encoding="utf-8", delay=True
+            )
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            logger.addHandler(handler)
+        return log_path
     except OSError:
         return None
-    logger = logging.getLogger("portfolio_assistant")
-    logger.setLevel(logging.INFO)
-    target = str(log_path)
-    if not any(
-        isinstance(handler, RotatingFileHandler) and handler.baseFilename == target
-        for handler in logger.handlers
-    ):
-        # Tests build many apps against different databases; keep exactly one
-        # file handler, pointed at the most recent settings.
-        for handler in [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]:
-            logger.removeHandler(handler)
-            handler.close()
-        handler = RotatingFileHandler(target, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-        logger.addHandler(handler)
-    return log_path
 
 
 class _HashedAssetFiles(StaticFiles):
@@ -245,10 +247,15 @@ class LoopbackGuard:
         await self.app(scope, receive, send)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, configure_logging: bool = True) -> FastAPI:
     settings = settings or load_settings()
     ensure_runtime_paths(settings)
-    _configure_diagnostic_log(settings)
+    if configure_logging:
+        # serve --reload's parent builds the app once purely to validate the
+        # configuration; it must not hold the log file that the reload child
+        # (a second process) needs to rotate — Windows rename fails on open
+        # handles.
+        _configure_diagnostic_log(settings)
     db = Database(settings.app.database_path)
     db.migrate()
     llm = build_adapter(settings.llm)

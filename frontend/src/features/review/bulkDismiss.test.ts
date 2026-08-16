@@ -30,3 +30,14 @@ test("multiple flooded kinds sort by size", () => {
     "malformed_llm", "snow_invalid_row",
   ]);
 });
+
+
+test("kinds with required side effects never get a bulk button, however many pile up", () => {
+  // project_fit and routing resolutions carry decisions the backend refuses
+  // to bulk-dismiss; offering the button would just produce a 422.
+  const items = [
+    ...Array.from({ length: 8 }, () => ({ kind: "project_fit" })),
+    ...Array.from({ length: 5 }, () => ({ kind: "multi_project_route" })),
+  ];
+  assert.deepEqual(bulkDismissTargets(items), []);
+});

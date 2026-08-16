@@ -181,8 +181,10 @@ def main(argv: list[str] | None = None) -> int:
                     # The child reads PORTFOLIO_ASSISTANT_CONFIG set above.
                     # Build the app once here first: a broken configuration
                     # must produce the Error: line and exit code 2 in this
-                    # parent, not an endlessly retried child traceback.
-                    create_app(settings)
+                    # parent, not an endlessly retried child traceback. Skip
+                    # logging setup so this process never opens the log file
+                    # the reload child will need to rotate.
+                    create_app(settings, configure_logging=False)
                     uvicorn.run(
                         "portfolio_assistant.api:create_app",
                         factory=True, reload=True, **server_options,

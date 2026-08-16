@@ -2703,7 +2703,7 @@ class TestReloadConfigErrorHandling:
         from portfolio_assistant import cli
         from portfolio_assistant.llm import LlmContractError
 
-        def broken_create_app(_settings):
+        def broken_create_app(_settings, **_kwargs):
             raise LlmContractError("LLM chat URL must remain on the configured HTTPS host")
 
         def unexpected_run(*args, **kwargs):
@@ -2781,7 +2781,7 @@ class TestFrontendCacheHeaders:
         assert response.headers.get("cache-control") == "public, max-age=31536000, immutable"
 
 
-def _seed_source_with_chunk(service, project_id: str, text: str) -> int:
+def _seed_source_with_chunks(service, project_id: str, texts: list[str]) -> int:
     from portfolio_assistant.db import utc_now
 
     now = utc_now()
@@ -2793,15 +2793,16 @@ def _seed_source_with_chunk(service, project_id: str, text: str) -> int:
                capture_method, canonical_source, memory_state, project_fit_confirmed,
                memory_state_changed_at
                ) VALUES (?, 'snow_comments', ?, 'fictional-blank.txt', 'fictional-blank.txt',
-               '{}', 'captured', ?, ?, '', 'snow_import', 1, 'active', 1, ?)""",
-            (project_id, f"sha-{text!r}-{now}", now, f"I-{now}", now),
+               '{}', 'captured', ?, ?, '', 'snow_import', 1, 'pending', 1, ?)""",
+            (project_id, f"sha-{texts!r}-{now}", now, f"I-{texts!r}-{now}", now),
         )
         source_id = int(cursor.lastrowid)
-        connection.execute(
-            """INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state)
-               VALUES (?, ?, 0, ?, 'fictional row', 'pending')""",
-            (source_id, project_id, text),
-        )
+        for sequence, text in enumerate(texts):
+            connection.execute(
+                """INSERT INTO source_chunks(source_id, project_id, sequence, text, locator, processing_state)
+                   VALUES (?, ?, ?, ?, 'fictional row', 'pending')""",
+                (source_id, project_id, sequence, text),
+            )
     return source_id
 
 
@@ -2809,32 +2810,106 @@ class TestBlankEvidenceSources:
     """A source whose chunks held only whitespace sent blank evidence to the LLM and spawned a malformed_llm review."""
 
     def test_blank_evidence_completes_without_an_ai_call(self, client: TestClient, project, service, monkeypatch):
-        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
         calls: list[object] = []
         monkeypatch.setattr(
             service.llm, "knowledge_update",
             lambda summary, evidence: calls.append(evidence) or (_ for _ in ()).throw(AssertionError("must not be called")),
         )
-        source_id = _seed_source_with_chunk(service, project["id"], "      ")
+        source_id = _seed_source_with_chunks(service, project["id"], ["      "])
         assert service.process_source(source_id) == "complete"
         assert calls == []
         with service.db.connect() as connection:
-            row = connection.execute("SELECT processing_state FROM sources WHERE id = ?", (source_id,)).fetchone()
+            row = connection.execute(
+                """SELECT processing_state, memory_state,
+                   json_extract(metadata_json, '$.completed_without_knowledge') AS reason
+                   FROM sources WHERE id = ?""",
+                (source_id,),
+            ).fetchone()
             reviews = connection.execute(
                 "SELECT count(*) FROM review_items WHERE source_id = ?", (source_id,)
             ).fetchone()[0]
         assert row["processing_state"] == "complete"
+        # Completion must decide memory too; complete-but-pending is a state
+        # no other pipeline path produces.
+        assert row["memory_state"] == "active"
+        assert row["reason"] == "blank_evidence"
         assert reviews == 0
 
     def test_real_evidence_still_reaches_the_llm(self, client: TestClient, project, service, monkeypatch):
-        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
-        source_id = _seed_source_with_chunk(service, project["id"], "Fictional real update text.")
+        source_id = _seed_source_with_chunks(service, project["id"], ["Fictional real update text."])
         assert service.process_source(source_id) == "complete"
         with service.db.connect() as connection:
             reviews = connection.execute(
                 "SELECT count(*) FROM review_items WHERE source_id = ?", (source_id,)
             ).fetchone()[0]
         assert reviews == 0
+
+    def test_unconfirmed_blank_source_never_activates(
+        self, client: TestClient, project, service,
+    ):
+        # There is no text to confirm a project fit with, so completing into
+        # active memory would bypass the fit invariant; the source completes
+        # with its memory decision deliberately left pending. (Removed is not
+        # an option either: that state belongs to the archive-removal
+        # lifecycle, which moves the package and records the prior state.)
+        source_id = _seed_source_with_chunks(service, project["id"], ["   "])
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE sources SET project_fit_confirmed = 0 WHERE id = ?", (source_id,)
+            )
+        assert service.process_source(source_id) == "complete"
+        with service.db.connect() as connection:
+            row = connection.execute(
+                "SELECT memory_state, processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        assert row["processing_state"] == "complete"
+        assert row["memory_state"] == "pending"
+
+    def test_removed_descendants_stay_removed_on_completion(
+        self, client: TestClient, project, service,
+    ):
+        from portfolio_assistant.db import utc_now
+
+        parent_id = _seed_source_with_chunks(service, project["id"], ["   "])
+        now = utc_now()
+        with service.db.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO sources(
+                   project_id, parent_source_id, source_type, sha256, original_filename,
+                   original_path, metadata_json, processing_state, created_at, ingestion_id,
+                   ingestion_path, capture_method, canonical_source, memory_state,
+                   project_fit_confirmed, memory_state_changed_at
+                   ) VALUES (?, ?, 'attachment', ?, 'removed-child.txt', 'removed-child.txt',
+                   '{}', 'complete', ?, ?, '', 'snow_import', 1, 'removed', 1, ?)""",
+                (project["id"], parent_id, f"sha-child-{now}", now, f"I-child-{now}", now),
+            )
+            child_id = int(cursor.lastrowid)
+        assert service.process_source(parent_id) == "complete"
+        with service.db.connect() as connection:
+            states = {
+                row["id"]: row["memory_state"] for row in connection.execute(
+                    "SELECT id, memory_state FROM sources WHERE id IN (?, ?)",
+                    (parent_id, child_id),
+                ).fetchall()
+            }
+        assert states[parent_id] == "active"
+        # The user's removal decision on the child survives the release.
+        assert states[child_id] == "removed"
+
+    def test_oversized_real_text_is_not_swallowed_as_blank(self, client: TestClient, project, service, settings):
+        # One chunk of real text too large for the evidence window plus one
+        # blank chunk: completing as "blank evidence" would silently discard
+        # the real content.
+        oversized = "x" * (settings.llm.max_evidence_chars + 1)
+        source_id = _seed_source_with_chunks(service, project["id"], [oversized, "   "])
+        assert service.process_source(source_id) == "needs_review"
+        with service.db.connect() as connection:
+            review = connection.execute(
+                "SELECT reason FROM review_items WHERE source_id = ? AND status = 'open'",
+                (source_id,),
+            ).fetchone()
+        assert review is not None
+        assert "evidence limit" in review["reason"]
 
 
 class TestMalformedLlmReviewDedupe:
@@ -2843,13 +2918,12 @@ class TestMalformedLlmReviewDedupe:
     def test_only_one_open_review_per_source(self, client: TestClient, project, service, monkeypatch):
         from portfolio_assistant.llm import LlmContractError
 
-        monkeypatch.setattr(service, "_refresh_source_archive", lambda *args, **kwargs: None)
 
         def broken(summary, evidence):
             raise LlmContractError("Knowledge update is missing a summary or cited updates")
 
         monkeypatch.setattr(service.llm, "knowledge_update", broken)
-        source_id = _seed_source_with_chunk(service, project["id"], "Fictional ticket comment.")
+        source_id = _seed_source_with_chunks(service, project["id"], ["Fictional ticket comment."])
         for _ in range(3):
             with service.db.transaction() as connection:
                 connection.execute(
@@ -2863,55 +2937,240 @@ class TestMalformedLlmReviewDedupe:
             ).fetchone()[0]
         assert open_reviews == 1
 
+    def test_reimporting_the_same_export_does_not_grow_the_queue(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        from portfolio_assistant.llm import LlmContractError
+
+        def broken(summary, evidence):
+            raise LlmContractError("Knowledge update is missing a summary or cited updates")
+
+        monkeypatch.setattr(service.llm, "knowledge_update", broken)
+        csv_data = (
+            "Number,Short description,Assignment group,Updated,Comments and Work notes\n"
+            "RITM0042,Fictional dedupe ticket,IT Applications,2026-08-15 10:00:00,"
+            "\"2026-08-15 09:00:00 - Fictional Analyst (Comments)\nFictional comment body\"\n"
+        ).encode("utf-8")
+        for attempt in range(2):
+            response = client.post(
+                "/api/import/servicenow",
+                files={"file": (f"dedupe-export-{attempt}.csv", csv_data, "text/csv")},
+            )
+            assert response.status_code == 200
+        open_reviews = [
+            item for item in client.get("/api/reviews?status=open").json()
+            if item["kind"] == "malformed_llm"
+        ]
+        # The pre-fix behavior grew the queue by one identical review per
+        # import attempt of the same export.
+        assert len(open_reviews) == 1
+
+
+def _broken_knowledge_update(summary, evidence):
+    from portfolio_assistant.llm import LlmContractError
+
+    raise LlmContractError("Knowledge update is missing a summary or cited updates")
+
 
 class TestBulkReviewDismissal:
-    """Clearing a flood of identical review items required one click per item."""
+    """Clearing a flood of identical review items required one click per item, and dismissal stranded the sources."""
 
-    def _seed_reviews(self, service, project_id: str, kind: str, count: int) -> None:
+    def _seed_flood(self, service, project_id: str, count: int, monkeypatch) -> list[int]:
+        monkeypatch.setattr(service.llm, "knowledge_update", _broken_knowledge_update)
+        source_ids = []
         for index in range(count):
-            service._create_review(
-                kind=kind, source_id=None, project_id=project_id,
-                question=f"Fictional question {index}?", reason="Fictional reason.",
-                evidence=[], options=[], memory_preview="No routing rule will be created.",
+            source_id = _seed_source_with_chunks(
+                service, project_id, [f"Fictional ticket comment {index}."]
             )
+            assert service.process_source(source_id) == "needs_review"
+            source_ids.append(source_id)
+        return source_ids
 
-    def test_dismiss_all_clears_one_kind_and_keeps_the_rest(self, client: TestClient, project, service):
-        self._seed_reviews(service, project["id"], "malformed_llm", 4)
-        self._seed_reviews(service, project["id"], "snow_invalid_row", 2)
+    def test_dismiss_all_clears_one_kind_and_releases_the_sources(
+        self, client: TestClient, project, service, monkeypatch,
+    ):
+        source_ids = self._seed_flood(service, project["id"], 3, monkeypatch)
+        service._create_review(
+            kind="snow_invalid_row", source_id=None, project_id=project["id"],
+            question="Fictional row question?", reason="Fictional reason.",
+            evidence=[], options=[], memory_preview="No routing rule will be created.",
+        )
         response = client.post("/api/reviews/dismiss-all", json={"kind": "malformed_llm"})
         assert response.status_code == 200
-        assert response.json() == {"dismissed": 4, "kind": "malformed_llm"}
+        assert response.json() == {"dismissed": 3, "kind": "malformed_llm", "sources_released": 3}
         remaining = client.get("/api/reviews?status=open").json()
         assert {item["kind"] for item in remaining} == {"snow_invalid_row"}
+        # The flood's sources must not stay needs_review with no open review:
+        # nothing requeues that state, so it was a permanent wedge.
+        with service.db.connect() as connection:
+            states = {
+                row["processing_state"] for row in connection.execute(
+                    f"SELECT processing_state FROM sources WHERE id IN ({','.join('?' * len(source_ids))})",
+                    source_ids,
+                ).fetchall()
+            }
+        assert states == {"complete"}
+
+    def test_single_dismissal_also_releases_the_source(
+        self, client: TestClient, project, service, monkeypatch,
+    ):
+        source_id = self._seed_flood(service, project["id"], 1, monkeypatch)[0]
+        review = next(
+            item for item in client.get("/api/reviews?status=open").json()
+            if item["source_id"] == source_id
+        )
+        response = client.post(f"/api/reviews/{review['id']}/resolve", json={"action": "dismiss"})
+        assert response.status_code == 200
+        with service.db.connect() as connection:
+            state = connection.execute(
+                "SELECT processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()["processing_state"]
+        assert state == "complete"
+
+    def test_apply_on_an_automatic_failure_review_also_releases(
+        self, client: TestClient, project, service, monkeypatch,
+    ):
+        # The generic Apply button used to mark these reviews resolved while
+        # leaving the source in needs_review with no open review to advance
+        # it; for automatic failures Apply and Dismiss mean the same thing.
+        source_id = self._seed_flood(service, project["id"], 1, monkeypatch)[0]
+        review = next(
+            item for item in client.get("/api/reviews?status=open").json()
+            if item["source_id"] == source_id
+        )
+        response = client.post(f"/api/reviews/{review['id']}/resolve", json={"action": "apply"})
+        assert response.status_code == 200
+        with service.db.connect() as connection:
+            row = connection.execute(
+                "SELECT processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+            recorded = connection.execute(
+                "SELECT status, resolution_json FROM review_items WHERE id = ?", (review["id"],)
+            ).fetchone()
+        assert row["processing_state"] == "complete"
+        assert recorded["status"] == "dismissed"
+        assert '"requested_action":"apply"' in recorded["resolution_json"]
+
+    def test_startup_reconciliation_heals_a_pre_fix_wedge(
+        self, client: TestClient, project, service, settings, monkeypatch,
+    ):
+        from portfolio_assistant.db import Database
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        source_id = self._seed_flood(service, project["id"], 1, monkeypatch)[0]
+        # Simulate the pre-fix dismissal (or a crash between dismissal and
+        # release): reviews explicitly dismissed, source left in needs_review.
+        with service.db.transaction() as connection:
+            connection.execute(
+                """UPDATE review_items SET status = 'dismissed',
+                   resolution_json = '{"action": "dismiss"}' WHERE source_id = ?""",
+                (source_id,),
+            )
+        rebuilt_db = Database(settings.app.database_path)
+        rebuilt_db.migrate()
+        PortfolioService(settings, rebuilt_db, FakeLlmAdapter())
+        with rebuilt_db.connect() as connection:
+            state = connection.execute(
+                "SELECT processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()["processing_state"]
+        assert state == "complete"
+
+    def test_retry_dismissals_are_not_completion_evidence(
+        self, client: TestClient, project, service, settings, monkeypatch,
+    ):
+        from portfolio_assistant.db import Database
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        # retry_source marks the old review dismissed with action "retry" - a
+        # request for another attempt, not a decision to complete. A source
+        # sitting in needs_review with only retry-dismissed rows (e.g. after a
+        # crash before its next review was recorded) must NOT be completed by
+        # reconciliation on the strength of the overloaded status column.
+        source_id = self._seed_flood(service, project["id"], 1, monkeypatch)[0]
+        with service.db.transaction() as connection:
+            connection.execute(
+                """UPDATE review_items SET status = 'dismissed',
+                   resolution_json = '{"action": "retry"}' WHERE source_id = ?""",
+                (source_id,),
+            )
+        rebuilt_db = Database(settings.app.database_path)
+        rebuilt_db.migrate()
+        PortfolioService(settings, rebuilt_db, FakeLlmAdapter())
+        with rebuilt_db.connect() as connection:
+            state = connection.execute(
+                "SELECT processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()["processing_state"]
+        assert state == "needs_review"
+
+    def test_reconciliation_leaves_crash_orphans_for_their_review(
+        self, client: TestClient, project, service, settings, monkeypatch,
+    ):
+        from portfolio_assistant.db import Database
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        # A crash between a needs_review source insert and its review-creation
+        # transaction leaves a source with NO review rows at all. That is not
+        # a dismissal: completing it would bury unreviewed material (and for
+        # SNOW sources even record the cell hash, skipping future imports).
+        source_id = self._seed_flood(service, project["id"], 1, monkeypatch)[0]
+        with service.db.transaction() as connection:
+            connection.execute("DELETE FROM review_items WHERE source_id = ?", (source_id,))
+        rebuilt_db = Database(settings.app.database_path)
+        rebuilt_db.migrate()
+        PortfolioService(settings, rebuilt_db, FakeLlmAdapter())
+        with rebuilt_db.connect() as connection:
+            state = connection.execute(
+                "SELECT processing_state FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()["processing_state"]
+        assert state == "needs_review"
+
+    def test_side_effect_kinds_cannot_be_bulk_dismissed(self, client: TestClient, project, service):
+        service._create_review(
+            kind="project_fit", source_id=None, project_id=project["id"],
+            question="Fictional fit question?", reason="Fictional reason.",
+            evidence=[], options=[], memory_preview="No routing rule will be created.",
+        )
+        response = client.post("/api/reviews/dismiss-all", json={"kind": "project_fit"})
+        assert response.status_code == 422
+        assert "individually" in response.json()["detail"]
 
     def test_blank_kind_is_rejected(self, client: TestClient):
         response = client.post("/api/reviews/dismiss-all", json={"kind": "   "})
         assert response.status_code == 422
 
-    def test_unknown_kind_dismisses_nothing(self, client: TestClient):
+    def test_unknown_kind_is_rejected(self, client: TestClient):
         response = client.post("/api/reviews/dismiss-all", json={"kind": "no_such_kind"})
-        assert response.status_code == 200
-        assert response.json()["dismissed"] == 0
+        assert response.status_code == 422
 
 
 class TestDiagnosticLog:
     """Failures lived only in the terminal, so debugging required the user to relay symptoms by hand."""
 
     def test_review_creation_is_recorded_in_the_log_file(self, client: TestClient, project, service, settings):
-        log_path = settings.app.database_path.parent / "logs" / "assistant.log"
-        assert log_path.is_file()
+        from portfolio_assistant.config import diagnostic_log_path
+
+        # delay=True means the file appears on the first emitted record, not
+        # at configuration time.
         service._create_review(
             kind="malformed_llm", source_id=None, project_id=project["id"],
             question="Fictional logged question?", reason="Fictional logged reason.",
             evidence=[], options=[], memory_preview="No routing rule will be created.",
         )
+        log_path = diagnostic_log_path(settings.app)
+        assert log_path.is_file()
         content = log_path.read_text(encoding="utf-8")
-        assert "review created: kind=malformed_llm" in content
+        assert "review recorded" in content
+        assert "kind=malformed_llm" in content
         assert "Fictional logged reason." in content
 
-    def test_configuration_status_names_the_log_file(self, client: TestClient):
+    def test_configuration_status_and_writer_share_one_path(self, client: TestClient, settings):
+        from portfolio_assistant.config import diagnostic_log_path
+
         status = client.get("/api/configuration").json()
-        assert status["log_file"].endswith("assistant.log")
+        assert status["log_file"] == str(diagnostic_log_path(settings.app))
 
     def test_rebuilding_the_app_does_not_duplicate_handlers(self, settings):
         import logging
@@ -2920,8 +3179,15 @@ class TestDiagnosticLog:
 
         from portfolio_assistant.api import create_app
 
-        create_app(settings)
-        create_app(settings)
         logger = logging.getLogger("portfolio_assistant")
-        file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
-        assert len(file_handlers) == 1
+        try:
+            create_app(settings)
+            create_app(settings)
+            file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+            assert len(file_handlers) == 1
+        finally:
+            # This test attaches process-global logging state; clean it up so
+            # later tests are not order-coupled to this one's tmp directory.
+            for handler in [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]:
+                logger.removeHandler(handler)
+                handler.close()

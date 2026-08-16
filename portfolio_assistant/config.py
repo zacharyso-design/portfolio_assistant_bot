@@ -21,6 +21,16 @@ def _expanded_path(value: str) -> Path:
     return Path(expanded).expanduser().resolve()
 
 
+def diagnostic_log_path(app: "AppSettings") -> Path:
+    """Single source of truth for the diagnostic log location.
+
+    Both the writer (api._configure_diagnostic_log) and the reporter
+    (services.configuration_status) derive the path from here, so the
+    status endpoint can never name a file the app does not write.
+    """
+    return app.database_path.parent / "logs" / "assistant.log"
+
+
 def _coerced(section: str, key: str, value: Any, converter: type):
     """Convert one setting, turning a bad scalar into an actionable error.
 

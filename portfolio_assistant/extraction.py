@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import hashlib
+import io
 import re
 from dataclasses import dataclass, field
 from email import policy
@@ -214,10 +215,47 @@ def _extract_msg(path: Path, max_attachments: int) -> ExtractedSource:
             if len(attachments) >= max_attachments:
                 raise ExtractionFailure("Email attachment count exceeds the configured limit")
             data = getattr(attachment, "data", None)
-            if not isinstance(data, bytes):
-                continue
-            filename = getattr(attachment, "longFilename", None) or getattr(attachment, "shortFilename", None)
-            attachments.append(AttachmentData(safe_filename(filename or f"attachment-{len(attachments) + 1}"), data))
+            if isinstance(data, extract_msg.MSGFile):
+                buffer = io.BytesIO()
+                try:
+                    data.export(buffer)
+                except Exception as exc:
+                    raise ExtractionFailure(
+                        "An embedded Outlook message attachment could not be preserved"
+                    ) from exc
+                finally:
+                    try:
+                        data.close()
+                    except Exception:
+                        pass
+                data = buffer.getvalue()
+                filename = (
+                    getattr(attachment, "longFilename", None)
+                    or getattr(attachment, "shortFilename", None)
+                    or getattr(attachment, "name", None)
+                    or f"embedded-message-{len(attachments) + 1}.msg"
+                )
+                if PureWindowsPath(str(filename)).suffix.casefold() != ".msg":
+                    filename = f"{filename}.msg"
+                content_type = "application/vnd.ms-outlook"
+            elif isinstance(data, bytes):
+                filename = (
+                    getattr(attachment, "longFilename", None)
+                    or getattr(attachment, "shortFilename", None)
+                    or getattr(attachment, "name", None)
+                    or f"attachment-{len(attachments) + 1}"
+                )
+                content_type = (
+                    getattr(attachment, "mimetype", None)
+                    or "application/octet-stream"
+                )
+            else:
+                raise ExtractionFailure(
+                    "The Outlook MSG contains a broken or unsupported attachment"
+                )
+            attachments.append(
+                AttachmentData(safe_filename(filename), data, content_type)
+            )
         header = getattr(message, "headerDict", {}) or {}
         metadata = {
             "subject": message.subject or "",

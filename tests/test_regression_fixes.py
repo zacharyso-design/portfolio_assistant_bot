@@ -2133,3 +2133,104 @@ class TestWindowsLegacyPathBudget:
             windows_units(path.resolve())
             for path in [quarantined, *quarantined.rglob("*")]
         ) <= 259
+
+
+class TestEmbeddedMsgAttachments:
+    """_extract_msg silently dropped embedded, broken, and unsupported attachments."""
+
+    def test_embedded_message_is_exported_as_a_preserved_msg(
+        self, tmp_path, monkeypatch,
+    ):
+        from msgforge import Message as MsgForgeMessage
+
+        import portfolio_assistant.extraction as extraction_module
+
+        real_message = extraction_module.extract_msg.Message
+        inner_path = tmp_path / "inner.msg"
+        MsgForgeMessage(
+            subject="Fictional embedded message",
+            text_body="Fictional forwarded-email evidence.",
+        ).save(inner_path)
+        embedded = real_message(str(inner_path), delayAttachments=True)
+
+        class EmbeddedAttachment:
+            data = embedded
+            longFilename = None
+            shortFilename = None
+            name = "forwarded-evidence"
+            mimetype = "application/vnd.ms-outlook"
+
+        class OuterMessage:
+            body = "Fictional outer message."
+            htmlBody = None
+            attachments = [EmbeddedAttachment()]
+            headerDict = {}
+            subject = "Fictional outer message"
+            sender = "sender@example.invalid"
+            to = "recipient@example.invalid"
+            cc = ""
+            date = "2026-08-15T12:00:00+00:00"
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            extraction_module.extract_msg, "Message", lambda *args, **kwargs: OuterMessage()
+        )
+        outer_path = tmp_path / "outer.msg"
+        outer_path.write_bytes(b"Fictional parser input replaced by controlled outer message.")
+
+        result = extraction_module._extract_msg(outer_path, max_attachments=5)
+
+        inner_path.unlink()
+        assert not inner_path.exists()
+        assert len(result.attachments) == 1
+        preserved = result.attachments[0]
+        assert preserved.filename == "forwarded-evidence.msg"
+        assert preserved.content_type == "application/vnd.ms-outlook"
+        exported_path = tmp_path / preserved.filename
+        exported_path.write_bytes(preserved.data)
+        exported = real_message(str(exported_path), delayAttachments=True)
+        try:
+            assert exported.subject == "Fictional embedded message"
+        finally:
+            exported.close()
+
+    @pytest.mark.parametrize("attachment_kind", ["broken", "unsupported"])
+    def test_unreadable_attachment_is_reported_as_extraction_failure(
+        self, tmp_path, monkeypatch, attachment_kind,
+    ):
+        import portfolio_assistant.extraction as extraction_module
+
+        class UnreadableAttachment:
+            data = None
+            type = attachment_kind
+            longFilename = None
+            shortFilename = None
+            name = None
+            mimetype = None
+
+        class MessageWithUnreadableAttachment:
+            body = "Fictional message with an unreadable attachment."
+            htmlBody = None
+            attachments = [UnreadableAttachment()]
+            headerDict = {}
+            subject = "Fictional unreadable attachment"
+            sender = "sender@example.invalid"
+            to = "recipient@example.invalid"
+            cc = ""
+            date = "2026-08-15T12:00:00+00:00"
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            extraction_module.extract_msg,
+            "Message",
+            lambda *args, **kwargs: MessageWithUnreadableAttachment(),
+        )
+        path = tmp_path / f"{attachment_kind}.msg"
+        path.write_bytes(b"Fictional parser input replaced by controlled message.")
+
+        with pytest.raises(ExtractionFailure, match="broken or unsupported attachment"):
+            extraction_module._extract_msg(path, max_attachments=5)

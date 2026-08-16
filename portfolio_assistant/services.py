@@ -20,16 +20,19 @@ from typing import Any, BinaryIO, Iterable
 from openpyxl import load_workbook
 
 from .archive import (
+    LEGACY_WINDOWS_MAX_PATH,
     SCHEMA_VERSION,
     atomic_write_json,
     atomic_write_text,
     ensure_archive_roots,
     ingestion_folder_name,
+    legacy_component_limit,
     project_folder_name,
     read_json,
     relative_to_root,
     stable_id,
     update_manifest,
+    windows_path_units,
     write_project_files,
 )
 from .config import Settings
@@ -136,6 +139,87 @@ class PortfolioService:
             raise ValidationError("Resolved path is outside the configured OneDrive root") from exc
         return resolved
 
+    def _project_archive_component(self, name: str, archive_id: str) -> str:
+        try:
+            limit = legacy_component_limit(
+                self.archive_paths["projects"],
+                reserved_tail=74,
+                desired=48,
+                minimum=len(archive_id),
+            )
+            return project_folder_name(name, archive_id, max_length=limit)
+        except ValueError as exc:
+            raise ValidationError(
+                "The configured OneDrive root is too deep for legacy Windows paths"
+            ) from exc
+
+    @staticmethod
+    def _ingestion_archive_component(
+        destination: Path, created_at: datetime, source_type: str, title: str,
+        ingestion_id: str, *, reserved_tail: int = 45,
+    ) -> str:
+        try:
+            compact_minimum = len(f"{created_at:%Y%m%d-%H%M%S}__{ingestion_id}")
+            limit = legacy_component_limit(
+                destination,
+                reserved_tail=reserved_tail,
+                desired=64,
+                minimum=compact_minimum,
+            )
+            return ingestion_folder_name(
+                created_at, source_type, title, ingestion_id, max_length=limit
+            )
+        except ValueError as exc:
+            raise ValidationError(
+                "The configured OneDrive/project path is too deep for legacy Windows paths"
+            ) from exc
+
+    @staticmethod
+    def _fit_relative_path(parent: Path, relative: Path) -> Path:
+        parts = [safe_filename(part, "item") for part in relative.parts]
+        separator_count = max(0, len(parts) - 1)
+        available = (
+            LEGACY_WINDOWS_MAX_PATH - windows_path_units(parent.resolve())
+            - 1 - separator_count
+        )
+        minimums = [min(windows_path_units(part), 18) for part in parts]
+        if not parts or available < sum(minimums):
+            raise ValidationError(
+                "The selected folder hierarchy is too deep for legacy Windows paths"
+            )
+        fitted = list(parts)
+        while sum(windows_path_units(part) for part in fitted) > available:
+            choices = [
+                (windows_path_units(fitted[index]) - minimums[index], index)
+                for index in range(len(fitted))
+                if windows_path_units(fitted[index]) > minimums[index]
+            ]
+            if not choices:
+                raise ValidationError(
+                    "The selected folder hierarchy is too deep for legacy Windows paths"
+                )
+            reducible, index = max(choices)
+            overflow = sum(windows_path_units(part) for part in fitted) - available
+            new_length = windows_path_units(fitted[index]) - min(reducible, overflow)
+            fitted[index] = safe_filename(
+                fitted[index], "item", max_length=new_length
+            )
+        return Path(*fitted)
+
+    @staticmethod
+    def _package_descendant_reserve(package: Path) -> int:
+        reserve = 45
+        for path in package.rglob("*"):
+            relative = path.relative_to(package)
+            reserve = max(reserve, 1 + windows_path_units(relative))
+            parent_relative = path.parent.relative_to(package)
+            atomic_tail = 1 + windows_path_units(parent_relative)
+            if parent_relative.parts:
+                atomic_tail += 1
+            atomic_tail += len(".tmp-") + 12
+            reserve = max(reserve, atomic_tail)
+        return reserve
+
     def _project(self, connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
         row = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if not row:
@@ -168,7 +252,8 @@ class PortfolioService:
             self._under_root(existing)
             if isinstance(descriptor, dict) and descriptor.get("archive_id") == archive_id
             else self._under_root(
-                self.archive_paths["projects"] / project_folder_name(str(project["name"]), archive_id)
+                self.archive_paths["projects"] /
+                self._project_archive_component(str(project["name"]), archive_id)
             )
         )
         folder.mkdir(parents=True, exist_ok=True)
@@ -247,13 +332,32 @@ class PortfolioService:
         )
 
     def _quarantine_routing_path(self, path: Path, label: str) -> Path:
-        quarantine_root = self._under_root(
-            self.settings.app.one_drive_root / "_PortfolioAssistant" / "quarantine" / "routing"
-        )
-        quarantine_root.mkdir(parents=True, exist_ok=True)
-        destination = self._under_root(quarantine_root / f"{label}-{stable_id('Q')}")
-        os.replace(path, destination)
-        return destination
+        root = self.settings.app.one_drive_root / "_PortfolioAssistant"
+        reserve = self._package_descendant_reserve(path) if path.is_dir() else 0
+        destination_name = f"{label}-{stable_id('Q')}"
+        for quarantine_root in (
+            root / "quarantine" / "routing",
+            root / "q",
+        ):
+            quarantine_root = self._under_root(quarantine_root)
+            try:
+                component_limit = legacy_component_limit(
+                    quarantine_root,
+                    reserved_tail=reserve,
+                    desired=180,
+                    minimum=16,
+                )
+            except ValueError:
+                continue
+            destination = self._under_root(
+                quarantine_root / safe_filename(
+                    destination_name, "quarantine", max_length=component_limit
+                )
+            )
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            os.replace(path, destination)
+            return destination
+        raise OSError("Routing quarantine path exceeds the legacy Windows limit")
 
     def _publish_routing_staging(self, staging: Path) -> bool:
         publication = read_json(staging / "publication.json", None)
@@ -589,56 +693,111 @@ class PortfolioService:
                 " AND source_type <> 'snow_comments' ORDER BY id"
             ).fetchall()
         for source in roots:
-            ingestion_id = str(source["ingestion_id"] or self._legacy_ingestion_id(source))
-            with self.db.connect() as connection:
-                project = self._project(connection, source["project_id"]) if source["project_id"] else None
-            destination = Path(project["folder_path"]) if project else self.archive_paths["shared_intake"]
-            created = datetime.fromisoformat(str(source["created_at"]).replace("Z", "+00:00"))
-            title = str(source["meeting_name"] or Path(source["original_filename"]).stem)
-            folder_name = ingestion_folder_name(created, source["source_type"], title, ingestion_id)
-            final = self._under_root(destination / folder_name)
-            incomplete = self._under_root(destination / f"_INCOMPLETE_{ingestion_id}")
-            if not final.exists():
-                incomplete.mkdir(parents=True, exist_ok=True)
-                original_dir = incomplete / "Original"
-                original_dir.mkdir(exist_ok=True)
-                self._initial_assistant_files(incomplete, ingestion_id, source["project_id"], title)
+            try:
+                ingestion_id = str(
+                    source["ingestion_id"] or self._legacy_ingestion_id(source)
+                )
+                with self.db.connect() as connection:
+                    project = (
+                        self._project(connection, source["project_id"])
+                        if source["project_id"] else None
+                    )
+                destination = (
+                    Path(project["folder_path"])
+                    if project else self.archive_paths["shared_intake"]
+                )
+                created = datetime.fromisoformat(
+                    str(source["created_at"]).replace("Z", "+00:00")
+                )
+                title = str(
+                    source["meeting_name"] or Path(source["original_filename"]).stem
+                )
+                folder_name = self._ingestion_archive_component(
+                    destination, created, source["source_type"], title, ingestion_id
+                )
+                final = self._under_root(destination / folder_name)
+                incomplete = self._under_root(
+                    destination / f"_INCOMPLETE_{ingestion_id}"
+                )
                 old = Path(source["original_path"])
+                stored = (
+                    self._fit_relative_path(
+                        final / "Original",
+                        Path(safe_filename(source["original_filename"], "source")),
+                    ).name
+                    if not final.exists() and old.is_file() else None
+                )
+            except (OSError, ValueError):
+                LOGGER.warning(
+                    "Could not preflight legacy source %s; will retry",
+                    source["id"],
+                    exc_info=True,
+                )
+                continue
+            if not final.exists():
                 originals: list[dict[str, Any]] = []
                 errors: list[str] = []
-                if old.is_file():
-                    stored = safe_filename(source["original_filename"], "source")
-                    new_original = original_dir / stored
-                    shutil.copy2(old, new_original)
-                    originals.append({
-                        "relative_path": f"Original/{stored}",
-                        "original_name": source["original_filename"],
-                        "stored_name": stored,
-                        "size_bytes": new_original.stat().st_size,
-                        "sha256": sha256_file(new_original),
+                try:
+                    incomplete.mkdir(parents=True, exist_ok=True)
+                    original_dir = incomplete / "Original"
+                    original_dir.mkdir(exist_ok=True)
+                    self._initial_assistant_files(
+                        incomplete, ingestion_id, source["project_id"], title
+                    )
+                    if stored is not None:
+                        new_original = original_dir / stored
+                        shutil.copy2(old, new_original)
+                        originals.append({
+                            "relative_path": f"Original/{stored}",
+                            "original_name": source["original_filename"],
+                            "stored_name": stored,
+                            "size_bytes": new_original.stat().st_size,
+                            "sha256": sha256_file(new_original),
+                        })
+                    else:
+                        errors.append(
+                            "Legacy original is unavailable; no replacement was fabricated."
+                        )
+                        counts["missing_originals"] += 1
+                    atomic_write_json(incomplete / "manifest.json", {
+                        "schema_version": SCHEMA_VERSION,
+                        "ingestion_id": ingestion_id,
+                        "project_id": project["archive_id"] if project else None,
+                        "database_project_id": source["project_id"],
+                        "source_type": source["source_type"],
+                        "title": title,
+                        "created_at": source["created_at"],
+                        "source_date": source["meeting_date"],
+                        "capture_method": "legacy_migration",
+                        "canonical_source": True,
+                        "linked_ingestion_id": None,
+                        "processing_status": source["processing_state"],
+                        "original_files": originals,
+                        "assistant_files": [],
+                        "extractor_version": "1.0",
+                        "errors": errors,
                     })
-                else:
-                    errors.append("Legacy original is unavailable; no replacement was fabricated.")
-                    counts["missing_originals"] += 1
-                atomic_write_json(incomplete / "manifest.json", {
-                    "schema_version": SCHEMA_VERSION,
-                    "ingestion_id": ingestion_id,
-                    "project_id": project["archive_id"] if project else None,
-                    "database_project_id": source["project_id"],
-                    "source_type": source["source_type"],
-                    "title": title,
-                    "created_at": source["created_at"],
-                    "source_date": source["meeting_date"],
-                    "capture_method": "legacy_migration",
-                    "canonical_source": True,
-                    "linked_ingestion_id": None,
-                    "processing_status": source["processing_state"],
-                    "original_files": originals,
-                    "assistant_files": [],
-                    "extractor_version": "1.0",
-                    "errors": errors,
-                })
-                os.replace(incomplete, final)
+                    os.replace(incomplete, final)
+                except Exception:
+                    try:
+                        if incomplete.exists():
+                            shutil.rmtree(incomplete)
+                    except OSError:
+                        try:
+                            self._quarantine_routing_path(
+                                incomplete, f"legacy-migration-{source['id']}"
+                            )
+                        except OSError:
+                            LOGGER.warning(
+                                "Could not contain failed legacy source migration %s",
+                                source["id"],
+                                exc_info=True,
+                            )
+                    LOGGER.warning(
+                        "Could not migrate legacy source %s; will retry", source["id"],
+                        exc_info=True,
+                    )
+                    continue
             counts["missing_originals"] += self._migrate_legacy_attachments(int(source["id"]), final)
             manifest = read_json(final / "manifest.json", {})
             originals = manifest.get("original_files", [])
@@ -784,14 +943,22 @@ class PortfolioService:
                     changed = True
                 missing += 1
                 continue
-            name = safe_filename(child["original_filename"], f"attachment-{child['id']}")
+            attachments_dir = package / "Original" / "Attachments"
+            name = self._fit_relative_path(
+                attachments_dir,
+                Path(safe_filename(child["original_filename"], f"attachment-{child['id']}")),
+            ).name
             candidate = Path("Original") / "Attachments" / name
             suffix = 2
             while candidate.as_posix().casefold() in used:
-                candidate = candidate.with_name(f"{Path(name).stem}-{suffix}{Path(name).suffix}")
+                collision_name = self._fit_relative_path(
+                    attachments_dir,
+                    Path(f"{Path(name).stem}-{suffix}{Path(name).suffix}"),
+                ).name
+                candidate = candidate.with_name(collision_name)
                 suffix += 1
             migrated_path = self._under_root(package / candidate)
-            temporary = migrated_path.parent / f".{uuid.uuid4().hex}.tmp"
+            temporary = migrated_path.parent / f".tmp-{uuid.uuid4().hex[:12]}"
             try:
                 migrated_path.parent.mkdir(parents=True, exist_ok=True)
                 digest = sha256_file(old_path)
@@ -1101,7 +1268,7 @@ class PortfolioService:
         project_id = str(uuid.uuid4())
         archive_id = self._archive_project_id(project_id)
         folder = self._under_root(
-            self.archive_paths["projects"] / project_folder_name(clean, archive_id)
+            self.archive_paths["projects"] / self._project_archive_component(clean, archive_id)
         )
         folder.mkdir(parents=True, exist_ok=False)
         now = utc_now()
@@ -1507,9 +1674,6 @@ class PortfolioService:
         destination = self._destination_dir(project, multi_project)
         destination.mkdir(parents=True, exist_ok=True)
         ingestion_id = stable_id("I")
-        incomplete = self._under_root(destination / f"_INCOMPLETE_{ingestion_id}")
-        incomplete.mkdir(parents=False, exist_ok=False)
-        (incomplete / "Original").mkdir()
         title = normalize_text(meeting_name or Path(first_name).stem) or "Source"
         source_kind = (
             "meeting-transcript" if transcript_in_selection
@@ -1520,8 +1684,13 @@ class PortfolioService:
         )
         created_local = datetime.now().astimezone()
         final_package = self._under_root(
-            destination / ingestion_folder_name(created_local, source_kind, title, ingestion_id)
+            destination / self._ingestion_archive_component(
+                destination, created_local, source_kind, title, ingestion_id
+            )
         )
+        incomplete = self._under_root(destination / f"_INCOMPLETE_{ingestion_id}")
+        incomplete.mkdir(parents=False, exist_ok=False)
+        (incomplete / "Original").mkdir()
         source_committed = False
         total = 0
         limit = self.settings.app.max_file_mb * 1024 * 1024
@@ -1529,13 +1698,21 @@ class PortfolioService:
         used_paths: set[str] = set()
         try:
             for stream, original_name, relative_name in files:
-                relative = self._safe_relative_path(relative_name, safe_filename(original_name, "source"))
+                relative = self._fit_relative_path(
+                    final_package / "Original",
+                    self._safe_relative_path(
+                        relative_name, safe_filename(original_name, "source")
+                    ),
+                )
                 relative_key = relative.as_posix().casefold()
                 original_relative = relative
                 collision = 2
                 while relative_key in used_paths:
-                    relative = original_relative.with_name(
-                        f"{original_relative.stem}-{collision}{original_relative.suffix}"
+                    relative = self._fit_relative_path(
+                        final_package / "Original",
+                        original_relative.with_name(
+                            f"{original_relative.stem}-{collision}{original_relative.suffix}"
+                        ),
                     )
                     relative_key = relative.as_posix().casefold()
                     collision += 1
@@ -2026,7 +2203,12 @@ class PortfolioService:
         }
         for original, result, path in results:
             index = original_positions[str(original["relative_path"])]
-            extracted_name = f"{index:03d}-{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
+            extracted_name = self._fit_relative_path(
+                extracted_dir,
+                Path(
+                    f"{index:03d}-{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
+                ),
+            ).name
             atomic_write_text(
                 extracted_dir / extracted_name,
                 "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n",
@@ -2051,8 +2233,6 @@ class PortfolioService:
                 ).fetchone()
         package = Path(root_source["ingestion_path"])
         directory = self._under_root(package / "Original" / "Attachments")
-        if source["parent_source_id"]:
-            directory = self._under_root(directory / safe_filename(Path(source["original_filename"]).stem, "nested-email"))
         directory.mkdir(parents=True, exist_ok=True)
         for sequence, attachment in enumerate(attachments):
             native_id = f"attachment:{source_id}:{sequence}"
@@ -2066,7 +2246,17 @@ class PortfolioService:
                 if existing_child["processing_state"] != "complete":
                     self._extract_attachment_child(int(existing_child["id"]))
                 continue
-            filename = safe_filename(attachment.filename, f"attachment-{sequence + 1}")
+            display_name = safe_filename(
+                attachment.filename, f"attachment-{sequence + 1}"
+            )
+            requested_name = (
+                f"{source_id}-{display_name}"
+                if source["parent_source_id"] else attachment.filename
+            )
+            filename = self._fit_relative_path(
+                directory,
+                Path(safe_filename(requested_name, f"attachment-{sequence + 1}")),
+            ).name
             final_path = self._under_root(directory / filename)
             digest = hashlib.sha256(attachment.data).hexdigest()
             collision = 2
@@ -2083,12 +2273,14 @@ class PortfolioService:
                     # transaction begins. Reclaim that exact unindexed file rather
                     # than leaving it orphaned and creating a suffixed duplicate.
                     break
-                final_path = self._under_root(
-                    directory / f"{Path(filename).stem}-{collision}{Path(filename).suffix}"
-                )
+                collision_name = self._fit_relative_path(
+                    directory,
+                    Path(f"{Path(filename).stem}-{collision}{Path(filename).suffix}"),
+                ).name
+                final_path = self._under_root(directory / collision_name)
                 collision += 1
             if not final_path.exists():
-                temp_path = self._under_root(directory / f".{uuid.uuid4().hex}.tmp")
+                temp_path = self._under_root(directory / f".tmp-{uuid.uuid4().hex[:12]}")
                 temp_path.write_bytes(attachment.data)
                 os.replace(temp_path, final_path)
             now = utc_now()
@@ -2100,8 +2292,9 @@ class PortfolioService:
                       memory_state, project_fit_confirmed, memory_state_changed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, 'pending', 0, ?)
                     """,
-                    (source["project_id"], source_id, Path(filename).suffix.casefold().lstrip(".") or "attachment",
-                     native_id, digest, filename, str(final_path),
+                    (source["project_id"], source_id,
+                     Path(display_name).suffix.casefold().lstrip(".") or "attachment",
+                     native_id, digest, display_name, str(final_path),
                      _json({"content_type": attachment.content_type}), now, now),
                 )
                 if cursor.rowcount == 1:
@@ -2163,9 +2356,16 @@ class PortfolioService:
             with self.db.connect() as connection:
                 root = connection.execute("SELECT * FROM sources WHERE id = ?", (parent,)).fetchone()
             if root and root["ingestion_path"]:
+                extracted_dir = Path(root["ingestion_path"]) / "Assistant" / "Extracted"
+                extracted_name = self._fit_relative_path(
+                    extracted_dir,
+                    Path(
+                        f"attachment-{child_id}-"
+                        f"{safe_filename(Path(child['original_filename']).stem, 'attachment')}.txt"
+                    ),
+                ).name
                 atomic_write_text(
-                    Path(root["ingestion_path"]) / "Assistant" / "Extracted" /
-                    f"attachment-{child_id}-{safe_filename(Path(child['original_filename']).stem, 'attachment')}.txt",
+                    extracted_dir / extracted_name,
                     "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n",
                 )
         except UnsupportedSource as exc:
@@ -2703,7 +2903,7 @@ class PortfolioService:
             raise ValidationError("No preserved originals are available to rebuild derived files")
         package = self._under_root(Path(source["ingestion_path"]))
         extracted_dir = self._under_root(package / "Assistant" / "Extracted")
-        replacement = self._under_root(package / "Assistant" / f"_DERIVED_{uuid.uuid4().hex}")
+        replacement = self._under_root(package / "Assistant" / f"._r{uuid.uuid4().hex[:4]}")
         replacement.mkdir(parents=True, exist_ok=False)
         generated: list[Path] = []
         unsupported = 0
@@ -2727,9 +2927,14 @@ class PortfolioService:
                 except UnsupportedSource:
                     unsupported += 1
                     continue
-                output = replacement / (
-                    f"{index:03d}-{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
-                )
+                output_name = self._fit_relative_path(
+                    extracted_dir,
+                    Path(
+                        f"{index:03d}-"
+                        f"{safe_filename(Path(original['relative_path']).stem, 'source')}.txt"
+                    ),
+                ).name
+                output = replacement / output_name
                 atomic_write_text(output, "\n\n".join(chunk["text"] for chunk in result.chunks) + "\n")
                 generated.append(output)
             extracted_dir.mkdir(parents=True, exist_ok=True)
@@ -2836,11 +3041,29 @@ class PortfolioService:
         if not source["ingestion_path"]:
             raise ConflictError("This legacy source has no movable OneDrive package")
         old_package = self._under_root(Path(source["ingestion_path"]))
-        destination = self._under_root(destination)
-        if old_package == destination:
-            raise ConflictError("Source package is already in that location")
         if not old_package.is_dir():
             raise ConflictError("The preserved source package is missing from OneDrive")
+        descendant_reserve = self._package_descendant_reserve(old_package)
+        destination_parent = self._under_root(destination.parent)
+        move_ingestion_id = (
+            source["ingestion_id"] or source["linked_ingestion_id"]
+            or self._legacy_ingestion_id(source)
+        )
+        move_created = datetime.fromisoformat(
+            str(source["created_at"]).replace("Z", "+00:00")
+        )
+        destination = self._under_root(
+            destination_parent / self._ingestion_archive_component(
+                destination_parent,
+                move_created,
+                source["source_type"],
+                source["source_title"] or source["original_filename"],
+                move_ingestion_id,
+                reserved_tail=descendant_reserve,
+            )
+        )
+        if old_package == destination:
+            raise ConflictError("Source package is already in that location")
         if destination.exists():
             raise ConflictError("A source package with this archive identity already exists at the destination")
         old_manifest_path = old_package / "manifest.json"
@@ -4402,9 +4625,9 @@ class PortfolioService:
         linked_ingestion_id = source["ingestion_id"] or self._legacy_ingestion_id(source)
         linked_package = self._under_root(
             Path(target["folder_path"]) /
-            ingestion_folder_name(
-                created, "linked-source", source["source_title"] or source["original_filename"],
-                linked_ingestion_id,
+            self._ingestion_archive_component(
+                Path(target["folder_path"]), created, "linked-source",
+                source["source_title"] or source["original_filename"], linked_ingestion_id,
             )
         )
         package_identity = {

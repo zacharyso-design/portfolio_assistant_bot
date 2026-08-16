@@ -16,6 +16,8 @@ from docx import Document
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
+from .archive import truncate_windows_units, windows_path_units
+
 
 SUPPORTED_SUFFIXES = {".eml", ".msg", ".txt", ".md", ".vtt", ".srt", ".docx", ".pdf", ".xlsx"}
 TRANSCRIPT_SUFFIXES = {".vtt", ".srt"}
@@ -62,7 +64,7 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def safe_filename(value: str, fallback: str = "source") -> str:
+def safe_filename(value: str, fallback: str = "source", *, max_length: int = 180) -> str:
     """Reduce an untrusted name to one safe Windows filename.
 
     Windows separator semantics are applied on every platform so the stored name
@@ -73,7 +75,19 @@ def safe_filename(value: str, fallback: str = "source") -> str:
     raw = str(value or fallback).replace("/", "\\")
     name = PureWindowsPath(raw).name
     name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "_", name).strip(" .")
-    name = name[:180].strip(" .")
+    max_length = max(16, min(int(max_length), 180))
+    if windows_path_units(name) > max_length:
+        suffix = PureWindowsPath(name).suffix
+        if windows_path_units(suffix) > 16:
+            suffix = ""
+        marker = f"-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:8]}"
+        stem_limit = max(
+            1,
+            max_length - windows_path_units(marker) - windows_path_units(suffix),
+        )
+        stem = truncate_windows_units(PureWindowsPath(name).stem, stem_limit).rstrip(" .")
+        name = f"{stem}{marker}{suffix}"
+    name = truncate_windows_units(name, max_length).strip(" .")
     if not name:
         return fallback
     if PureWindowsPath(name).stem.upper() in WINDOWS_RESERVED_NAMES:

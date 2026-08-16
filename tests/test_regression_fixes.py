@@ -1751,3 +1751,385 @@ class TestRemovedSourceReupload:
         assert any(
             event["event_type"] == "restored_to_memory" for event in detail["lifecycle"]
         )
+
+
+class TestWindowsLegacyPathBudget:
+    """Generated archive and atomic-temp paths exceeded Windows MAX_PATH."""
+
+    def test_long_project_and_source_names_stay_within_legacy_windows_limit(
+        self, client: TestClient,
+    ):
+        project_response = client.post("/api/projects", json={
+            "name": "Fictional Long Path Project " + "P" * 200,
+        })
+        assert project_response.status_code == 201, project_response.text
+        project = project_response.json()
+        filename = "very-long-source-name-" + "S" * 150 + ".txt"
+        captured = upload(
+            client,
+            project["id"],
+            filename,
+            b"Fictional content used to verify legacy Windows path budgeting.",
+        )
+        assert captured.status_code == 202, captured.text
+        source = captured.json()["source"]
+        retried = client.post(f"/api/sources/{source['id']}/retry")
+        assert retried.status_code == 200, retried.text
+
+        package = Path(source["ingestion_path"])
+        generated = [package, *package.rglob("*")]
+        assert generated
+        assert max(len(str(path.resolve())) for path in generated) <= 259
+        atomic_directories = {
+            path.parent for path in generated
+            if path.is_file() and "Assistant" in path.parts
+        }
+        assert atomic_directories
+        assert max(
+            len(str((directory / ".tmp-000000000000").resolve()))
+            for directory in atomic_directories
+        ) <= 259
+        assert not list(Path(project["folder_path"]).glob("_INCOMPLETE_*"))
+
+    def test_unusable_deep_destination_is_rejected_before_incomplete_creation(
+        self, client: TestClient, project, service, settings,
+    ):
+        root = settings.app.one_drive_root
+        padding = max(1, 205 - len(str(root.resolve())) - 1)
+        deep_destination = root / ("D" * padding)
+        deep_destination.mkdir()
+        assert len(str(deep_destination.resolve())) >= 200
+        assert len(str((deep_destination / "_INCOMPLETE_I-12345678").resolve())) <= 259
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET folder_path = ? WHERE id = ?",
+                (str(deep_destination), project["id"]),
+            )
+
+        rejected = upload(
+            client,
+            project["id"],
+            "deep-path.txt",
+            b"Fictional content that must be rejected without partial folders.",
+        )
+
+        assert rejected.status_code == 422, rejected.text
+        assert not list(deep_destination.glob("_INCOMPLETE_*"))
+
+    def test_non_bmp_names_are_budgeted_as_utf16_code_units(
+        self, client: TestClient,
+    ):
+        windows_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        project_response = client.post("/api/projects", json={
+            "name": "Fictional Emoji Project " + "😀" * 100,
+        })
+        assert project_response.status_code == 201, project_response.text
+        project = project_response.json()
+        captured = upload(
+            client,
+            project["id"],
+            "📁" * 80 + ".txt",
+            b"Fictional non-BMP Windows path evidence.",
+        )
+        assert captured.status_code == 202, captured.text
+        source = captured.json()["source"]
+        retried = client.post(f"/api/sources/{source['id']}/retry")
+        assert retried.status_code == 200, retried.text
+
+        package = Path(source["ingestion_path"])
+        generated = [package, *package.rglob("*")]
+        assert max(windows_units(path.resolve()) for path in generated) <= 259
+        assistant_directories = {
+            path.parent for path in generated
+            if path.is_file() and "Assistant" in path.parts
+        }
+        assert max(
+            windows_units((directory / ".tmp-000000000000").resolve())
+            for directory in assistant_directories
+        ) <= 259
+
+    def test_legacy_migration_copy_failure_cleans_incomplete_package(
+        self, project, service, settings, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        legacy_original = settings.app.one_drive_root / "legacy-path-source.txt"
+        legacy_original.write_bytes(b"Fictional legacy migration content.")
+        with service.db.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO sources(
+                   project_id, source_type, sha256, original_filename, original_path,
+                   metadata_json, processing_state, created_at
+                   ) VALUES (?, 'txt', ?, ?, ?, '{}', 'captured', ?)""",
+                (
+                    project["id"], hashlib.sha256(legacy_original.read_bytes()).hexdigest(),
+                    "legacy-path-source.txt", str(legacy_original),
+                    "2026-08-15T12:00:00+00:00",
+                ),
+            )
+            source_id = int(cursor.lastrowid)
+
+        def locked_copy(source, destination, *args, **kwargs):
+            if Path(source) == legacy_original:
+                raise OSError("fictional locked legacy original")
+            return real_copy(source, destination, *args, **kwargs)
+
+        real_copy = services_module.shutil.copy2
+        monkeypatch.setattr(services_module.shutil, "copy2", locked_copy)
+
+        service.migrate_archive()
+
+        with service.db.connect() as connection:
+            migrated = connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        assert migrated["ingestion_path"] is None
+        assert not list(Path(project["folder_path"]).glob("_INCOMPLETE_*"))
+
+    def test_project_move_rebudgets_package_for_deep_legacy_target(
+        self, client: TestClient, project, service, settings,
+    ):
+        windows_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        target = client.post("/api/projects", json={"name": "Fictional Move Target"}).json()
+        root = settings.app.one_drive_root
+        padding = max(1, 180 - len(str(root.resolve())) - 1)
+        deep_target = root / ("T" * padding)
+        deep_target.mkdir()
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET folder_path = ? WHERE id = ?",
+                (str(deep_target), target["id"]),
+            )
+        source = upload(
+            client,
+            project["id"],
+            "move-path-" + "M" * 100 + ".txt",
+            b"Fictional pending source moved to a deep legacy project.",
+        ).json()["source"]
+        old_package = Path(source["ingestion_path"])
+
+        moved = service._move_source_package(
+            source["id"],
+            deep_target / old_package.name,
+            memory_state="pending",
+            event_type="moved_before_processing",
+            reason="Regression test for destination rebudgeting.",
+            to_project_id=target["id"],
+            project_fit_confirmed=True,
+        )
+
+        new_package = Path(moved["ingestion_path"])
+        assert new_package.parent == deep_target
+        assert new_package.name != old_package.name
+        assert not old_package.exists()
+        generated = [new_package, *new_package.rglob("*")]
+        assert max(windows_units(path.resolve()) for path in generated) <= 259
+
+    def test_project_move_reserves_actual_long_nested_original_tail(
+        self, client: TestClient, project, service, settings,
+    ):
+        windows_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        root = settings.app.one_drive_root
+        shallow_source = root / "s"
+        shallow_source.mkdir()
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET folder_path = ? WHERE id = ?",
+                (str(shallow_source), project["id"]),
+            )
+        nested_relative = (
+            "nested-folder-with-a-long-name/"
+            "another-folder/long-original-document-name.txt"
+        )
+        captured = client.post(
+            f"/api/projects/{project['id']}/sources",
+            files=[("files", (
+                "long-original-document-name.txt",
+                b"Fictional nested original preserved across a deep project move.",
+                "text/plain",
+            ))],
+            data={"relative_paths": json.dumps([nested_relative])},
+        )
+        assert captured.status_code == 202, captured.text
+        source = captured.json()["source"]
+        detail = client.get(f"/api/sources/{source['id']}").json()
+        original_relative = detail["original_files"][0]["relative_path"]
+        assert windows_units(original_relative) > 45
+
+        target = client.post(
+            "/api/projects", json={"name": "Fictional Nested Move Target"}
+        ).json()
+        descendant_reserve = service._package_descendant_reserve(
+            Path(source["ingestion_path"])
+        )
+        compact_component_units = len("20260815-120000__I-12345678")
+        target_parent_units = (
+            259 - 1 - descendant_reserve - compact_component_units
+        )
+        padding = max(1, target_parent_units - windows_units(root.resolve()) - 1)
+        deep_target = root / ("N" * padding)
+        deep_target.mkdir()
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET folder_path = ? WHERE id = ?",
+                (str(deep_target), target["id"]),
+            )
+
+        moved = service._move_source_package(
+            source["id"],
+            deep_target / Path(source["ingestion_path"]).name,
+            memory_state="pending",
+            event_type="moved_before_processing",
+            reason="Regression test for descendant-aware move budgeting.",
+            to_project_id=target["id"],
+            project_fit_confirmed=True,
+        )
+
+        new_package = Path(moved["ingestion_path"])
+        generated = [new_package, *new_package.rglob("*")]
+        assert max(windows_units(path.resolve()) for path in generated) <= 259
+        assert (new_package / original_relative).is_file()
+
+    def test_nested_attachment_keeps_user_facing_original_filename(
+        self, client: TestClient, project, service,
+    ):
+        from portfolio_assistant.extraction import AttachmentData
+
+        root = upload(
+            client,
+            project["id"],
+            "attachment-root.txt",
+            b"Fictional root for nested attachment provenance.",
+        ).json()["source"]
+        with service.db.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO sources(
+                   project_id, parent_source_id, source_type, native_id, sha256,
+                   original_filename, original_path, metadata_json, processing_state, created_at,
+                   ingestion_path, canonical_source, memory_state, project_fit_confirmed,
+                   memory_state_changed_at
+                   ) VALUES (?, ?, 'msg', ?, ?, ?, ?, '{}', 'processing', ?, ?, 0, 'pending', 0, ?)""",
+                (
+                    project["id"], root["id"], "nested-email:test",
+                    hashlib.sha256(b"nested-message").hexdigest(),
+                    "forwarded-message.msg", root["original_path"],
+                    "2026-08-15T12:00:00+00:00", root["ingestion_path"],
+                    "2026-08-15T12:00:00+00:00",
+                ),
+            )
+            nested_id = int(cursor.lastrowid)
+
+        service._preserve_attachments(nested_id, [
+            AttachmentData(
+                "user-visible-attachment.txt",
+                b"Fictional nested attachment text.",
+                "text/plain",
+            ),
+        ])
+
+        with service.db.connect() as connection:
+            child = connection.execute(
+                "SELECT original_filename, original_path FROM sources WHERE parent_source_id = ?",
+                (nested_id,),
+            ).fetchone()
+        assert child["original_filename"] == "user-visible-attachment.txt"
+        assert Path(child["original_path"]).name != child["original_filename"]
+
+    def test_legacy_migration_path_preflight_does_not_abort_startup(
+        self, project, service, settings,
+    ):
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        windows_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        root = settings.app.one_drive_root
+        padding = max(1, 195 - windows_units(root.resolve()) - 1)
+        deep_project = root / ("L" * padding)
+        assistant = deep_project / "_Assistant"
+        assistant.mkdir(parents=True)
+        descriptor = {
+            "schema_version": 1,
+            "project_id": project["id"],
+            "archive_id": project["archive_id"],
+            "name": project["name"],
+            "created_at": project["created_at"],
+        }
+        (assistant / "project.json").write_text(
+            json.dumps(descriptor), encoding="utf-8"
+        )
+        assert windows_units(deep_project.resolve()) >= 190
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET folder_path = ? WHERE id = ?",
+                (str(deep_project), project["id"]),
+            )
+
+        legacy_original = root / "legacy-deep-preflight.txt"
+        legacy_original.write_bytes(b"Fictional legacy startup containment evidence.")
+        with service.db.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO sources(
+                   project_id, source_type, sha256, original_filename, original_path,
+                   metadata_json, processing_state, created_at
+                   ) VALUES (?, 'txt', ?, ?, ?, '{}', 'captured', ?)""",
+                (
+                    project["id"], hashlib.sha256(legacy_original.read_bytes()).hexdigest(),
+                    "legacy-deep-preflight.txt", str(legacy_original),
+                    "2026-08-15T12:00:00+00:00",
+                ),
+            )
+            source_id = int(cursor.lastrowid)
+
+        PortfolioService(settings, service.db, FakeLlmAdapter())
+
+        with service.db.connect() as connection:
+            pending = connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        assert pending["ingestion_path"] is None
+        assert not list(deep_project.glob("_INCOMPLETE_*"))
+
+    def test_deep_routing_quarantine_keeps_every_descendant_within_max_path(
+        self, settings,
+    ):
+        from dataclasses import replace
+
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        windows_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        root_parent = settings.app.one_drive_root.parent
+        padding = max(1, 175 - windows_units(root_parent.resolve()) - 1)
+        deep_root = root_parent / ("Q" * padding)
+        deep_root.mkdir()
+        deep_settings = replace(
+            settings,
+            app=replace(
+                settings.app,
+                database_path=settings.app.database_path.with_name("quarantine-path.db"),
+                one_drive_root=deep_root,
+            ),
+        )
+        deep_db = Database(deep_settings.app.database_path)
+        deep_db.migrate()
+        deep_service = PortfolioService(deep_settings, deep_db, FakeLlmAdapter())
+        staging = (
+            deep_root / "_PortfolioAssistant" / "staging" / "routing" / "review-1"
+        )
+        sidecar = staging / "Assistant" / "linked-segments.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("[]\n", encoding="utf-8")
+        assert max(
+            windows_units(path.resolve()) for path in [staging, *staging.rglob("*")]
+        ) <= 259
+
+        quarantined = deep_service._quarantine_routing_path(
+            staging, "legacy-migration-with-a-long-recovery-label"
+        )
+
+        assert not staging.exists()
+        assert (quarantined / "Assistant" / "linked-segments.json").is_file()
+        assert max(
+            windows_units(path.resolve())
+            for path in [quarantined, *quarantined.rglob("*")]
+        ) <= 259

@@ -3,8 +3,10 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import re
 import sys
 import threading
+import unicodedata
 from ctypes import wintypes
 from pathlib import Path
 from typing import Protocol
@@ -12,6 +14,51 @@ from typing import Protocol
 
 class CredentialError(RuntimeError):
     """A safe, non-secret-bearing credential storage failure."""
+
+
+class InvalidApiKeyError(CredentialError):
+    """The supplied key cannot be used. The message never contains the key."""
+
+
+# Word, Outlook and Teams wrap pasted values in matched smart quotes.
+_QUOTE_CHARACTERS = "\"'`´‘’‚‛“”„‟«»‹›"
+# Printable ASCII without space: exactly what survives HTTP header encoding.
+_HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
+
+
+def normalize_api_key(raw: str) -> str:
+    """Repair paste damage, then require a header-safe key.
+
+    Keys arrive pasted out of documents far more often than they are typed, so
+    the invisible characters that ride along are repaired rather than rejected.
+    What cannot be repaired is refused here instead of at request time, where
+    the failure surfaces as an opaque encoding error or a bare 401.
+
+    Raises InvalidApiKeyError, whose message never contains the key.
+    """
+    # Structural damage, unlike invisible damage, is not repairable: joining the
+    # lines of a two-line paste just yields a different wrong key. Rejecting CR
+    # and LF here is also what forecloses header injection.
+    if any(ch in raw for ch in "\r\n\x00"):
+        raise InvalidApiKeyError(
+            "The API key must be a single line. Paste only the key itself."
+        )
+    text = unicodedata.normalize("NFKC", raw)
+    # Cc and Cf cover tab, zero-width joiners, soft hyphen and the UTF-8 BOM.
+    text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
+    text = text.strip()
+    while len(text) >= 2 and text[0] in _QUOTE_CHARACTERS and text[-1] in _QUOTE_CHARACTERS:
+        text = text[1:-1].strip()
+    # NFKC has already folded NBSP and friends down to plain spaces.
+    text = "".join(ch for ch in text if not ch.isspace())
+    if not text:
+        raise InvalidApiKeyError("Enter a GenAI.mil API key before saving")
+    if not _HEADER_SAFE.fullmatch(text):
+        raise InvalidApiKeyError(
+            "The API key contains characters that cannot be sent in an HTTP header. "
+            "Retype the key instead of pasting it from a document."
+        )
+    return text
 
 
 class CredentialStore(Protocol):
@@ -113,12 +160,14 @@ class WindowsDpapiCredentialStore:
             value = self._unprotect(ciphertext).decode("utf-8")
         except (OSError, UnicodeError) as exc:
             raise CredentialError("The saved GenAI.mil API key could not be read") from exc
-        return value or None
+        if not value:
+            return None
+        # Keys stored before this validation existed can still be damaged on disk,
+        # so repair on the way out rather than failing at request time.
+        return normalize_api_key(value)
 
     def set(self, value: str) -> None:
-        key = value.strip()
-        if not key:
-            raise CredentialError("Enter a GenAI.mil API key before saving")
+        key = normalize_api_key(value)
         ciphertext = self._protect(key.encode("utf-8"))
         temporary = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"

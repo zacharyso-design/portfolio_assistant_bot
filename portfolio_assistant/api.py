@@ -11,12 +11,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from . import APPLICATION_ID
 from .config import Settings, ensure_runtime_paths, load_settings
+from .credentials import InvalidApiKeyError
 from .db import Database
 from .llm import LlmContractError, LlmUnavailable, build_adapter
 from .services import (
@@ -266,6 +268,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.add_exception_handler(ValidationError, invalid)
     app.add_exception_handler(LlmContractError, invalid)
+    app.add_exception_handler(InvalidApiKeyError, invalid)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_invalid(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Pydantic reports the rejected value in "input", and SecretStr does not
+        # redact it. FastAPI's default handler would therefore echo a rejected
+        # API key straight back to the caller and into the access log.
+        safe = [
+            {key: value for key, value in error.items() if key not in {"input", "ctx", "url"}}
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": safe}, status_code=422)
 
     @app.exception_handler(LlmUnavailable)
     async def unavailable(_: Request, exc: LlmUnavailable) -> JSONResponse:

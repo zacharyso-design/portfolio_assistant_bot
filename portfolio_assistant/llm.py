@@ -17,7 +17,10 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from .config import LlmSettings
-from .credentials import CredentialError, CredentialStore, WindowsDpapiCredentialStore
+from .credentials import (
+    CredentialError, CredentialStore, InvalidApiKeyError, WindowsDpapiCredentialStore,
+    normalize_api_key,
+)
 from .preferences import (
     JsonModelPreferenceStore, ModelPreferenceError, ModelPreferenceStore, valid_model_id,
 )
@@ -506,11 +509,15 @@ class InternalHttpLlmAdapter:
         }
 
     def save_api_key(self, api_key: str) -> dict[str, Any]:
+        # Normalize here so the caller can be told the pasted key was repaired.
+        cleaned = normalize_api_key(api_key)
         try:
-            self._credential_store.set(api_key)
+            self._credential_store.set(cleaned)
+        except InvalidApiKeyError:
+            raise
         except CredentialError as exc:
             raise LlmUnavailable(str(exc)) from exc
-        return self.credential_status()
+        return {**self.credential_status(), "normalized": cleaned != api_key.strip()}
 
     def remove_api_key(self) -> dict[str, Any]:
         try:
@@ -528,7 +535,13 @@ class InternalHttpLlmAdapter:
             return stored, "encrypted_local"
         environment_key = os.environ.get(self.settings.api_key_env, "").strip()
         if environment_key:
-            return environment_key, "environment"
+            # The environment is a third entry point into the same auth header.
+            try:
+                return normalize_api_key(environment_key), "environment"
+            except InvalidApiKeyError as exc:
+                raise LlmUnavailable(
+                    f"The {self.settings.api_key_env} environment value is not a usable API key"
+                ) from exc
         raise LlmUnavailable("No GenAI.mil API key is configured; save one in Settings")
 
     def list_models(self) -> list[str]:

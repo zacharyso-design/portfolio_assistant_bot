@@ -126,20 +126,23 @@ def test_serve_reload_passes_an_import_string(settings, monkeypatch):
     import importlib
 
     calls: list[tuple[object, dict[str, object]]] = []
-    validations: list[object] = []
+    validations: list[tuple[object, dict[str, object]]] = []
 
     def record_run(selected_app, **kwargs) -> None:
         calls.append((selected_app, kwargs))
 
     monkeypatch.setattr(cli, "load_settings", lambda _: settings)
-    monkeypatch.setattr(cli, "create_app", lambda s: validations.append(s) or object())
+    monkeypatch.setattr(
+        cli, "create_app", lambda s, **kw: validations.append((s, kw)) or object()
+    )
     monkeypatch.setattr(cli.uvicorn, "run", record_run)
 
     assert cli.main(["--config", "unused.toml", "serve", "--reload"]) == 0
     # The parent validates the configuration by building the app once before
     # the reloader starts, so config errors surface as Error: lines, not as
-    # endlessly retried child tracebacks.
-    assert validations == [settings]
+    # endlessly retried child tracebacks — and it must NOT open the log file
+    # the reload child (a second process) will need to rotate on Windows.
+    assert validations == [(settings, {"configure_logging": False})]
     assert calls == [("portfolio_assistant.api:create_app", {
         "factory": True,
         "host": "127.0.0.1",

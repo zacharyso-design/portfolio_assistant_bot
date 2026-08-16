@@ -3229,7 +3229,19 @@ class PortfolioService:
         for manifest_path in package_paths:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    raise ValueError("Archive manifest must contain a JSON object")
                 package = manifest_path.parent
+                index_file = package / "Assistant" / "index.json"
+                index = json.loads(index_file.read_text(encoding="utf-8")) if index_file.is_file() else {}
+                if not isinstance(index, dict):
+                    raise ValueError("Archive index must contain a JSON object")
+                email_metadata = index.get("email_metadata")
+                if email_metadata is None:
+                    email_metadata = {}
+                if not isinstance(email_metadata, dict):
+                    raise ValueError("Archive email metadata must contain a JSON object")
+                rebuilt_metadata = {**index, **email_metadata}
                 canonical = bool(manifest.get("canonical_source", True))
                 ingestion_id = str(manifest.get("ingestion_id") or stable_id("I"))
                 manifest_project_id = manifest.get("project_id")
@@ -3352,12 +3364,10 @@ class PortfolioService:
                                     )
                                     sequence += 1
                     source_summary_file = package / "Assistant" / "source-summary.md"
-                    index_file = package / "Assistant" / "index.json"
-                    index = json.loads(index_file.read_text(encoding="utf-8")) if index_file.is_file() else {}
                     connection.execute(
                         "UPDATE sources SET source_summary = ?, metadata_json = ? WHERE id = ?",
                         (index.get("summary") or (source_summary_file.read_text(encoding="utf-8") if source_summary_file.is_file() else ""),
-                          _json({**index, **(index.get("email_metadata") or {})}), source_id),
+                          _json(rebuilt_metadata), source_id),
                     )
                     lifecycle_file = package / "Assistant" / "source-lifecycle.jsonl"
                     if lifecycle_file.is_file():

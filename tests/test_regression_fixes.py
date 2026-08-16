@@ -1675,3 +1675,46 @@ class TestRejectedRoutingRuleArchiveAtomicity:
         ])
         assert not first_staging.exists()
         assert not second_staging.exists()
+
+
+class TestMalformedSidecarRebuildIsolation:
+    """A scalar email_metadata sidecar value aborted the entire archive rebuild."""
+
+    def test_bad_package_is_reported_and_good_package_still_rebuilds(
+        self, client: TestClient, project, settings,
+    ):
+        from dataclasses import replace
+
+        from portfolio_assistant.llm import FakeLlmAdapter
+        from portfolio_assistant.services import PortfolioService
+
+        good = upload(
+            client, project["id"], "rebuild-good.txt", b"Fictional good rebuild evidence."
+        ).json()["source"]
+        bad = upload(
+            client, project["id"], "rebuild-bad.txt", b"Fictional malformed-sidecar evidence."
+        ).json()["source"]
+        bad_index_path = Path(bad["ingestion_path"]) / "Assistant" / "index.json"
+        bad_index = json.loads(bad_index_path.read_text(encoding="utf-8"))
+        bad_index["email_metadata"] = "not-an-object"
+        bad_index_path.write_text(json.dumps(bad_index), encoding="utf-8")
+
+        rebuilt_settings = replace(
+            settings,
+            app=replace(
+                settings.app,
+                database_path=settings.app.database_path.with_name("malformed-sidecar-rebuild.db"),
+            ),
+        )
+        rebuilt_db = Database(rebuilt_settings.app.database_path)
+        rebuilt_db.migrate()
+        rebuilt = PortfolioService(rebuilt_settings, rebuilt_db, FakeLlmAdapter())
+
+        counts = rebuilt.rebuild_index()
+
+        assert counts["errors"] == 1
+        rebuilt_sources = rebuilt.get_project(project["id"])["sources"]
+        assert {item["ingestion_id"] for item in rebuilt_sources} == {good["ingestion_id"]}
+        assert bad["ingestion_id"] not in {
+            item["ingestion_id"] for item in rebuilt_sources
+        }

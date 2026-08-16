@@ -31,6 +31,17 @@ WORKER_MAX_BACKOFF_MULTIPLIER = 30
 SHUTDOWN_GRACE_SECONDS = 10.0
 
 
+class _HashedAssetFiles(StaticFiles):
+    """Vite assets carry a content hash in the filename, so they never change
+    in place and can be cached forever; index.html (served elsewhere with
+    no-cache) is what points browsers at the current hashes."""
+
+    def file_response(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -544,7 +555,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if static_dir.exists():
         assets = static_dir / "assets"
         if assets.exists():
-            app.mount("/assets", StaticFiles(directory=assets), name="assets")
+            app.mount("/assets", _HashedAssetFiles(directory=assets), name="assets")
 
         @app.get("/{path:path}", include_in_schema=False)
         def frontend(path: str) -> FileResponse:
@@ -552,7 +563,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="API route not found")
             candidate = static_dir / path
             if path and candidate.is_file() and candidate.resolve().is_relative_to(static_dir.resolve()):
-                return FileResponse(candidate)
-            return FileResponse(static_dir / "index.html")
+                response = FileResponse(candidate)
+            else:
+                response = FileResponse(static_dir / "index.html")
+            # Without a cache policy, browsers cache index.html heuristically
+            # and keep running a stale frontend against an upgraded backend.
+            # no-cache means revalidate-every-load, which is free on loopback.
+            response.headers["Cache-Control"] = "no-cache"
+            return response
 
     return app

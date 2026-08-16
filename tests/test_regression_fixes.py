@@ -2758,3 +2758,24 @@ class TestBooleanAndNonFiniteConfigScalars:
         config = self._config(tmp_path, llm_lines='timeout_seconds = "inf"\n')
         with pytest.raises(ConfigurationError, match="timeout_seconds"):
             load_settings(config)
+
+
+class TestFrontendCacheHeaders:
+    """index.html had no cache policy, so browsers kept running a stale frontend after upgrades."""
+
+    def test_index_html_must_be_revalidated_every_load(self, client: TestClient):
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") == "no-cache"
+
+    def test_spa_routes_share_the_no_cache_policy(self, client: TestClient):
+        response = client.get("/snow-import")
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") == "no-cache"
+
+    def test_hashed_assets_are_immutable(self, client: TestClient, settings):
+        assets = sorted((settings.static_dir / "assets").glob("*.js"))
+        assert assets, "built frontend assets must exist for this test"
+        response = client.get(f"/assets/{assets[0].name}")
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") == "public, max-age=31536000, immutable"

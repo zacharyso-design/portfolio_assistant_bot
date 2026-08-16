@@ -14,6 +14,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from portfolio_assistant.credentials import (
+    InvalidApiKeyError, WindowsDpapiCredentialStore, normalize_api_key,
+)
 from portfolio_assistant.db import Database
 from portfolio_assistant.extraction import (
     ExtractionFailure, decode_text_bytes, safe_filename,
@@ -2369,3 +2372,129 @@ class TestEmptyPortfolioMetrics:
     def test_metrics_are_zero_not_null_on_an_empty_portfolio(self, client: TestClient):
         payload = client.get("/api/projects").json()
         assert payload["metrics"] == {"total": 0, "active": 0, "red": 0}
+
+
+GOOD_KEY = "sk-genai-AbC123_xyz-456"
+KEY_HEAD, KEY_TAIL = "sk-genai-AbC123_xyz", "-456"
+
+# Paste damage that is repairable: the key underneath is intact.
+REPAIRABLE_KEYS = [
+    ("curly-quotes", "“" + GOOD_KEY + "”"),
+    ("straight-quotes", '"' + GOOD_KEY + '"'),
+    ("single-curly-quotes", "‘" + GOOD_KEY + "’"),
+    ("guillemets", "«" + GOOD_KEY + "»"),
+    ("trailing-nbsp", GOOD_KEY + " "),
+    ("interior-nbsp", KEY_HEAD + " " + KEY_TAIL),
+    ("zero-width-space", KEY_HEAD + "​" + KEY_TAIL),
+    ("zero-width-joiner", KEY_HEAD + "‍" + KEY_TAIL),
+    ("word-joiner", KEY_HEAD + "⁠" + KEY_TAIL),
+    ("soft-hyphen", KEY_HEAD + "­" + KEY_TAIL),
+    ("utf8-bom", "﻿" + GOOD_KEY),
+    ("interior-tab", KEY_HEAD + "\t" + KEY_TAIL),
+    ("surrounding-whitespace", "   " + GOOD_KEY + "\t "),
+    ("quotes-and-padding", " “ " + GOOD_KEY + " ” "),
+]
+
+# Damage that cannot be repaired into a header-safe key.
+UNUSABLE_KEYS = [
+    ("empty", ""),
+    ("whitespace-only", "     "),
+    ("nbsp-only", "  "),
+    ("quotes-only", "“”"),
+    ("accented-text", "sk-genai-café-456"),
+    ("cyrillic-homoglyph", "sk-genai-АbC123"),
+    ("emoji", GOOD_KEY + "\U0001f511"),
+    ("carriage-return", GOOD_KEY + "\r"),
+    ("newline-injection", GOOD_KEY + "\nX-Injected: 1"),
+    ("crlf-injection", GOOD_KEY + "\r\nX-Injected: 1"),
+    ("null-byte", GOOD_KEY + "\x00"),
+]
+
+
+class TestPastedApiKeyNormalization:
+    """A pasted key's smart quotes and invisible characters were stored, then failed at request time."""
+
+    @pytest.mark.parametrize(
+        "raw", [case[1] for case in REPAIRABLE_KEYS], ids=[c[0] for c in REPAIRABLE_KEYS]
+    )
+    def test_repairable_paste_damage_is_normalized(self, raw):
+        assert normalize_api_key(raw) == GOOD_KEY
+
+    @pytest.mark.parametrize(
+        "raw", [case[1] for case in UNUSABLE_KEYS], ids=[c[0] for c in UNUSABLE_KEYS]
+    )
+    def test_unusable_keys_are_rejected(self, raw):
+        with pytest.raises(InvalidApiKeyError):
+            normalize_api_key(raw)
+
+    @pytest.mark.parametrize(
+        "raw", [case[1] for case in UNUSABLE_KEYS], ids=[c[0] for c in UNUSABLE_KEYS]
+    )
+    def test_rejection_message_never_contains_the_key(self, raw):
+        with pytest.raises(InvalidApiKeyError) as caught:
+            normalize_api_key(raw)
+        assert GOOD_KEY not in str(caught.value)
+        assert "AbC123" not in str(caught.value)
+
+    def test_already_clean_key_is_returned_unchanged(self):
+        assert normalize_api_key(GOOD_KEY) == GOOD_KEY
+
+    def test_normalization_is_idempotent(self):
+        for _, raw in REPAIRABLE_KEYS:
+            once = normalize_api_key(raw)
+            assert normalize_api_key(once) == once
+
+    def test_normalized_keys_survive_http_header_encoding(self):
+        # Latin-1 is what the HTTP stack encodes header values with. Anything
+        # that escaped normalization would raise here instead of at request time.
+        for _, raw in REPAIRABLE_KEYS:
+            ("Bearer " + normalize_api_key(raw)).encode("latin-1")
+
+    def test_store_writes_nothing_when_the_key_is_unusable(self, tmp_path):
+        store = WindowsDpapiCredentialStore(path=tmp_path / "creds" / "genai-api-key.bin")
+        with pytest.raises(InvalidApiKeyError):
+            store.set("sk-genai-café-456")
+        assert not store.path.exists()
+        assert not store.path.parent.exists()
+
+    def test_store_repairs_a_damaged_key_already_on_disk(self, tmp_path, monkeypatch):
+        # Keys saved before this validation existed are still in %LOCALAPPDATA%.
+        store = WindowsDpapiCredentialStore(path=tmp_path / "genai-api-key.bin")
+        store.path.write_bytes(b"ciphertext")
+        monkeypatch.setattr(
+            WindowsDpapiCredentialStore, "_unprotect",
+            classmethod(lambda cls, blob: ("“" + GOOD_KEY + "”").encode("utf-8")),
+        )
+        assert store.get() == GOOD_KEY
+
+    def test_store_reports_an_unrepairable_key_already_on_disk(self, tmp_path, monkeypatch):
+        store = WindowsDpapiCredentialStore(path=tmp_path / "genai-api-key.bin")
+        store.path.write_bytes(b"ciphertext")
+        monkeypatch.setattr(
+            WindowsDpapiCredentialStore, "_unprotect",
+            classmethod(lambda cls, blob: "sk-genai-café".encode("utf-8")),
+        )
+        with pytest.raises(InvalidApiKeyError):
+            store.get()
+
+
+class TestRejectedApiKeyEcho:
+    """SecretStr does not redact pydantic's "input", so a rejected key came back in the 422 body."""
+
+    def test_oversize_key_is_rejected_without_echoing_it(self, client: TestClient):
+        oversize = "sk-" + "a" * 20_001
+        response = client.put("/api/llm/credential", json={"api_key": oversize})
+        assert response.status_code == 422
+        assert oversize not in response.text
+        assert "a" * 100 not in response.text
+
+    def test_empty_key_is_rejected(self, client: TestClient):
+        assert client.put("/api/llm/credential", json={"api_key": ""}).status_code == 422
+
+    def test_validation_errors_keep_their_shape(self, client: TestClient):
+        response = client.put("/api/llm/credential", json={"api_key": "x" * 20_001})
+        detail = response.json()["detail"]
+        assert isinstance(detail, list) and detail
+        assert {"type", "loc", "msg"} <= set(detail[0])
+        assert "input" not in detail[0]
+        assert "ctx" not in detail[0]

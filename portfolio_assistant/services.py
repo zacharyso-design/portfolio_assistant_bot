@@ -122,8 +122,10 @@ class PortfolioService:
         self._llm_model_catalog_result: dict[str, Any] | None = None
         self._llm_model_catalog_generation = 0
         self._llm_model_catalog_inflight: threading.Event | None = None
+        self._routing_publication_lock = threading.Lock()
         self.archive_paths = ensure_archive_roots(settings.app.one_drive_root)
         self.migrate_archive()
+        self._recover_routing_publications()
 
     def _under_root(self, path: Path) -> Path:
         root = self.settings.app.one_drive_root.resolve()
@@ -205,6 +207,177 @@ class PortfolioService:
         atomic_write_json(assistant / "knowledge-items.json", [])
         atomic_write_json(assistant / "citations.json", [])
         atomic_write_text(assistant / "source-lifecycle.jsonl", "")
+
+    def _routing_staging_root(self) -> Path:
+        root = self._under_root(
+            self.settings.app.one_drive_root / "_PortfolioAssistant" / "staging" / "routing"
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _discard_routing_staging(staging: Path | None) -> None:
+        if staging and staging.exists():
+            try:
+                shutil.rmtree(staging)
+            except OSError:
+                # This location is outside every archive-rescan glob. A startup
+                # recovery pass will retry without exposing uncommitted memory.
+                LOGGER.warning(
+                    "Could not remove rolled-back routing staging %s; will retry",
+                    staging,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _routing_manifest_matches(manifest: Any, identity: Any) -> bool:
+        if not isinstance(manifest, dict) or not isinstance(identity, dict):
+            return False
+        required = (
+            "ingestion_id", "linked_ingestion_id", "database_project_id", "project_id",
+        )
+        return (
+            manifest.get("source_type") == "linked-source"
+            and identity.get("source_type") == "linked-source"
+            and manifest.get("canonical_source") is False
+            and all(
+                identity.get(field) and manifest.get(field) == identity.get(field)
+                for field in required
+            )
+        )
+
+    def _quarantine_routing_path(self, path: Path, label: str) -> Path:
+        quarantine_root = self._under_root(
+            self.settings.app.one_drive_root / "_PortfolioAssistant" / "quarantine" / "routing"
+        )
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        destination = self._under_root(quarantine_root / f"{label}-{stable_id('Q')}")
+        os.replace(path, destination)
+        return destination
+
+    def _publish_routing_staging(self, staging: Path) -> bool:
+        publication = read_json(staging / "publication.json", None)
+        if not isinstance(publication, dict):
+            return False
+        review_id = int(publication.get("review_id") or 0)
+        final_relative = publication.get("final_relative_path")
+        mode = publication.get("mode")
+        package_identity = publication.get("package_identity")
+        if (
+            not review_id or not isinstance(final_relative, str)
+            or mode not in {"package", "segments"}
+            or not isinstance(package_identity, dict)
+        ):
+            return False
+        final = self._under_root(self.settings.app.one_drive_root / final_relative)
+        with self.db.connect() as connection:
+            review = connection.execute(
+                "SELECT status, resolution_json FROM review_items WHERE id = ?", (review_id,)
+            ).fetchone()
+            resolution = _decode(review["resolution_json"], {}) if review else {}
+            derived_source_id = resolution.get("derived_source_id") if isinstance(resolution, dict) else None
+            derived = connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (derived_source_id,)
+            ).fetchone() if derived_source_id else None
+        if (
+            not review or review["status"] != "resolved" or not derived
+            or not derived["ingestion_path"]
+            or Path(derived["ingestion_path"]).resolve() != final.resolve()
+        ):
+            return False
+        with self._routing_publication_lock:
+            if mode == "package":
+                staged_package = staging / "package"
+                if final.exists():
+                    final_manifest = read_json(final / "manifest.json", None)
+                    if not self._routing_manifest_matches(final_manifest, package_identity):
+                        raise ConflictError("Routing publication destination contains unrelated data")
+                    if staged_package.is_dir():
+                        staged_manifest = read_json(staged_package / "manifest.json", None)
+                        if not self._routing_manifest_matches(staged_manifest, package_identity):
+                            raise ConflictError("Committed routing package staging has invalid ownership")
+                        self._merge_linked_segments(
+                            staged_package / "Assistant" / "linked-segments.json",
+                            final / "Assistant" / "linked-segments.json",
+                        )
+                    elif not self._linked_segments_include(
+                        final / "Assistant" / "linked-segments.json", review_id
+                    ):
+                        raise ConflictError("Committed routing package staging is unavailable")
+                elif staged_package.is_dir():
+                    staged_manifest = read_json(staged_package / "manifest.json", None)
+                    if not self._routing_manifest_matches(staged_manifest, package_identity):
+                        raise ConflictError("Committed routing package staging has invalid ownership")
+                    os.replace(staged_package, final)
+                else:
+                    raise ConflictError("Committed routing package staging is unavailable")
+            else:
+                staged_segments = staging / "linked-segments.json"
+                if staged_segments.is_file():
+                    if not final.is_dir():
+                        raise ConflictError("Committed linked routing package is unavailable")
+                    if not self._routing_manifest_matches(
+                        read_json(final / "manifest.json", None), package_identity
+                    ):
+                        raise ConflictError("Routing publication destination contains unrelated data")
+                    self._merge_linked_segments(
+                        staged_segments, final / "Assistant" / "linked-segments.json"
+                    )
+                elif not self._linked_segments_include(
+                    final / "Assistant" / "linked-segments.json", review_id
+                ):
+                    raise ConflictError("Committed linked routing segment staging is unavailable")
+            shutil.rmtree(staging)
+        return True
+
+    @staticmethod
+    def _linked_segments_include(path: Path, review_id: int) -> bool:
+        segments = read_json(path, None)
+        return isinstance(segments, list) and any(
+            isinstance(item, dict) and item.get("review_id") == review_id
+            for item in segments
+        )
+
+    @staticmethod
+    def _merge_linked_segments(staged_path: Path, final_path: Path) -> None:
+        staged = read_json(staged_path, None)
+        existing = read_json(final_path, [])
+        if not isinstance(staged, list) or not isinstance(existing, list):
+            raise ConflictError("Linked routing segment metadata is invalid")
+        merged = list(existing)
+        for item in staged:
+            review_id = item.get("review_id") if isinstance(item, dict) else None
+            if review_id is not None:
+                merged = [
+                    current for current in merged
+                    if not isinstance(current, dict) or current.get("review_id") != review_id
+                ]
+            elif item in merged:
+                continue
+            merged.append(item)
+        atomic_write_json(final_path, merged)
+
+    def _recover_routing_publications(self) -> None:
+        try:
+            staging_root = self._routing_staging_root()
+            candidates = list(staging_root.iterdir())
+        except OSError:
+            LOGGER.warning("Could not enumerate routing publication staging", exc_info=True)
+            return
+        for staging in candidates:
+            try:
+                if not staging.is_dir():
+                    continue
+                if not self._publish_routing_staging(staging):
+                    LOGGER.warning(
+                        "Retaining ambiguous routing publication staging %s for manual recovery",
+                        staging,
+                    )
+            except Exception:
+                LOGGER.warning(
+                    "Could not recover routing publication %s; will retry", staging,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _matching_snow_import(imports: Path, expected_sha256: str) -> Path | None:
@@ -3938,110 +4111,129 @@ class PortfolioService:
         if action not in {"apply", "dismiss"}:
             raise ValidationError("Review action must be apply or dismiss")
         now = utc_now()
-        with self.db.transaction() as connection:
-            review = connection.execute("SELECT * FROM review_items WHERE id = ?", (review_id,)).fetchone()
-            if not review:
-                raise NotFoundError("Review item not found")
-            if review["status"] != "open":
-                raise ConflictError("Review item is already resolved")
-            if action == "dismiss":
-                connection.execute(
-                    "UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ? WHERE id = ?",
-                    (_json(resolution), now, review_id),
-                )
-            # Delete this compatibility branch after all pre-003 review rows have been resolved or
-            # after an archive rebuild, which never recreates cross_project_evidence reviews.
-            elif review["kind"] in {"multi_project_route", "cross_project_evidence"}:
-                self._resolve_routing_review(
-                    connection, review, resolution, now,
-                    learn_rule=review["kind"] == "multi_project_route",
-                )
-            elif review["kind"] == "action_close":
-                action_id = int(resolution.get("action_item_id") or 0)
-                item = connection.execute(
-                    "SELECT * FROM action_items WHERE id = ? AND project_id = ?", (action_id, review["project_id"])
+        routing_publication: dict[str, Any] = {}
+        try:
+            with self.db.transaction() as connection:
+                review = connection.execute("SELECT * FROM review_items WHERE id = ?", (review_id,)).fetchone()
+                if not review:
+                    raise NotFoundError("Review item not found")
+                if review["status"] != "open":
+                    raise ConflictError("Review item is already resolved")
+                if action == "dismiss":
+                    connection.execute(
+                        "UPDATE review_items SET status = 'dismissed', resolution_json = ?, resolved_at = ? WHERE id = ?",
+                        (_json(resolution), now, review_id),
+                    )
+                # Delete this compatibility branch after all pre-003 review rows have been resolved or
+                # after an archive rebuild, which never recreates cross_project_evidence reviews.
+                elif review["kind"] in {"multi_project_route", "cross_project_evidence"}:
+                    self._resolve_routing_review(
+                        connection, review, resolution, now,
+                        learn_rule=review["kind"] == "multi_project_route",
+                        publication=routing_publication,
+                    )
+                elif review["kind"] == "action_close":
+                    action_id = int(resolution.get("action_item_id") or 0)
+                    item = connection.execute(
+                        "SELECT * FROM action_items WHERE id = ? AND project_id = ?", (action_id, review["project_id"])
+                    ).fetchone()
+                    if not item:
+                        raise ValidationError("Action item was not found in this project")
+                    connection.execute(
+                        "UPDATE action_items SET state = 'complete', completed_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, action_id),
+                    )
+                    connection.execute(
+                        "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
+                        (_json(resolution), now, review_id),
+                    )
+                elif review["kind"] == "project_field_recommendation":
+                    field = resolution.get("field")
+                    value = resolution.get("value")
+                    if field not in {"status", "priority"}:
+                        raise ValidationError("Only a user-confirmed status or priority recommendation can be applied")
+                    valid = STATUSES if field == "status" else PRIORITIES
+                    if value not in valid:
+                        raise ValidationError(f"Invalid project {field}")
+                    project = self._project(connection, review["project_id"])
+                    connection.execute(
+                        f"UPDATE projects SET {field} = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+                        (value, now, now if field == "status" and value == "Complete" else project["completed_at"], review["project_id"]),
+                    )
+                    text = f"User approved changing {field} from {project[field]} to {value}."
+                    connection.execute(
+                        "INSERT INTO project_updates(project_id, source_id, update_type, text, citations_json, created_at) VALUES (?, ?, 'manual_field', ?, '[]', ?)",
+                        (review["project_id"], review["source_id"], text, now),
+                    )
+                    connection.execute(
+                        "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
+                        (_json(resolution), now, review_id),
+                    )
+                elif review["kind"] == "inferred_action":
+                    evidence = _decode(review["evidence_json"], [])
+                    proposed = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
+                    description = normalize_text(str(resolution.get("description") or proposed.get("description") or ""))
+                    assignee_type = resolution.get("assignee_type") or proposed.get("assignee_type")
+                    assignee_value = normalize_text(str(resolution.get("assignee_value") or proposed.get("assignee_value") or ""))
+                    due = resolution.get("due_date") or proposed.get("due_date")
+                    if not description or assignee_type not in ASSIGNEE_TYPES or not assignee_value or not due:
+                        raise ValidationError("Confirmed action description, assignee, and due date are required")
+                    try:
+                        date.fromisoformat(str(due))
+                    except ValueError as exc:
+                        raise ValidationError("Confirmed action due date must be an ISO date") from exc
+                    citations = proposed.get("citations") if isinstance(proposed.get("citations"), list) else []
+                    connection.execute(
+                        """INSERT INTO action_items(project_id, description, assignee_type, assignee_value,
+                           due_date, state, source_id, citations_json, created_by, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, 'user', ?, ?)""",
+                        (review["project_id"], description, assignee_type, assignee_value, due,
+                         review["source_id"], _json(citations), now, now),
+                    )
+                    connection.execute(
+                        "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
+                        (_json(resolution), now, review_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
+                        (_json(resolution), now, review_id),
+                    )
+                source_id = review["source_id"]
+                if source_id:
+                    root = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+                    # The second condition finishes legacy direct-routing reviews created before migration 003.
+                    if root and (root["project_id"] is None or review["kind"] == "cross_project_evidence"):
+                        open_count = connection.execute(
+                            "SELECT count(*) FROM review_items WHERE source_id = ? AND status = 'open'", (source_id,)
+                        ).fetchone()[0]
+                        if open_count == 0:
+                            connection.execute(
+                                "UPDATE sources SET processing_state = 'complete', processed_at = ? WHERE id = ?",
+                                (now, source_id),
+                            )
+                updated = connection.execute(
+                    """SELECT r.*, p.name AS project_name, s.original_filename
+                       FROM review_items r LEFT JOIN projects p ON p.id = r.project_id
+                       LEFT JOIN sources s ON s.id = r.source_id WHERE r.id = ?""",
+                    (review_id,),
                 ).fetchone()
-                if not item:
-                    raise ValidationError("Action item was not found in this project")
-                connection.execute(
-                    "UPDATE action_items SET state = 'complete', completed_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, action_id),
+        except Exception:
+            self._discard_routing_staging(routing_publication.get("staging_path"))
+            raise
+        routing_published = True
+        if routing_publication.get("staging_path"):
+            try:
+                routing_published = self._publish_routing_staging(
+                    routing_publication["staging_path"]
                 )
-                connection.execute(
-                    "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
-                    (_json(resolution), now, review_id),
+            except Exception:
+                routing_published = False
+                LOGGER.warning(
+                    "Routing review %s committed but package publication is pending recovery",
+                    review_id,
+                    exc_info=True,
                 )
-            elif review["kind"] == "project_field_recommendation":
-                field = resolution.get("field")
-                value = resolution.get("value")
-                if field not in {"status", "priority"}:
-                    raise ValidationError("Only a user-confirmed status or priority recommendation can be applied")
-                valid = STATUSES if field == "status" else PRIORITIES
-                if value not in valid:
-                    raise ValidationError(f"Invalid project {field}")
-                project = self._project(connection, review["project_id"])
-                connection.execute(
-                    f"UPDATE projects SET {field} = ?, updated_at = ?, completed_at = ? WHERE id = ?",
-                    (value, now, now if field == "status" and value == "Complete" else project["completed_at"], review["project_id"]),
-                )
-                text = f"User approved changing {field} from {project[field]} to {value}."
-                connection.execute(
-                    "INSERT INTO project_updates(project_id, source_id, update_type, text, citations_json, created_at) VALUES (?, ?, 'manual_field', ?, '[]', ?)",
-                    (review["project_id"], review["source_id"], text, now),
-                )
-                connection.execute(
-                    "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
-                    (_json(resolution), now, review_id),
-                )
-            elif review["kind"] == "inferred_action":
-                evidence = _decode(review["evidence_json"], [])
-                proposed = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
-                description = normalize_text(str(resolution.get("description") or proposed.get("description") or ""))
-                assignee_type = resolution.get("assignee_type") or proposed.get("assignee_type")
-                assignee_value = normalize_text(str(resolution.get("assignee_value") or proposed.get("assignee_value") or ""))
-                due = resolution.get("due_date") or proposed.get("due_date")
-                if not description or assignee_type not in ASSIGNEE_TYPES or not assignee_value or not due:
-                    raise ValidationError("Confirmed action description, assignee, and due date are required")
-                try:
-                    date.fromisoformat(str(due))
-                except ValueError as exc:
-                    raise ValidationError("Confirmed action due date must be an ISO date") from exc
-                citations = proposed.get("citations") if isinstance(proposed.get("citations"), list) else []
-                connection.execute(
-                    """INSERT INTO action_items(project_id, description, assignee_type, assignee_value,
-                       due_date, state, source_id, citations_json, created_by, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, 'open', ?, ?, 'user', ?, ?)""",
-                    (review["project_id"], description, assignee_type, assignee_value, due,
-                     review["source_id"], _json(citations), now, now),
-                )
-                connection.execute(
-                    "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
-                    (_json(resolution), now, review_id),
-                )
-            else:
-                connection.execute(
-                    "UPDATE review_items SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
-                    (_json(resolution), now, review_id),
-                )
-            source_id = review["source_id"]
-            if source_id:
-                root = connection.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-                # The second condition finishes legacy direct-routing reviews created before migration 003.
-                if root and (root["project_id"] is None or review["kind"] == "cross_project_evidence"):
-                    open_count = connection.execute(
-                        "SELECT count(*) FROM review_items WHERE source_id = ? AND status = 'open'", (source_id,)
-                    ).fetchone()[0]
-                    if open_count == 0:
-                        connection.execute(
-                            "UPDATE sources SET processing_state = 'complete', processed_at = ? WHERE id = ?",
-                            (now, source_id),
-                        )
-            updated = connection.execute(
-                """SELECT r.*, p.name AS project_name, s.original_filename
-                   FROM review_items r LEFT JOIN projects p ON p.id = r.project_id
-                   LEFT JOIN sources s ON s.id = r.source_id WHERE r.id = ?""",
-                (review_id,),
-            ).fetchone()
         decoded = self._decode_review(updated)
         # cross_project_evidence is retained here solely for pre-migration review compatibility.
         if action == "apply" and review["kind"] in {"multi_project_route", "cross_project_evidence"}:
@@ -4051,7 +4243,8 @@ class PortfolioService:
             derived_source_id = routed.get("derived_source_id")
             target_project_id = routed.get("target_project_id")
             if derived_source_id and target_project_id:
-                self._refresh_source_archive(int(derived_source_id), processing_status="complete")
+                if routing_published:
+                    self._refresh_source_archive(int(derived_source_id), processing_status="complete")
                 self._write_knowledge_history(str(target_project_id))
                 try:
                     self.regenerate_living_summary(str(target_project_id), advance_revision=False)
@@ -4148,6 +4341,7 @@ class PortfolioService:
     def _resolve_routing_review(
         self, connection: sqlite3.Connection, review: sqlite3.Row,
         resolution: dict[str, Any], now: str, *, learn_rule: bool,
+        publication: dict[str, Any],
     ) -> None:
         target_project_id = str(resolution.get("target_project_id") or "")
         target = self._project(connection, target_project_id)
@@ -4155,6 +4349,19 @@ class PortfolioService:
         if not evidence:
             raise ValidationError("Routing review has no preserved evidence")
         segment = evidence[0]
+        confirmed_rule: dict[str, Any] | None = None
+        if learn_rule:
+            rule = resolution.get("rule") or segment.get("suggested_rule") or {}
+            rule_type = str(rule.get("rule_type") or "")
+            pattern = normalize_text(str(rule.get("pattern") or "")).casefold()
+            context = rule.get("context") if isinstance(rule.get("context"), dict) else {}
+            # Validate every user-controlled rule field before creating or editing
+            # the linked archive package. A rejected rule must leave no sidecar for
+            # disaster recovery to mistake for confirmed memory.
+            self._validate_routing_rule(rule_type, pattern, context, target)
+            confirmed_rule = {
+                "rule_type": rule_type, "pattern": pattern, "context": context,
+            }
         citations = segment.get("citations", [])
         source = connection.execute("SELECT * FROM sources WHERE id = ?", (review["source_id"],)).fetchone()
         if not source:
@@ -4165,24 +4372,72 @@ class PortfolioService:
         allowed = {(int(row["source_id"]), int(row["id"])) for row in allowed_rows}
         valid_citations = self._validate_citations(citations, allowed)
         created = datetime.fromisoformat(str(source["created_at"]).replace("Z", "+00:00"))
+        linked_ingestion_id = source["ingestion_id"] or self._legacy_ingestion_id(source)
         linked_package = self._under_root(
             Path(target["folder_path"]) /
             ingestion_folder_name(
                 created, "linked-source", source["source_title"] or source["original_filename"],
-                source["ingestion_id"] or self._legacy_ingestion_id(source),
+                linked_ingestion_id,
             )
         )
+        package_identity = {
+            "ingestion_id": linked_ingestion_id,
+            "linked_ingestion_id": linked_ingestion_id,
+            "database_project_id": target_project_id,
+            "project_id": target["archive_id"],
+            "source_type": "linked-source",
+        }
+        base_linked_segments: list[Any] = []
+        if linked_package.exists():
+            if not self._routing_manifest_matches(
+                read_json(linked_package / "manifest.json", None), package_identity
+            ):
+                raise ConflictError("Routing destination contains unrelated data")
+            existing_segments = read_json(
+                linked_package / "Assistant" / "linked-segments.json", None
+            )
+            if not isinstance(existing_segments, list):
+                raise ConflictError("Linked routing segment metadata is invalid")
+            base_linked_segments = existing_segments
+        legacy_incomplete = self._under_root(
+            linked_package.parent / f"_INCOMPLETE_LINK_{review['id']}"
+        )
+        if legacy_incomplete.exists():
+            if not self._routing_manifest_matches(
+                read_json(legacy_incomplete / "manifest.json", None), package_identity
+            ):
+                raise ConflictError("Legacy routing staging contains unrelated data")
+            self._quarantine_routing_path(
+                legacy_incomplete, f"legacy-incomplete-review-{review['id']}"
+            )
+        staging = self._under_root(
+            self._routing_staging_root() / f"routing-review-{review['id']}"
+        )
+        if staging.exists():
+            self._quarantine_routing_path(staging, f"superseded-review-{review['id']}")
+        staging.mkdir(parents=False)
+        publication["staging_path"] = staging
+        mode = "segments" if linked_package.exists() else "package"
+        atomic_write_json(staging / "publication.json", {
+            "review_id": int(review["id"]),
+            "final_relative_path": relative_to_root(
+                linked_package, self.settings.app.one_drive_root
+            ),
+            "mode": mode,
+            "package_identity": package_identity,
+        })
         if not linked_package.exists():
-            incomplete = linked_package.parent / f"_INCOMPLETE_LINK_{review['id']}"
-            incomplete.mkdir(parents=True, exist_ok=False)
+            staged_package = staging / "package"
+            staged_package.mkdir(parents=False)
             self._initial_assistant_files(
-                incomplete, source["ingestion_id"], target_project_id,
+                staged_package, linked_ingestion_id, target_project_id,
                 source["source_title"] or source["original_filename"],
             )
-            atomic_write_json(incomplete / "Assistant" / "linked-segments.json", [])
-            atomic_write_json(incomplete / "manifest.json", {
+            atomic_write_json(staged_package / "Assistant" / "linked-segments.json", [])
+            atomic_write_json(staged_package / "manifest.json", {
                 "schema_version": SCHEMA_VERSION,
-                "ingestion_id": source["ingestion_id"],
+                "ingestion_id": linked_ingestion_id,
+                "routing_review_id": int(review["id"]),
                 "project_id": target["archive_id"],
                 "database_project_id": target_project_id,
                 "source_type": "linked-source",
@@ -4191,7 +4446,7 @@ class PortfolioService:
                 "source_date": source["source_date"],
                 "capture_method": "routing_review",
                 "canonical_source": False,
-                "linked_ingestion_id": source["ingestion_id"],
+                "linked_ingestion_id": linked_ingestion_id,
                 "canonical_source_path": relative_to_root(Path(source["ingestion_path"]), self.settings.app.one_drive_root),
                 "processing_status": "complete",
                 "memory_state": "active",
@@ -4205,7 +4460,6 @@ class PortfolioService:
                 "extractor_version": "1.0",
                 "errors": [],
             })
-            os.replace(incomplete, linked_package)
         derived_native = f"routed-review:{review['id']}"
         existing = connection.execute(
             "SELECT id FROM sources WHERE project_id = ? AND native_id = ?",
@@ -4229,7 +4483,7 @@ class PortfolioService:
                  _json({"review_id": review["id"]}), source["meeting_name"], source["meeting_date"],
                  source["model_id"], now, now, str(linked_package),
                  source["source_title"] or source["original_filename"], source["source_date"],
-                 source["ingestion_id"], normalize_text(str(segment["text"])), now),
+                 linked_ingestion_id, normalize_text(str(segment["text"])), now),
             )
             derived_source_id = int(cursor.lastrowid)
             derived_citations = []
@@ -4290,31 +4544,34 @@ class PortfolioService:
                    WHERE id = ?""",
                 (text, now, target_project_id),
             )
-            linked_segments_path = linked_package / "Assistant" / "linked-segments.json"
-            linked_segments = json.loads(linked_segments_path.read_text(encoding="utf-8"))
+            linked_segments = list(base_linked_segments)
+            linked_segments = [
+                item for item in linked_segments
+                if not isinstance(item, dict) or item.get("review_id") != review["id"]
+            ]
             linked_segments.append({
                 "review_id": review["id"], "text": text, "citations": citation_payload,
                 "confirmed_at": now, "target_project_id": target["archive_id"],
             })
-            atomic_write_json(linked_segments_path, linked_segments)
+            if mode == "package":
+                linked_segments_path = staging / "package" / "Assistant" / "linked-segments.json"
+                atomic_write_json(linked_segments_path, linked_segments)
+            else:
+                atomic_write_json(staging / "linked-segments.json", linked_segments)
         stored_resolution = {**resolution, "derived_source_id": derived_source_id}
-        if learn_rule:
-            rule = resolution.get("rule") or segment.get("suggested_rule") or {}
-            rule_type = str(rule.get("rule_type") or "")
-            pattern = normalize_text(str(rule.get("pattern") or "")).casefold()
-            context = rule.get("context") if isinstance(rule.get("context"), dict) else {}
-            self._validate_routing_rule(rule_type, pattern, context, target)
+        if confirmed_rule is not None:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO routing_rules(rule_type, pattern, context_json, target_project_id,
                   created_from_review_id, active, created_at)
                 VALUES (?, ?, ?, ?, ?, 1, ?)
                 """,
-                (rule_type, pattern, _json(context), target_project_id, review["id"], now),
+                (
+                    confirmed_rule["rule_type"], confirmed_rule["pattern"],
+                    _json(confirmed_rule["context"]), target_project_id, review["id"], now,
+                ),
             )
-            stored_resolution["confirmed_rule"] = {
-                "rule_type": rule_type, "pattern": pattern, "context": context,
-            }
+            stored_resolution["confirmed_rule"] = confirmed_rule
         connection.execute(
             "UPDATE review_items SET project_id = ?, status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?",
             (target_project_id, _json(stored_resolution), now, review["id"]),

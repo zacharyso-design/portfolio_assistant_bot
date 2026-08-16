@@ -1202,3 +1202,476 @@ class TestSharedIntakeDuplicateAttachments:
             ).fetchone()
         assert child_count == 1
         assert original["relative_path"].endswith("/interrupted-child.txt")
+
+
+class TestRejectedRoutingRuleArchiveAtomicity:
+    """A rejected routing rule left an active orphan package that rescan imported as confirmed."""
+
+    @staticmethod
+    def _open_routing_review(client: TestClient):
+        client.post("/api/projects", json={"name": "Fictional Routing Source Project"})
+        target = client.post(
+            "/api/projects", json={"name": "Fictional Routing Target Project"},
+        ).json()
+        source = client.post(
+            "/api/intake/multi-project",
+            files={"file": (
+                "routing-atomicity.txt",
+                b"Fictional Routing Target Project owns this confirmed evidence.",
+                "text/plain",
+            )},
+        ).json()["source"]
+        processed = client.post(f"/api/sources/{source['id']}/retry")
+        assert processed.status_code == 200, processed.text
+        review = next(
+            item for item in client.get("/api/reviews?status=open").json()
+            if item["source_id"] == source["id"]
+        )
+        return target, source, review
+
+    @staticmethod
+    def _invalid_resolution(target, review):
+        return {
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": {"rule_type": "filename_phrase", "pattern": "x", "context": {}},
+        }
+
+    def test_rejected_rule_creates_no_package_or_rescan_source(
+        self, client: TestClient, service,
+    ):
+        target, source, review = self._open_routing_review(client)
+        target_folder = Path(target["folder_path"])
+        before = {path.name for path in target_folder.iterdir()}
+
+        rejected = client.post(
+            f"/api/reviews/{review['id']}/resolve",
+            json=self._invalid_resolution(target, review),
+        )
+
+        assert rejected.status_code == 422, rejected.text
+        assert {path.name for path in target_folder.iterdir()} == before
+        with service.db.connect() as connection:
+            current_review = connection.execute(
+                "SELECT status FROM review_items WHERE id = ?", (review["id"],)
+            ).fetchone()
+            derived_before = connection.execute(
+                "SELECT count(*) FROM sources WHERE parent_source_id = ? AND project_id = ?",
+                (source["id"], target["id"]),
+            ).fetchone()[0]
+        assert current_review["status"] == "open"
+        assert derived_before == 0
+
+        rescanned = client.post("/api/archive/rescan")
+        assert rescanned.status_code == 200, rescanned.text
+        with service.db.connect() as connection:
+            derived_after = connection.execute(
+                "SELECT count(*) FROM sources WHERE parent_source_id = ? AND project_id = ?",
+                (source["id"], target["id"]),
+            ).fetchone()[0]
+        assert derived_after == 0
+
+    def test_retry_after_rejection_writes_one_linked_segment(
+        self, client: TestClient,
+    ):
+        target, _, review = self._open_routing_review(client)
+        rejected = client.post(
+            f"/api/reviews/{review['id']}/resolve",
+            json=self._invalid_resolution(target, review),
+        )
+        assert rejected.status_code == 422
+
+        accepted = client.post(f"/api/reviews/{review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+
+        assert accepted.status_code == 200, accepted.text
+        derived_source_id = accepted.json()["resolution"]["derived_source_id"]
+        target_detail = client.get(f"/api/projects/{target['id']}").json()
+        derived = next(
+            item for item in target_detail["sources"] if item["id"] == derived_source_id
+        )
+        segments = json.loads(
+            (Path(derived["ingestion_path"]) / "Assistant" / "linked-segments.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert [item["review_id"] for item in segments] == [review["id"]]
+
+    def test_database_failure_after_package_preparation_is_rescan_safe_and_retryable(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        target, source, review = self._open_routing_review(client)
+        target_folder = Path(target["folder_path"])
+        before = {path.name for path in target_folder.iterdir()}
+        original_resolver = service._resolve_routing_review
+
+        def fail_after_preparation(*args, **kwargs):
+            original_resolver(*args, **kwargs)
+            raise sqlite3.OperationalError("fictional failure before routing transaction commit")
+
+        monkeypatch.setattr(service, "_resolve_routing_review", fail_after_preparation)
+        with pytest.raises(sqlite3.OperationalError):
+            service.resolve_review(review["id"], {
+                "action": "apply",
+                "target_project_id": target["id"],
+                "rule": review["evidence"][0]["suggested_rule"],
+            })
+
+        assert {path.name for path in target_folder.iterdir()} == before
+        with service.db.connect() as connection:
+            current_review = connection.execute(
+                "SELECT status FROM review_items WHERE id = ?", (review["id"],)
+            ).fetchone()
+            derived = connection.execute(
+                "SELECT count(*) FROM sources WHERE parent_source_id = ? AND project_id = ?",
+                (source["id"], target["id"]),
+            ).fetchone()[0]
+        assert current_review["status"] == "open"
+        assert derived == 0
+        assert client.post("/api/archive/rescan").json()["errors"] == 0
+
+        monkeypatch.setattr(service, "_resolve_routing_review", original_resolver)
+        retried = service.resolve_review(review["id"], {
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+        assert retried["status"] == "resolved"
+        assert retried["resolution"]["derived_source_id"]
+
+    def test_retry_cleans_a_legacy_incomplete_link_package(
+        self, client: TestClient, service,
+    ):
+        target, source, review = self._open_routing_review(client)
+        stale = Path(target["folder_path"]) / f"_INCOMPLETE_LINK_{review['id']}"
+        stale.mkdir()
+        with service.db.connect() as connection:
+            ingestion_id = connection.execute(
+                "SELECT ingestion_id FROM sources WHERE id = ?", (source["id"],)
+            ).fetchone()["ingestion_id"]
+        (stale / "manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "ingestion_id": ingestion_id,
+            "project_id": target["archive_id"],
+            "database_project_id": target["id"],
+            "source_type": "linked-source",
+            "canonical_source": False,
+            "linked_ingestion_id": ingestion_id,
+            "processing_status": "complete",
+            "memory_state": "active",
+            "original_files": [],
+        }), encoding="utf-8")
+        (stale / "preserved-marker.txt").write_text("recoverable", encoding="utf-8")
+
+        resolved = client.post(f"/api/reviews/{review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+
+        assert resolved.status_code == 200, resolved.text
+        assert not stale.exists()
+        quarantines = list((
+            service.settings.app.one_drive_root / "_PortfolioAssistant" / "quarantine" / "routing"
+        ).glob(f"legacy-incomplete-review-{review['id']}-*"))
+        assert len(quarantines) == 1
+        assert (quarantines[0] / "preserved-marker.txt").read_text(encoding="utf-8") == "recoverable"
+
+    def test_unverified_legacy_incomplete_folder_is_never_deleted(
+        self, client: TestClient,
+    ):
+        target, _, review = self._open_routing_review(client)
+        unrelated = Path(target["folder_path"]) / f"_INCOMPLETE_LINK_{review['id']}"
+        unrelated.mkdir()
+        (unrelated / "manifest.json").write_text(
+            json.dumps({"source_type": "personal-user-folder"}), encoding="utf-8"
+        )
+        marker = unrelated / "do-not-delete.txt"
+        marker.write_text("user-owned", encoding="utf-8")
+
+        rejected = client.post(f"/api/reviews/{review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+
+        assert rejected.status_code == 409, rejected.text
+        assert marker.read_text(encoding="utf-8") == "user-owned"
+
+    def test_unrelated_existing_destination_is_preserved_and_rejected(
+        self, client: TestClient, service,
+    ):
+        target, source, first_review = self._open_routing_review(client)
+        first = client.post(f"/api/reviews/{first_review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": first_review["evidence"][0]["suggested_rule"],
+        })
+        assert first.status_code == 200, first.text
+        first_source_id = first.json()["resolution"]["derived_source_id"]
+        with service.db.connect() as connection:
+            final = Path(connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (first_source_id,)
+            ).fetchone()["ingestion_path"])
+        second_review_id = service._create_review(
+            kind="multi_project_route",
+            source_id=source["id"],
+            project_id=target["id"],
+            question=first_review["question"],
+            reason=first_review["reason"],
+            evidence=first_review["evidence"],
+            options=first_review["options"],
+            memory_preview=first_review["memory_preview"],
+        )
+        unrelated_manifest = {
+            "source_type": "linked-source",
+            "canonical_source": False,
+            "ingestion_id": "I-UNRELATED",
+            "linked_ingestion_id": "I-UNRELATED",
+            "database_project_id": target["id"],
+            "project_id": target["archive_id"],
+        }
+        (final / "manifest.json").write_text(
+            json.dumps(unrelated_manifest, indent=2), encoding="utf-8"
+        )
+        segments_path = final / "Assistant" / "linked-segments.json"
+        segments_before = segments_path.read_bytes()
+
+        rejected = client.post(f"/api/reviews/{second_review_id}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": first_review["evidence"][0]["suggested_rule"],
+        })
+
+        assert rejected.status_code == 409, rejected.text
+        assert json.loads((final / "manifest.json").read_text(encoding="utf-8")) == unrelated_manifest
+        assert segments_path.read_bytes() == segments_before
+        with service.db.connect() as connection:
+            assert connection.execute(
+                "SELECT status FROM review_items WHERE id = ?", (second_review_id,)
+            ).fetchone()["status"] == "open"
+
+    def test_non_list_existing_segment_sidecar_is_preserved_and_rejected(
+        self, client: TestClient, service,
+    ):
+        target, source, first_review = self._open_routing_review(client)
+        first = client.post(f"/api/reviews/{first_review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": first_review["evidence"][0]["suggested_rule"],
+        })
+        assert first.status_code == 200, first.text
+        with service.db.connect() as connection:
+            final = Path(connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?",
+                (first.json()["resolution"]["derived_source_id"],),
+            ).fetchone()["ingestion_path"])
+        second_review_id = service._create_review(
+            kind="multi_project_route",
+            source_id=source["id"],
+            project_id=target["id"],
+            question=first_review["question"],
+            reason=first_review["reason"],
+            evidence=first_review["evidence"],
+            options=first_review["options"],
+            memory_preview=first_review["memory_preview"],
+        )
+        malformed = b'{"unexpected":"object instead of list"}'
+        segments_path = final / "Assistant" / "linked-segments.json"
+        segments_path.write_bytes(malformed)
+
+        rejected = client.post(f"/api/reviews/{second_review_id}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": first_review["evidence"][0]["suggested_rule"],
+        })
+
+        assert rejected.status_code == 409, rejected.text
+        assert segments_path.read_bytes() == malformed
+        with service.db.connect() as connection:
+            assert connection.execute(
+                "SELECT status FROM review_items WHERE id = ?", (second_review_id,)
+            ).fetchone()["status"] == "open"
+
+    def test_startup_recovery_retains_staging_when_local_database_has_no_review(
+        self, service,
+    ):
+        staging = service._routing_staging_root() / "routing-review-999999"
+        (staging / "package").mkdir(parents=True)
+        (staging / "publication.json").write_text(json.dumps({
+            "review_id": 999999,
+            "final_relative_path": "Projects/Fictional/linked-source",
+            "mode": "package",
+            "package_identity": {
+                "source_type": "linked-source",
+                "ingestion_id": "I-MISSINGDB",
+                "linked_ingestion_id": "I-MISSINGDB",
+                "database_project_id": "P-MISSINGDB",
+                "project_id": "P-MISSINGDB",
+            },
+        }), encoding="utf-8")
+
+        service._recover_routing_publications()
+
+        assert staging.is_dir()
+
+    def test_startup_recovery_contains_an_unavailable_staging_root(
+        self, service, monkeypatch,
+    ):
+        def unavailable_root():
+            raise OSError("fictional transient OneDrive staging-root conflict")
+
+        monkeypatch.setattr(service, "_routing_staging_root", unavailable_root)
+
+        service._recover_routing_publications()
+
+    def test_post_commit_publication_failure_recovers_from_safe_staging(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        target, _, review = self._open_routing_review(client)
+        real_replace = services_module.os.replace
+
+        def block_package_publication(source, destination):
+            source_path = Path(source)
+            if (
+                source_path.name == "package"
+                and source_path.parent.name == f"routing-review-{review['id']}"
+            ):
+                raise OSError("fictional transient OneDrive publication lock")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(services_module.os, "replace", block_package_publication)
+        resolved = service.resolve_review(review["id"], {
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+        derived_source_id = resolved["resolution"]["derived_source_id"]
+        with service.db.connect() as connection:
+            final = Path(connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (derived_source_id,)
+            ).fetchone()["ingestion_path"])
+        staging = (
+            service.settings.app.one_drive_root / "_PortfolioAssistant" / "staging" /
+            "routing" / f"routing-review-{review['id']}"
+        )
+        assert resolved["status"] == "resolved"
+        assert not final.exists()
+        assert staging.is_dir()
+        assert client.post("/api/archive/rescan").json()["errors"] == 0
+
+        monkeypatch.setattr(services_module.os, "replace", real_replace)
+        service._recover_routing_publications()
+        assert final.is_dir()
+        assert not staging.exists()
+
+    def test_recovery_is_idempotent_after_package_move_but_before_staging_cleanup(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        target, _, review = self._open_routing_review(client)
+        real_rmtree = services_module.shutil.rmtree
+        blocked = True
+
+        def block_cleanup_after_move(path, *args, **kwargs):
+            nonlocal blocked
+            candidate = Path(path)
+            if (
+                blocked
+                and candidate.name == f"routing-review-{review['id']}"
+                and not (candidate / "package").exists()
+            ):
+                blocked = False
+                raise OSError("fictional crash after package move")
+            return real_rmtree(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(services_module.shutil, "rmtree", block_cleanup_after_move)
+        resolved = service.resolve_review(review["id"], {
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+        derived_source_id = resolved["resolution"]["derived_source_id"]
+        with service.db.connect() as connection:
+            final = Path(connection.execute(
+                "SELECT ingestion_path FROM sources WHERE id = ?", (derived_source_id,)
+            ).fetchone()["ingestion_path"])
+        staging = service._routing_staging_root() / f"routing-review-{review['id']}"
+        assert final.is_dir()
+        assert staging.is_dir()
+        assert not (staging / "package").exists()
+
+        monkeypatch.setattr(services_module.shutil, "rmtree", real_rmtree)
+        service._recover_routing_publications()
+
+        assert final.is_dir()
+        assert not staging.exists()
+
+    def test_two_pending_reviews_merge_when_recovered_in_reverse_order(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        target, source, first_review = self._open_routing_review(client)
+        second_review_id = service._create_review(
+            kind="multi_project_route",
+            source_id=source["id"],
+            project_id=target["id"],
+            question=first_review["question"],
+            reason=first_review["reason"],
+            evidence=first_review["evidence"],
+            options=first_review["options"],
+            memory_preview=first_review["memory_preview"],
+        )
+        real_replace = services_module.os.replace
+
+        def block_package_publication(source_path, destination):
+            source_path = Path(source_path)
+            if source_path.name == "package" and source_path.parent.name.startswith("routing-review-"):
+                raise OSError("fictional lock holding both committed routing publications")
+            return real_replace(source_path, destination)
+
+        monkeypatch.setattr(services_module.os, "replace", block_package_publication)
+        resolution = {
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": first_review["evidence"][0]["suggested_rule"],
+        }
+        first = service.resolve_review(first_review["id"], resolution)
+        second = service.resolve_review(second_review_id, resolution)
+        first_id = first["resolution"]["derived_source_id"]
+        second_id = second["resolution"]["derived_source_id"]
+        with service.db.connect() as connection:
+            paths = {
+                Path(row["ingestion_path"])
+                for row in connection.execute(
+                    "SELECT ingestion_path FROM sources WHERE id IN (?, ?)",
+                    (first_id, second_id),
+                )
+            }
+        assert len(paths) == 1
+        final = paths.pop()
+        staging_root = service._routing_staging_root()
+        first_staging = staging_root / f"routing-review-{first_review['id']}"
+        second_staging = staging_root / f"routing-review-{second_review_id}"
+        assert not final.exists()
+        assert first_staging.is_dir() and second_staging.is_dir()
+
+        monkeypatch.setattr(services_module.os, "replace", real_replace)
+        assert service._publish_routing_staging(second_staging)
+        assert service._publish_routing_staging(first_staging)
+
+        segments = json.loads(
+            (final / "Assistant" / "linked-segments.json").read_text(encoding="utf-8")
+        )
+        assert sorted(item["review_id"] for item in segments) == sorted([
+            first_review["id"], second_review_id,
+        ])
+        assert not first_staging.exists()
+        assert not second_staging.exists()

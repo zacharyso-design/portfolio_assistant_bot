@@ -1,5 +1,3 @@
--r requirements.txt
 pytest==8.4.1
 pytest-asyncio==1.1.0
-pyinstaller==6.15.0
 msgforge==1.0.0

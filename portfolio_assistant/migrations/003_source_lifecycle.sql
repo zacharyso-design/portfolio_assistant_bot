@@ -20,14 +20,16 @@ SET memory_state = CASE
       WHEN (SELECT root_processing_state FROM source_roots WHERE source_roots.id = sources.id) = 'complete'
         OR (SELECT root_project_id FROM source_roots WHERE source_roots.id = sources.id) IS NULL
       THEN 1 ELSE 0 END,
-    memory_state_changed_at = coalesce(processed_at, created_at);
+    memory_state_changed_at = coalesce(processed_at, created_at)
+WHERE memory_state_changed_at IS NULL;
 
 -- Routed segments are logical roots of linked project packages. Their parent points to the
 -- Shared Intake evidence for provenance, not for processing-state inheritance.
 UPDATE sources
 SET memory_state = 'active', project_fit_confirmed = 1,
-    memory_state_changed_at = coalesce(processed_at, created_at)
-WHERE source_type = 'routed_segment' AND processing_state = 'complete' AND project_id IS NOT NULL;
+    memory_state_changed_at = coalesce(memory_state_changed_at, processed_at, created_at)
+WHERE source_type = 'routed_segment' AND processing_state = 'complete'
+  AND project_id IS NOT NULL AND memory_state <> 'removed';
 
 CREATE INDEX ix_sources_memory_state ON sources(memory_state, project_id, created_at);
 

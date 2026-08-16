@@ -79,33 +79,38 @@ class Database:
                 ).fetchone() if self._table_exists(connection, "schema_migrations") else None
                 if exists:
                     continue
-                # executescript() commits after every statement, which would leave a
-                # half-applied schema with no recorded version if the process died
-                # mid-migration; the next start then fails on "duplicate column name"
-                # and the application never opens again. Applying the statements and
-                # the version row in one transaction makes an interrupted migration
-                # roll back cleanly and simply replay on the next start.
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    for statement in self._split_statements(migration.read_text(encoding="utf-8")):
-                        try:
-                            connection.execute(statement)
-                        except sqlite3.OperationalError as exc:
-                            # Databases left half-migrated by an earlier build still
-                            # need to start: replay the migration and skip the parts
-                            # that are demonstrably already in place.
-                            if not ALREADY_APPLIED_MESSAGE.search(str(exc)):
-                                raise
-                    connection.execute(
-                        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                        (version, utc_now()),
-                    )
-                    connection.commit()
-                except Exception:
-                    connection.rollback()
-                    raise
+                self._apply_migration(
+                    connection, version, migration.read_text(encoding="utf-8")
+                )
             self._install_search(connection)
             connection.commit()
+
+    def _apply_migration(
+        self, connection: sqlite3.Connection, version: str, script: str,
+    ) -> None:
+        """Apply a migration and its version row in one rollback-safe transaction."""
+        # executescript() commits outside this transaction, which can leave a
+        # half-applied schema with no version row. Execute complete statements
+        # individually so DDL, data backfills, and the version marker are atomic.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in self._split_statements(script):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # Older builds could leave DDL applied without recording the
+                    # version. Skip only errors that prove that exact DDL exists;
+                    # every other failure must roll the whole migration back.
+                    if not ALREADY_APPLIED_MESSAGE.search(str(exc)):
+                        raise
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (version, utc_now()),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     @staticmethod
     def _table_exists(connection: sqlite3.Connection, name: str) -> bool:

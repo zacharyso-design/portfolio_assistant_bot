@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -64,6 +65,7 @@ SNOW_ENTRY_HEADER = re.compile(
 RULE_TYPES = {"ticket_number", "project_name", "filename_phrase", "sender_subject", "meeting_workstream"}
 PROJECT_FIT_SELECTED_REVIEW_THRESHOLD = 0.45
 PROJECT_FIT_ALTERNATIVE_CONFIDENCE_THRESHOLD = 0.65
+LOGGER = logging.getLogger(__name__)
 
 
 class NotFoundError(LookupError):
@@ -204,6 +206,188 @@ class PortfolioService:
         atomic_write_json(assistant / "citations.json", [])
         atomic_write_text(assistant / "source-lifecycle.jsonl", "")
 
+    @staticmethod
+    def _matching_snow_import(imports: Path, expected_sha256: str) -> Path | None:
+        for candidate in imports.iterdir():
+            if candidate.name.startswith("."):
+                continue
+            try:
+                if candidate.is_file() and sha256_file(candidate) == expected_sha256:
+                    return candidate
+            except OSError:
+                LOGGER.warning(
+                    "Skipping unavailable ServiceNow import candidate %s", candidate,
+                    exc_info=True,
+                )
+        return None
+
+    def _cleanup_repaired_snow_quarantines(self, imports: Path) -> None:
+        """Retry non-essential package deletion after a prior database commit."""
+        try:
+            candidates = list(imports.iterdir())
+        except OSError:
+            LOGGER.warning("Could not enumerate ServiceNow repair quarantines", exc_info=True)
+            return
+        for quarantine in candidates:
+            match = re.fullmatch(r"\.legacy-snow-package-(\d+)", quarantine.name)
+            if not match:
+                continue
+            try:
+                if not quarantine.is_dir():
+                    continue
+                with self.db.connect() as connection:
+                    source = connection.execute(
+                        """SELECT capture_method, original_path, sha256 FROM sources
+                           WHERE id = ?""",
+                        (int(match.group(1)),),
+                    ).fetchone()
+                if not source or source["capture_method"] != "snow_import":
+                    continue
+                authoritative = self._under_root(Path(source["original_path"]))
+                if (
+                    not authoritative.is_file()
+                    or sha256_file(authoritative) != source["sha256"]
+                ):
+                    continue
+                shutil.rmtree(quarantine)
+            except Exception:
+                # Quarantine is under shared imports, not a project. Leaving it for
+                # the next start is safer than making a transient sync lock fatal.
+                LOGGER.warning(
+                    "Could not remove repaired ServiceNow quarantine %s; will retry",
+                    quarantine,
+                    exc_info=True,
+                )
+
+    def _repair_migrated_snow_source(
+        self, source: sqlite3.Row, imports: Path,
+    ) -> None:
+        original_package = self._under_root(Path(source["ingestion_path"]))
+        quarantine = self._under_root(imports / f".legacy-snow-package-{source['id']}")
+        package = original_package if original_package.is_dir() else quarantine
+        if not package.is_dir():
+            return
+        manifest = read_json(package / "manifest.json", None)
+        if not isinstance(manifest, dict) or any((
+            manifest.get("source_type") != "snow_comments",
+            manifest.get("capture_method") != "legacy_migration",
+            str(manifest.get("ingestion_id")) != str(source["ingestion_id"]),
+            str(manifest.get("database_project_id")) != str(source["project_id"]),
+        )):
+            return
+        if package == original_package:
+            project_folder = self._under_root(Path(source["project_folder"]))
+            try:
+                relative_package = package.relative_to(project_folder)
+            except ValueError:
+                return
+            if not relative_package.parts:
+                return
+        originals = manifest.get("original_files")
+        primary = originals[0] if isinstance(originals, list) and originals else None
+        if not isinstance(primary, dict) or not primary.get("relative_path"):
+            return
+        leaked_original = self._under_root(package / str(primary["relative_path"]))
+        try:
+            leaked_original.relative_to(package)
+        except ValueError:
+            return
+        expected_sha256 = str(source["sha256"])
+        if not leaked_original.is_file() or sha256_file(leaked_original) != expected_sha256:
+            return
+        authoritative = self._matching_snow_import(imports, expected_sha256)
+        if authoritative is None:
+            suffix = Path(safe_filename(source["original_filename"], "snow-export")).suffix[:16]
+            authoritative = self._under_root(
+                imports / f"recovered-{source['id']}-{expected_sha256[:16]}{suffix}"
+            )
+            if authoritative.exists():
+                if not authoritative.is_file() or sha256_file(authoritative) != expected_sha256:
+                    raise ConflictError("ServiceNow recovery destination already contains different data")
+            else:
+                temporary = self._under_root(imports / f".{uuid.uuid4().hex}.tmp")
+                try:
+                    shutil.copy2(leaked_original, temporary)
+                    if authoritative.exists():
+                        if sha256_file(authoritative) != expected_sha256:
+                            raise ConflictError(
+                                "ServiceNow recovery destination already contains different data"
+                            )
+                    else:
+                        os.replace(temporary, authoritative)
+                finally:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        LOGGER.warning(
+                            "Could not remove temporary ServiceNow recovery file %s",
+                            temporary,
+                            exc_info=True,
+                        )
+        moved = False
+        if package == original_package:
+            if quarantine.exists():
+                raise ConflictError("A prior ServiceNow repair quarantine still needs recovery")
+            os.replace(original_package, quarantine)
+            moved = True
+        try:
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """UPDATE sources SET original_path = ?, ingestion_id = NULL,
+                       ingestion_path = NULL, capture_method = 'snow_import'
+                       WHERE id = ?""",
+                    (str(authoritative), source["id"]),
+                )
+                connection.execute(
+                    "DELETE FROM original_files WHERE source_id = ?", (source["id"],)
+                )
+                connection.execute(
+                    """UPDATE citation_records
+                       SET original_relative_path = ?, display_name = ?
+                       WHERE source_id = ?""",
+                    (authoritative.name, source["original_filename"], source["id"]),
+                )
+        except Exception:
+            if moved and quarantine.exists() and not original_package.exists():
+                os.replace(quarantine, original_package)
+            raise
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            LOGGER.warning(
+                "Could not remove repaired ServiceNow quarantine %s; will retry",
+                quarantine,
+                exc_info=True,
+            )
+
+    def _repair_migrated_snow_sources(self) -> None:
+        """Remove legacy per-project copies of shared ServiceNow exports."""
+        with self.db.connect() as connection:
+            sources = connection.execute(
+                """SELECT s.*, p.folder_path AS project_folder
+                   FROM sources s JOIN projects p ON p.id = s.project_id
+                   WHERE s.source_type = 'snow_comments'
+                     AND s.ingestion_path IS NOT NULL
+                     AND s.capture_method = 'legacy_migration'
+                   ORDER BY s.id"""
+            ).fetchall()
+        imports = self._under_root(
+            self.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        )
+        imports.mkdir(parents=True, exist_ok=True)
+        self._cleanup_repaired_snow_quarantines(imports)
+        for source in sources:
+            try:
+                self._repair_migrated_snow_source(source, imports)
+            except Exception:
+                # The source remains in its legacy state and will be retried on the
+                # next start. A repair-only OneDrive failure must not block the app.
+                LOGGER.warning(
+                    "Could not repair legacy ServiceNow source %s; will retry",
+                    source["id"],
+                    exc_info=True,
+                )
+
     def migrate_archive(self) -> dict[str, int]:
         """Idempotently materialize legacy database records in the durable OneDrive archive."""
         counts = {"projects": 0, "sources": 0, "missing_originals": 0}
@@ -219,6 +403,8 @@ class PortfolioService:
                         (archive_id, str(folder), project["id"]),
                     )
                 counts["projects"] += 1
+
+        self._repair_migrated_snow_sources()
 
         with self.db.connect() as connection:
             # snow_comments rows point original_path at the shared multi-ticket
@@ -1943,6 +2129,46 @@ class PortfolioService:
         self._write_knowledge_history(project_id)
         self.regenerate_living_summary(project_id, advance_revision=False)
 
+    @staticmethod
+    def _store_citation_record(
+        connection: sqlite3.Connection, *, source_id: int, chunk_id: int,
+        original_relative_path: str, display_name: str, source_type: str,
+        locator: str, excerpt: str, source_date: str | None, created_at: str,
+        identifier_key: str | None = None, preferred_id: str | None = None,
+    ) -> str:
+        existing = connection.execute(
+            "SELECT id FROM citation_records WHERE source_id = ? AND chunk_id = ?",
+            (source_id, chunk_id),
+        ).fetchone()
+        if existing:
+            return str(existing["id"])
+
+        key = identifier_key or f"{source_id}:{chunk_id}"
+        digest = hashlib.sha256(key.encode()).hexdigest().upper()
+        candidates = ([preferred_id] if preferred_id else []) + [
+            f"C-{digest[:length]}" for length in range(8, len(digest) + 1, 4)
+        ]
+        for candidate in candidates:
+            occupied = connection.execute(
+                "SELECT source_id, chunk_id FROM citation_records WHERE id = ?", (candidate,)
+            ).fetchone()
+            if occupied:
+                if (int(occupied["source_id"]), int(occupied["chunk_id"])) == (source_id, chunk_id):
+                    return candidate
+                continue
+            connection.execute(
+                """INSERT INTO citation_records(
+                   id, source_id, chunk_id, original_relative_path, display_name, source_type,
+                   locator, excerpt, source_date, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate, source_id, chunk_id, original_relative_path, display_name,
+                    source_type, locator, excerpt, source_date, created_at,
+                ),
+            )
+            return candidate
+        raise ConflictError("Could not allocate a unique citation identifier")
+
     def _ensure_citation_record(
         self, connection: sqlite3.Connection, root_source: sqlite3.Row,
         citation: dict[str, int], now: str,
@@ -1962,36 +2188,19 @@ class PortfolioService:
             original_relative = original_path.resolve().relative_to(package.resolve()).as_posix()
         except ValueError:
             original_relative = f"Original/{safe_filename(row['original_filename'], 'source')}"
-        existing = connection.execute(
-            "SELECT id FROM citation_records WHERE source_id = ? AND chunk_id = ?",
-            (root_source["id"], row["id"]),
-        ).fetchone()
-        if existing:
-            citation_id = str(existing["id"])
-        else:
-            # A truncated hash is only 32 bits, so identifiers collide well within a
-            # single portfolio's citation count. INSERT OR IGNORE would silently keep
-            # the row that got there first and hand this project the other project's
-            # citation, exposing an unrelated original file. Lengthen on collision.
-            citation_key = f"{citation['source_id']}:{citation['chunk_id']}"
-            digest = hashlib.sha256(citation_key.encode()).hexdigest().upper()
-            citation_id = f"C-{digest}"
-            for length in range(8, len(digest), 4):
-                candidate = f"C-{digest[:length]}"
-                if not connection.execute(
-                    "SELECT 1 FROM citation_records WHERE id = ?", (candidate,)
-                ).fetchone():
-                    citation_id = candidate
-                    break
-            connection.execute(
-                """INSERT OR IGNORE INTO citation_records(
-                   id, source_id, chunk_id, original_relative_path, display_name, source_type,
-                   locator, excerpt, source_date, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (citation_id, root_source["id"], row["id"], original_relative,
-                 row["original_filename"], row["source_type"], row["locator"], row["text"][:1200],
-                 row["meeting_date"] or row["created_at"], now),
-            )
+        citation_id = self._store_citation_record(
+            connection,
+            source_id=int(root_source["id"]),
+            chunk_id=int(row["id"]),
+            original_relative_path=original_relative,
+            display_name=row["original_filename"],
+            source_type=row["source_type"],
+            locator=row["locator"],
+            excerpt=row["text"][:1200],
+            source_date=row["meeting_date"] or row["created_at"],
+            created_at=now,
+            identifier_key=f"{citation['source_id']}:{citation['chunk_id']}",
+        )
         return {
             "source_id": int(citation["source_id"]),
             "chunk_id": int(citation["chunk_id"]),
@@ -4026,22 +4235,23 @@ class PortfolioService:
                 original_chunk = connection.execute(
                     "SELECT * FROM source_chunks WHERE id = ?", (original_citation["chunk_id"],)
                 ).fetchone()
-                citation_key = f"{derived_source_id}:{derived_citation['chunk_id']}"
-                citation_id = f"C-{hashlib.sha256(citation_key.encode()).hexdigest()[:8].upper()}"
                 try:
                     canonical_relative = relative_to_root(
                         Path(source["original_path"]), Path(source["ingestion_path"])
                     )
                 except ValueError:
                     canonical_relative = Path(source["original_path"]).name
-                connection.execute(
-                    """INSERT OR IGNORE INTO citation_records(
-                       id, source_id, chunk_id, original_relative_path, display_name, source_type,
-                       locator, excerpt, source_date, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (citation_id, derived_source_id, derived_citation["chunk_id"], canonical_relative,
-                     source["original_filename"], source["source_type"], original_chunk["locator"],
-                     original_chunk["text"][:1200], source["source_date"] or source["created_at"], now),
+                citation_id = self._store_citation_record(
+                    connection,
+                    source_id=derived_source_id,
+                    chunk_id=derived_citation["chunk_id"],
+                    original_relative_path=canonical_relative,
+                    display_name=source["original_filename"],
+                    source_type=source["source_type"],
+                    locator=original_chunk["locator"],
+                    excerpt=original_chunk["text"][:1200],
+                    source_date=source["source_date"] or source["created_at"],
+                    created_at=now,
                 )
                 citation_payload.append({**derived_citation, "citation_id": citation_id})
             connection.execute(
@@ -4343,32 +4553,51 @@ class PortfolioService:
     def get_citation_original(self, citation_id: str) -> tuple[Path, str]:
         with self.db.connect() as connection:
             row = connection.execute(
-                """SELECT c.*, s.ingestion_path, s.linked_ingestion_id, s.original_filename
+                """SELECT c.*, s.ingestion_path, s.linked_ingestion_id, s.original_filename,
+                          s.original_path AS source_original_path,
+                          s.sha256 AS source_sha256
                    FROM citation_records c JOIN sources s ON s.id = c.source_id WHERE c.id = ?""",
                 (citation_id,),
             ).fetchone()
             if not row:
                 raise NotFoundError("Citation not found")
-            package = Path(row["ingestion_path"])
+            package = Path(row["ingestion_path"]) if row["ingestion_path"] else None
+            source_original_path = Path(row["source_original_path"])
+            source_sha256 = str(row["source_sha256"])
             original_source_id = int(row["source_id"])
             if row["linked_ingestion_id"]:
                 canonical = connection.execute(
-                    """SELECT id, ingestion_path FROM sources
+                    """SELECT id, ingestion_path, original_path, sha256 FROM sources
                        WHERE ingestion_id = ? AND canonical_source = 1""",
                     (row["linked_ingestion_id"],),
                 ).fetchone()
                 if canonical:
-                    package = Path(canonical["ingestion_path"])
+                    package = (
+                        Path(canonical["ingestion_path"])
+                        if canonical["ingestion_path"] else None
+                    )
+                    source_original_path = Path(canonical["original_path"])
+                    source_sha256 = str(canonical["sha256"])
                     original_source_id = int(canonical["id"])
-            original = connection.execute(
-                """SELECT sha256 FROM original_files
-                   WHERE source_id = ? AND relative_path = ?""",
-                (original_source_id, row["original_relative_path"]),
-            ).fetchone()
-        path = self._under_root(package / row["original_relative_path"])
+            original = None
+            if package is not None:
+                original = connection.execute(
+                    """SELECT sha256 FROM original_files
+                       WHERE source_id = ? AND relative_path = ?""",
+                    (original_source_id, row["original_relative_path"]),
+                ).fetchone()
+        if package is None:
+            # ServiceNow rows intentionally reference one shared import rather than
+            # copying a multi-ticket export into every project package. Their
+            # authoritative original and hash live directly on sources.
+            path = self._under_root(source_original_path)
+            expected_sha256 = source_sha256
+        else:
+            path = self._under_root(package / row["original_relative_path"])
+            expected_sha256 = str(original["sha256"]) if original else ""
         if not path.is_file():
             raise NotFoundError("Cited original is unavailable locally; make it available in OneDrive and retry")
-        if not original or sha256_file(path) != original["sha256"]:
+        if not expected_sha256 or sha256_file(path) != expected_sha256:
             raise ConflictError("Cited original no longer matches its recorded SHA-256 hash")
         return path, safe_filename(row["display_name"], row["original_filename"])
 

@@ -4,7 +4,10 @@ Each test fails against the code as it stood before the corresponding fix.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -107,7 +110,7 @@ class TestTextDecoding:
             decode_text_bytes(broken)
 
 
-class TestMigrations:
+class TestMigrationAtomicity:
     """executescript() committed each statement outside the version-row transaction."""
 
     def test_interrupted_migration_replays_instead_of_bricking_startup(self, tmp_path):
@@ -135,17 +138,25 @@ class TestMigrations:
         database = Database(tmp_path / "portfolio.db")
         database.migrate()
         with database.connect() as connection:
-            before = {
-                row["version"] for row in
-                connection.execute("SELECT version FROM schema_migrations").fetchall()
-            }
-        database.migrate()  # second run is a no-op
-        with database.connect() as connection:
-            after = {
-                row["version"] for row in
-                connection.execute("SELECT version FROM schema_migrations").fetchall()
-            }
-        assert before == after
+            with pytest.raises(sqlite3.OperationalError):
+                database._apply_migration(
+                    connection,
+                    "999_atomicity_probe",
+                    """
+                    CREATE TABLE atomicity_probe (id INTEGER PRIMARY KEY);
+                    INSERT INTO atomicity_probe(id) VALUES (1);
+                    INSERT INTO deliberately_missing_table(id) VALUES (1);
+                    """,
+                )
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='atomicity_probe'"
+            ).fetchone()
+            version_exists = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version='999_atomicity_probe'"
+            ).fetchone()
+
+        assert table_exists is None
+        assert version_exists is None
 
     def test_statement_splitter_keeps_trigger_bodies_intact(self):
         script = """
@@ -160,6 +171,49 @@ class TestMigrations:
         assert len(statements) == 3
         assert statements[1].count("UPDATE demo") == 2
         assert statements[1].rstrip().endswith("END;")
+
+
+class TestLifecycleMigrationReplay:
+    """Replaying migration 003 reactivated sources the user had removed from memory."""
+
+    def test_replay_preserves_a_removed_source(self, tmp_path):
+        database = Database(tmp_path / "portfolio.db")
+        database.migrate()
+
+        with database.connect() as connection:
+            group_id = connection.execute(
+                "SELECT id FROM portfolio_groups ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO projects(id, name, portfolio_group_id, folder_path,"
+                " created_at, updated_at)"
+                " VALUES ('P-REMOVED', 'Fictional Removed Project', ?, 'P-REMOVED-folder',"
+                " '2026-01-01', '2026-01-01')",
+                (group_id,),
+            )
+            connection.execute(
+                "INSERT INTO sources(id, project_id, source_type, sha256, original_filename,"
+                " original_path, processing_state, created_at, processed_at, memory_state,"
+                " memory_state_changed_at)"
+                " VALUES (999, 'P-REMOVED', 'text', 'removed-sha', 'removed.txt',"
+                " 'removed.txt', 'complete', '2026-01-01', '2026-01-02', 'removed',"
+                " '2026-02-01')"
+            )
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = '003_source_lifecycle'"
+            )
+            connection.commit()
+
+        database.migrate()
+
+        with database.connect() as connection:
+            source = connection.execute(
+                "SELECT memory_state, memory_state_changed_at FROM sources WHERE id = 999"
+            ).fetchone()
+        assert dict(source) == {
+            "memory_state": "removed",
+            "memory_state_changed_at": "2026-02-01",
+        }
 
 
 class TestSearchIndex:
@@ -253,8 +307,6 @@ class TestCitationIdentifiers:
             )
             connection.commit()
 
-        import hashlib
-
         key = "901:901"
         digest = hashlib.sha256(key.encode()).hexdigest().upper()
         squatted = f"C-{digest[:8]}"
@@ -322,8 +374,124 @@ class TestCitationIdentifiers:
         assert ids[0] == ids[1]
 
 
+class TestRoutedCitationIdentifiers:
+    """Routed reviews still used an unchecked 32-bit citation identifier."""
+
+    def test_a_routed_citation_collision_is_lengthened_not_reused(self, client, service):
+        client.post("/api/projects", json={"name": "Fictional Routing Alpha"})
+        target = client.post(
+            "/api/projects", json={"name": "Fictional Routing Beta"},
+        ).json()
+        captured = client.post(
+            "/api/intake/multi-project",
+            files={"file": (
+                "routing-collision.txt",
+                b"Fictional Routing Beta owns this cited segment.",
+                "text/plain",
+            )},
+        ).json()["source"]
+        processed = client.post(f"/api/sources/{captured['id']}/retry")
+        assert processed.status_code == 200
+        review = next(
+            item for item in client.get("/api/reviews?status=open").json()
+            if item["source_id"] == captured["id"]
+        )
+
+        with service.db.transaction() as connection:
+            original_chunk = connection.execute(
+                "SELECT * FROM source_chunks WHERE source_id = ? ORDER BY id LIMIT 1",
+                (captured["id"],),
+            ).fetchone()
+            next_source_id = int(connection.execute(
+                "SELECT seq + 1 FROM sqlite_sequence WHERE name = 'sources'"
+            ).fetchone()[0])
+            next_chunk_id = int(connection.execute(
+                "SELECT seq + 1 FROM sqlite_sequence WHERE name = 'source_chunks'"
+            ).fetchone()[0])
+            digest = hashlib.sha256(
+                f"{next_source_id}:{next_chunk_id}".encode()
+            ).hexdigest().upper()
+            squatted = f"C-{digest[:8]}"
+            connection.execute(
+                """INSERT INTO citation_records(
+                   id, source_id, chunk_id, original_relative_path, display_name,
+                   source_type, locator, excerpt, source_date, created_at
+                   ) VALUES (?, ?, ?, 'Original/routing-collision.txt',
+                             'routing-collision.txt', 'text', ?, ?, '2026-08-15',
+                             '2026-08-15T12:00:00+00:00')""",
+                (
+                    squatted, captured["id"], original_chunk["id"],
+                    original_chunk["locator"], original_chunk["text"],
+                ),
+            )
+
+        resolved = client.post(f"/api/reviews/{review['id']}/resolve", json={
+            "action": "apply",
+            "target_project_id": target["id"],
+            "rule": review["evidence"][0]["suggested_rule"],
+        })
+        assert resolved.status_code == 200, resolved.text
+        derived_source_id = resolved.json()["resolution"]["derived_source_id"]
+        citation = service.list_knowledge(target["id"])[0]["citations"][0]
+
+        assert citation["citation_id"] != squatted
+        with service.db.connect() as connection:
+            owner = connection.execute(
+                "SELECT source_id FROM citation_records WHERE id = ?",
+                (citation["citation_id"],),
+            ).fetchone()
+        assert int(owner["source_id"]) == int(derived_source_id)
+
+
 class TestSnowMigration:
     """migrate_archive copied the shared ServiceNow export into every project folder."""
+
+    @staticmethod
+    def _create_legacy_snow_package(service, project, source_id: int, export_bytes: bytes):
+        digest = hashlib.sha256(export_bytes).hexdigest()
+        package = Path(project["folder_path"]) / f"legacy-snow-package-{source_id}"
+        filename = f"snow-export-{source_id}.csv"
+        original = package / "Original" / filename
+        original.parent.mkdir(parents=True)
+        original.write_bytes(export_bytes)
+        ingestion_id = f"I-SNOW{source_id}"
+        (package / "manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "ingestion_id": ingestion_id,
+            "database_project_id": project["id"],
+            "source_type": "snow_comments",
+            "capture_method": "legacy_migration",
+            "original_files": [{
+                "relative_path": f"Original/{filename}",
+                "sha256": digest,
+            }],
+        }), encoding="utf-8")
+        with service.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, source_type, native_id, sha256, original_filename,
+                   original_path, processing_state, created_at, ingestion_id, ingestion_path,
+                   source_title, capture_method, memory_state, project_fit_confirmed,
+                   memory_state_changed_at
+                   ) VALUES (?, ?, 'snow_comments', ?, ?, ?, ?, 'complete', '2026-08-15',
+                             ?, ?, 'Fictional SNOW comments', 'legacy_migration',
+                             'active', 1, '2026-08-15')""",
+                (
+                    source_id, project["id"], f"snow:INC{source_id}:legacy", digest,
+                    filename, str(original), ingestion_id, str(package),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO original_files(
+                   source_id, relative_path, original_name, stored_name, size_bytes,
+                   sha256, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, '2026-08-15')""",
+                (
+                    source_id, f"Original/{filename}", filename, filename,
+                    len(export_bytes), digest,
+                ),
+            )
+        return package, digest
 
     def test_snow_sources_are_not_materialized_into_project_folders(self, service, client, project, tmp_path):
         export = tmp_path / "snow-export.csv"
@@ -354,6 +522,236 @@ class TestSnowMigration:
             ).fetchone()
         assert row["capture_method"] != "legacy_migration"
         assert row["ingestion_path"] is None
+
+    def test_an_already_migrated_snow_export_is_removed_from_the_project(
+        self, service, project,
+    ):
+        export_bytes = b"number,comments\nINC001,fictional shared export\n"
+        digest = hashlib.sha256(export_bytes).hexdigest()
+        imports = service.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        imports.mkdir(parents=True, exist_ok=True)
+        authoritative = imports / "20260815-120000-shared-snow-export.csv"
+        authoritative.write_bytes(export_bytes)
+
+        package = Path(project["folder_path"]) / "legacy-snow-package"
+        original = package / "Original" / "shared-snow-export.csv"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(export_bytes)
+        (package / "manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "ingestion_id": "I-SNOWLEAK",
+            "database_project_id": project["id"],
+            "source_type": "snow_comments",
+            "capture_method": "legacy_migration",
+            "original_files": [{
+                "relative_path": "Original/shared-snow-export.csv",
+                "sha256": digest,
+            }],
+        }), encoding="utf-8")
+
+        with service.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, source_type, native_id, sha256, original_filename,
+                   original_path, processing_state, created_at, ingestion_id, ingestion_path,
+                   source_title, capture_method, memory_state, project_fit_confirmed,
+                   memory_state_changed_at
+                   ) VALUES (951, ?, 'snow_comments', 'snow:INC001:leaked', ?,
+                             'shared-snow-export.csv', ?, 'complete', '2026-08-15',
+                             'I-SNOWLEAK', ?, 'INC001 comments', 'legacy_migration',
+                             'active', 1, '2026-08-15')""",
+                (project["id"], digest, str(original), str(package)),
+            )
+            connection.execute(
+                """INSERT INTO original_files(
+                   source_id, relative_path, original_name, stored_name, size_bytes,
+                   sha256, created_at
+                   ) VALUES (951, 'Original/shared-snow-export.csv',
+                             'shared-snow-export.csv', 'shared-snow-export.csv', ?, ?,
+                             '2026-08-15')""",
+                (len(export_bytes), digest),
+            )
+
+        service.migrate_archive()
+
+        assert not package.exists()
+        with service.db.connect() as connection:
+            row = connection.execute(
+                """SELECT original_path, ingestion_id, ingestion_path, capture_method
+                   FROM sources WHERE id = 951"""
+            ).fetchone()
+            originals = connection.execute(
+                "SELECT count(*) FROM original_files WHERE source_id = 951"
+            ).fetchone()[0]
+        assert Path(row["original_path"]) == authoritative
+        assert row["ingestion_id"] is None
+        assert row["ingestion_path"] is None
+        assert row["capture_method"] == "snow_import"
+        assert originals == 0
+
+    def test_locked_import_candidate_does_not_abort_cleanup(
+        self, service, project, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        export_bytes = b"number,comments\nINC954,fictional recovery source\n"
+        package, _ = self._create_legacy_snow_package(
+            service, project, 954, export_bytes,
+        )
+        imports = service.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        locked = imports / "locked-placeholder.csv"
+        locked.write_bytes(b"offline placeholder")
+        real_sha256_file = services_module.sha256_file
+
+        def sometimes_locked(path):
+            if Path(path) == locked:
+                raise OSError("fictional OneDrive placeholder is unavailable")
+            return real_sha256_file(path)
+
+        monkeypatch.setattr(services_module, "sha256_file", sometimes_locked)
+
+        service.migrate_archive()
+
+        assert not package.exists()
+        with service.db.connect() as connection:
+            source = connection.execute(
+                "SELECT original_path, ingestion_path, capture_method FROM sources WHERE id = 954"
+            ).fetchone()
+        recovered = Path(source["original_path"])
+        assert recovered.read_bytes() == export_bytes
+        assert source["ingestion_path"] is None
+        assert source["capture_method"] == "snow_import"
+
+    def test_failed_quarantine_delete_is_retried_without_aborting_startup(
+        self, service, project, monkeypatch,
+    ):
+        import portfolio_assistant.services as services_module
+
+        export_bytes = b"number,comments\nINC955,fictional cleanup retry\n"
+        package, digest = self._create_legacy_snow_package(
+            service, project, 955, export_bytes,
+        )
+        imports = service.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        (imports / "authoritative-955.csv").write_bytes(export_bytes)
+        quarantine = imports / ".legacy-snow-package-955"
+        real_rmtree = services_module.shutil.rmtree
+        fail_cleanup = True
+
+        def transient_rmtree(path, *args, **kwargs):
+            if fail_cleanup and Path(path) == quarantine:
+                raise OSError("fictional OneDrive directory lock")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(services_module.shutil, "rmtree", transient_rmtree)
+
+        service.migrate_archive()
+
+        assert not package.exists()
+        assert quarantine.is_dir()
+        with service.db.connect() as connection:
+            source = connection.execute(
+                "SELECT sha256, ingestion_path, capture_method FROM sources WHERE id = 955"
+            ).fetchone()
+        assert source["sha256"] == digest
+        assert source["ingestion_path"] is None
+        assert source["capture_method"] == "snow_import"
+
+        fail_cleanup = False
+        service.migrate_archive()
+        assert not quarantine.exists()
+
+    def test_recovery_never_overwrites_a_mismatched_destination(
+        self, service, project,
+    ):
+        export_bytes = b"number,comments\nINC956,fictional collision-safe recovery\n"
+        package, digest = self._create_legacy_snow_package(
+            service, project, 956, export_bytes,
+        )
+        imports = service.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        recovery = imports / f"recovered-956-{digest[:16]}.csv"
+        mismatched = b"fictional unrelated existing bytes"
+        recovery.write_bytes(mismatched)
+
+        service.migrate_archive()
+
+        assert recovery.read_bytes() == mismatched
+        assert package.is_dir()
+        with service.db.connect() as connection:
+            source = connection.execute(
+                "SELECT ingestion_path, capture_method FROM sources WHERE id = 956"
+            ).fetchone()
+        assert Path(source["ingestion_path"]) == package
+        assert source["capture_method"] == "legacy_migration"
+
+
+class TestSnowCitationOriginalResolution:
+    """ServiceNow citations used a nullable package path and a stale package-relative file path."""
+
+    def test_citation_download_survives_legacy_package_cleanup(
+        self, client: TestClient, service, project,
+    ):
+        export_bytes = b"number,comments\nINC002,fictional citation evidence\n"
+        digest = hashlib.sha256(export_bytes).hexdigest()
+        imports = service.settings.app.one_drive_root / "_PortfolioAssistant" / "imports" / "snow"
+        imports.mkdir(parents=True, exist_ok=True)
+        authoritative = imports / "20260815-130000-citation-export.csv"
+        authoritative.write_bytes(export_bytes)
+
+        package = Path(project["folder_path"]) / "legacy-snow-citation-package"
+        original = package / "Original" / "citation-export.csv"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(export_bytes)
+        (package / "manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "ingestion_id": "I-SNOWCITE",
+            "database_project_id": project["id"],
+            "source_type": "snow_comments",
+            "capture_method": "legacy_migration",
+            "original_files": [{
+                "relative_path": "Original/citation-export.csv",
+                "sha256": digest,
+            }],
+        }), encoding="utf-8")
+
+        with service.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO sources(
+                   id, project_id, source_type, native_id, sha256, original_filename,
+                   original_path, processing_state, created_at, ingestion_id, ingestion_path,
+                   source_title, capture_method, memory_state, project_fit_confirmed,
+                   memory_state_changed_at
+                   ) VALUES (952, ?, 'snow_comments', 'snow:INC002:citation', ?,
+                             'citation-export.csv', ?, 'complete', '2026-08-15',
+                             'I-SNOWCITE', ?, 'INC002 comments', 'legacy_migration',
+                             'active', 1, '2026-08-15')""",
+                (project["id"], digest, str(original), str(package)),
+            )
+            connection.execute(
+                """INSERT INTO original_files(
+                   source_id, relative_path, original_name, stored_name, size_bytes,
+                   sha256, created_at
+                   ) VALUES (952, 'Original/citation-export.csv', 'citation-export.csv',
+                             'citation-export.csv', ?, ?, '2026-08-15')""",
+                (len(export_bytes), digest),
+            )
+            connection.execute(
+                """INSERT INTO source_chunks(
+                   id, source_id, project_id, sequence, text, locator, processing_state
+                   ) VALUES (952, 952, ?, 0, 'fictional citation evidence',
+                             'SNOW INC002', 'complete')""",
+                (project["id"],),
+            )
+            source = connection.execute("SELECT * FROM sources WHERE id = 952").fetchone()
+            citation = service._ensure_citation_record(
+                connection, source, {"source_id": 952, "chunk_id": 952}, "2026-08-15",
+            )
+
+        service.migrate_archive()
+
+        response = client.get(f"/api/citations/{citation['citation_id']}/original")
+        assert response.status_code == 200, response.text
+        assert response.content == export_bytes
+        assert "citation-export.csv" in response.headers["content-disposition"]
 
 
 class TestCredentialRejectionDetail:
@@ -403,3 +801,171 @@ class TestCredentialRejectionDetail:
         from portfolio_assistant.llm import InternalHttpLlmAdapter as A
         message = A._rejection_message("x", 401, self._response(401, text="y" * 5000))
         assert len(message) < 400
+
+
+class TestCredentialRejectionSecretRedaction:
+    """A gateway rejection could echo credentials into the UI and persisted source errors."""
+
+    @staticmethod
+    def _response(*, json_body=None, text: str = "") -> "httpx.Response":
+        import httpx
+        request = httpx.Request("POST", "https://api.genai.mil/v1/chat/completions")
+        if json_body is not None:
+            return httpx.Response(401, json=json_body, request=request)
+        return httpx.Response(401, text=text, request=request)
+
+    def test_active_key_is_redacted_without_hiding_unlock_url(self):
+        from portfolio_assistant.llm import InternalHttpLlmAdapter as A
+        active_key = "fictional-active-api-key-123456789"
+        unlock_url = "https://genai.mil/stark/user-ui/keys/unlock/abc"
+        response = self._response(json_body={
+            "error": {"message": f"Credential {active_key} is locked. Unlock at {unlock_url}"},
+        })
+
+        message = A._rejection_message(
+            "API key saved in Settings", 401, response, active_credential=active_key,
+        )
+
+        assert active_key not in message
+        assert "[REDACTED]" in message
+        assert unlock_url in message
+
+    def test_common_bearer_and_named_token_values_are_redacted(self):
+        from portfolio_assistant.llm import InternalHttpLlmAdapter as A
+        response = self._response(
+            text="Authorization: Bearer gateway-session-token; api_key=secondary-secret",
+        )
+
+        message = A._rejection_message("x", 401, response)
+
+        assert "gateway-session-token" not in message
+        assert "secondary-secret" not in message
+        assert message.count("[REDACTED]") == 2
+
+    @pytest.mark.parametrize("operation", ["list_models", "test_connection"])
+    def test_live_adapter_paths_supply_the_active_key_to_redaction(self, operation):
+        import httpx
+        from portfolio_assistant.config import LlmSettings
+        from portfolio_assistant.llm import InternalHttpLlmAdapter, LlmUnavailable
+
+        active_key = "fictional-live-path-key-987654321"
+        response = httpx.Response(401, json={
+            "error": {"message": f"Credential {active_key} was rejected"},
+        })
+
+        class CredentialStore:
+            @staticmethod
+            def get():
+                return active_key
+
+        class ModelStore:
+            @staticmethod
+            def load():
+                return None
+
+        class Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            @staticmethod
+            def get(*_, **__):
+                return response
+
+            @staticmethod
+            def post(*_, **__):
+                return response
+
+        adapter = InternalHttpLlmAdapter(
+            LlmSettings(max_attempts=1, rate_limit_requests=0),
+            credential_store=CredentialStore(),
+            model_preference_store=ModelStore(),
+            client_factory=lambda **_: Client(),
+        )
+
+        with pytest.raises(LlmUnavailable) as rejected:
+            getattr(adapter, operation)()
+
+        assert active_key not in str(rejected.value)
+        assert "[REDACTED]" in str(rejected.value)
+
+
+class TestBackgroundWorkerRecovery:
+    """One unexpected batch failure permanently stopped the background ingestion worker."""
+
+    def test_worker_retries_after_an_unexpected_batch_failure(self, tmp_path, monkeypatch):
+        from portfolio_assistant.api import create_app
+        from portfolio_assistant.config import AppSettings, LlmSettings, Settings
+        from portfolio_assistant.services import PortfolioService
+
+        one_drive = tmp_path / "one-drive"
+        one_drive.mkdir()
+        attempts = 0
+        retried = threading.Event()
+
+        def flaky_process_pending(self, *, manual=False, source_id=None, limit=20):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("fictional transient OneDrive failure")
+            retried.set()
+            return {
+                "processed": 0, "pending_ai": 0, "needs_review": 0,
+                "unsupported": 0, "error": 0,
+            }
+
+        monkeypatch.setattr(PortfolioService, "process_pending", flaky_process_pending)
+        settings = Settings(
+            app=AppSettings(
+                database_path=tmp_path / "portfolio.db",
+                one_drive_root=one_drive,
+                worker_poll_seconds=0.01,
+                testing=False,
+            ),
+            llm=LlmSettings(adapter="fake", model="fake-llm-v1"),
+        )
+        app = create_app(settings)
+
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8765",
+            headers={"X-Requested-With": "CHIO-Portfolio-Assistant"},
+        ):
+            assert retried.wait(timeout=2), "worker did not run again after the first failure"
+
+        assert attempts >= 2
+
+
+class TestMultiProjectUnexpectedFailureContainment:
+    """An unexpected multi-project failure left the source permanently in processing."""
+
+    def test_unexpected_failure_transitions_the_source_to_error(
+        self, client: TestClient, service, monkeypatch,
+    ):
+        captured = client.post(
+            "/api/intake/multi-project",
+            files={
+                "file": (
+                    "fictional-cross-project.txt",
+                    b"Fictional evidence for more than one project.",
+                    "text/plain",
+                ),
+            },
+        ).json()["source"]
+
+        def unexpected_failure(_source_id):
+            raise RuntimeError("fictional unexpected implementation failure")
+
+        monkeypatch.setattr(service, "_ensure_extracted", unexpected_failure)
+
+        assert service.process_multi_source(captured["id"]) == "error"
+        with service.db.connect() as connection:
+            source = connection.execute(
+                "SELECT processing_state, error_code, error_message FROM sources WHERE id = ?",
+                (captured["id"],),
+            ).fetchone()
+        assert source["processing_state"] == "error"
+        assert source["error_code"] == "multi_project_processing_failed"
+        assert "fictional unexpected implementation failure" not in source["error_message"]

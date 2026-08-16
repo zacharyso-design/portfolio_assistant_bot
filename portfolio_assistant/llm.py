@@ -562,10 +562,13 @@ class InternalHttpLlmAdapter:
                 else f"{self.settings.api_key_env} environment fallback"
             )
             raise LlmUnavailable(
-                self._rejection_message(credential_label, response.status_code, response)
+                self._rejection_message(
+                    credential_label, response.status_code, response,
+                    active_credential=key,
+                )
             )
         if response.status_code >= 400:
-            detail = self._error_detail(response)
+            detail = self._error_detail(response, secrets=(key,))
             suffix = f": {detail}" if detail else ""
             raise LlmUnavailable(
                 f"The GenAI.mil model catalog returned HTTP {response.status_code}{suffix}"
@@ -588,14 +591,18 @@ class InternalHttpLlmAdapter:
 
     @classmethod
     def _rejection_message(
-        cls, credential_label: str, status: int, response: httpx.Response,
+        cls, credential_label: str, status: int, response: httpx.Response, *,
+        active_credential: str | None = None,
     ) -> str:
         message = f"GenAI.mil rejected the {credential_label} (HTTP {status})"
-        detail = cls._error_detail(response)
+        secrets = (active_credential,) if active_credential else ()
+        detail = cls._error_detail(response, secrets=secrets)
         return f"{message}: {detail}" if detail else message
 
     @staticmethod
-    def _error_detail(response: httpx.Response, limit: int = 300) -> str:
+    def _error_detail(
+        response: httpx.Response, limit: int = 300, *, secrets: tuple[str, ...] = (),
+    ) -> str:
         """Return a short, safe summary of an error response body.
 
         GenAI.mil puts actionable guidance in the body of a rejection - notably
@@ -620,6 +627,16 @@ class InternalHttpLlmAdapter:
             detail = response.text
         detail = re.sub(r"<[^>]+>", " ", detail)
         detail = re.sub(r"\s+", " ", detail).strip()
+        for secret in secrets:
+            if secret:
+                detail = detail.replace(secret, "[REDACTED]")
+        secret_patterns = (
+            r"(\bauthorization\s*:\s*(?:bearer|token)\s+)([^\s,;]+)",
+            r"(\bbearer\s+)([^\s,;]+)",
+            r"(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)([^\s,;&]+)",
+        )
+        for pattern in secret_patterns:
+            detail = re.sub(pattern, r"\1[REDACTED]", detail, flags=re.IGNORECASE)
         return detail[:limit]
 
     @staticmethod
@@ -758,7 +775,9 @@ class InternalHttpLlmAdapter:
                     else f"{self.settings.api_key_env} environment fallback"
                 )
                 raise LlmUnavailable(
-                    self._rejection_message(credential_label, status, response)
+                    self._rejection_message(
+                        credential_label, status, response, active_credential=key,
+                    )
                 )
             if status == 429 or status >= 500:
                 last_error = LlmUnavailable(f"The GenAI.mil endpoint returned transient HTTP {status}")
